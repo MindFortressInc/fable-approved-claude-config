@@ -32,7 +32,7 @@ The argument names the **work-list** — enumerate it before anything else:
 2. **One batched ask:** collect ALL true forks found across the list into a single `AskUserQuestion`, then build straight through with the answers in hand.
 3. **Then per unit, sequentially, in dependency order:** phases 3–8 with its own worktree, own `matt/dev-NNNN-slug` branch, own PR. If a unit hard-depends on an earlier unit's still-unmerged PR, branch off that PR's branch and mark the title "(stacked on #NNNN)".
 4. **A halted unit never kills the batch.** Contradicted premise / blocked / failed → record it, continue with the remaining units, and end with a per-unit report table: `unit → PR link / halted:<reason> / failed:<reason>`.
-5. **Long list (≳4 units):** run each unit's build phases (6–8) in a fresh subagent per the `briefs` six-section contract (bulldozer's pattern) so orchestrator context stays lean — validation and forks stay in the main session where the owner can answer.
+5. **Long list (≳4 units):** run each unit's build phases (6–8) in a fresh subagent per the `briefs` six-section contract (bulldozer's pattern) so orchestrator context stays lean — validation and forks stay in the main session where the owner can answer. Paste `/orchestrate`'s Worker gotcha pack into every build brief; its test bound (targeted + ratchet tests at `-n 2`, full suite left to CI) is what keeps N builders from exhausting the machine. Before spawning, check nothing else is already running a fleet here: `ps -axo command | grep -c '[c]laude -p --agent'` and `ps -axo command | grep -c '[-]m pytest'` (`hooks/test-admission.py` enforces the same bound mechanically).
 
 ## The pipeline
 
@@ -89,7 +89,8 @@ Everything else you decide yourself and keep moving:
 Build ON what exists. The phase-2 discovery already found the relevant substrate — use it (extend the service, the component, the endpoint pattern) rather than inventing a parallel mechanism. Only build from scratch after discovery genuinely came back empty (rule #6). Match the surrounding code's style, naming, and idioms.
 
 ### 7. Build
-- Create the **isolated worktree + feature branch** (`superpowers:using-git-worktrees`); branch name `matt/dev-NNNN-slug` so the `linear-startwork` hook flips the ticket to In Progress.
+- Create the **isolated worktree + feature branch** (`superpowers:using-git-worktrees`); branch name `me/dev-NNNN-slug` so the `linear-startwork` hook flips the ticket to In Progress.
+- **If `git worktree add` fails with "branch already exists", or the path is taken — STOP.** That is another agent's live workspace. Report it. Clearing the way by force is how a sibling agent's unpushed commit once ended up as an unreferenced object; there is no version of "it's only a local branch" that makes deletion safe.
 - Implement with `superpowers:test-driven-development` (test → red → minimal code → green → refactor).
 - For a plan with independent tasks, use `superpowers:subagent-driven-development` / `superpowers:executing-plans`.
 - Hit a bug? `superpowers:systematic-debugging` — find root cause before patching. Never gut complexity to dodge a bug (rule #2: move forward, never regress).
@@ -138,6 +139,7 @@ digraph execute_stop {
 
 - **Narrowing a batch.** The owner pastes 3 tickets or an epic → every unit ships. Picking a "preferred" ticket, deferring the rest as follow-ups, or asking which one they meant is the #1 failure of this skill — the work-list is the answer.
 - **One mega-PR for a batch.** N units = N PRs; every PR maps to exactly one ticket.
+- **Clearing a collision by force.** Removing another agent's worktree or deleting its branch because "it has no PR yet" is the destructive move, not the safe one — unpushed is the *most* fragile state. Report it; never remove a worktree you did not create, never `git worktree remove --force`, never `git branch -D` someone else's branch.
 - **Skipping phase 2.** Planning straight from the ticket builds whatever the ticket assumed — including things that already exist or bugs that aren't real. Validate first.
 - **Skipping the evidence table, or back-filling it after building.** Filling the premise table retroactively to match what you already built defeats phase 2 — the check has to precede the plan, and every row needs a command you actually ran this session.
 - **Over-asking.** Pausing for naming, file placement, or "is this OK?" on decisions with an obvious default. That's not a fork — decide and move.
