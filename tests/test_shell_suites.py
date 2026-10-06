@@ -44,8 +44,11 @@ class ShellSuiteTests(unittest.TestCase):
                                           text=True, cwd=REPO_ROOT,
                                           timeout=SUITE_TIMEOUT)
                 except subprocess.TimeoutExpired as exc:
+                    # TimeoutExpired carries bytes even under text=True.
+                    out, err = (v.decode(errors="replace") if isinstance(v, bytes) else (v or "")
+                                for v in (exc.stdout, exc.stderr))
                     self.fail("%s did not finish within %ds\n%s%s"
-                              % (rel, SUITE_TIMEOUT, exc.stdout or "", exc.stderr or ""))
+                              % (rel, SUITE_TIMEOUT, out, err))
                 self.assertEqual(proc.returncode, 0, "%s failed (exit %d)\n%s%s"
                                  % (rel, proc.returncode, proc.stdout, proc.stderr))
 

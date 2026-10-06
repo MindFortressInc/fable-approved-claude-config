@@ -88,12 +88,13 @@ Dedup set of in-flight ticket refs (skip these — already being worked; `prlaun
 ```bash
 # List EVERY owner you ship to (`--owner` repeats into one query): an org-only
 # scan contributes zero in-flight PRs from repos under your personal account.
-# --limit MUST stay above the true open-PR count: `gh search prs` sorts
-# newest-first and SILENTLY truncates at the cap, hiding the OLDEST in-flight
+# --limit MUST stay above the true open-PR count: `gh search prs` defaults to
+# best-match order, so the sort is pinned newest-first with --sort/--order, and it
+# SILENTLY truncates at the cap, hiding the OLDEST in-flight
 # PRs — exactly the long-running ones most likely to have lost their worktree.
 (ls ~/.claude/prlaunch-ok/ 2>/dev/null; \
  for r in ~/code/*/; do git -C "$r" worktree list 2>/dev/null; done; \
- gh search prs --owner <your-org> --owner <your-user> --author "@me" --state open --json title -q '.[].title' --limit 300 2>/dev/null) \
+ gh search prs --owner <your-org> --owner <your-user> --author "@me" --state open --sort created --order desc --json title -q '.[].title' --limit 300 2>/dev/null) \
   | grep -oiE "dev-?[0-9]+" | tr 'A-Z' 'a-z' | sed 's/dev-*/dev-/' | sort -u
 ```
 The `gh search prs` scan (adapt `<your-org>`/`<your-user>`; PR titles must carry the ticket ref — the ship flow's convention) runs ONCE per wake (rate-limit friendly); if it errors/returns nothing, proceed on the other two sources — it's a belt-and-suspenders layer, not a gate.

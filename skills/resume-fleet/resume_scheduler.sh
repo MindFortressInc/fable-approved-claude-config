@@ -31,6 +31,7 @@ for r in $(seq 1 "$ROUNDS"); do
   # "0 blocked": don't let it feed the dry streak and end the schedule early.
   if ! [[ "$blocked" =~ ^[0-9]+$ ]]; then
     echo "[$(date '+%H:%M:%S')] round $r: fleet run FAILED (no count) — not counting as dry" >> "$LOG"
+    dry=0   # a failure breaks consecutiveness: two dry rounds must be adjacent
     [ "$r" -lt "$ROUNDS" ] && sleep "$GAP"
     continue
   fi

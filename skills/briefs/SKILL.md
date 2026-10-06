@@ -22,7 +22,7 @@ One outcome, stated as **the artifact to produce** — "return a JSON verdict on
 ### 3. CONSTRAINTS
 The scope fences that keep the worker in its lane: never merge, never reassign a ticket, read-only, path allowlist, don't touch files another agent owns. Then paste the relevant **gotchas verbatim** — the zsh word-split trap, the "list_issues blows the token cap" warning, whatever bit the last run. Verbatim, because a paraphrased gotcha is a gotcha the worker will re-learn the hard way.
 
-Include the discovery obligation **written out**, never as a pointer to a rule the worker has not read — a fresh subagent sees only this prompt, and a Codex delegate reads `AGENTS.md`, never `CLAUDE.md`, so "follow rule #6" arrives as a dead reference. The operative text to paste: *when you are about to spend real work establishing something that may already exist or have already been measured — proposing a new mechanism, concluding "X doesn't exist", or measuring/benchmarking a system that is already running — first run all three of: (1) search the tracker for the* concern *(product, SKU or epic names — not the ticket id); the tracker records what is already built, not just what is planned. (2) grep the ecosystem for the concern. (3)* `memory_search` *the FULL memory: an injected memory block is usually a truncated top-ranked slice, and a* `[+N more]` *marker means the rest was cut. Build or derive from scratch only after all three come back empty.* A question one file read settles does not trigger this. If a retrieval tool ranks hits, inspect several and verify each cited `file:line` against the source; the top-ranked hit is not ground truth.
+Include the discovery obligation **written out**, never as a pointer to a rule the worker has not read — a fresh subagent sees only this prompt, and a Codex delegate reads `AGENTS.md`, never `CLAUDE.md`, so "follow rule #6" arrives as a dead reference. The operative text to paste: *when you are about to spend real work establishing something that may already exist or have already been measured — proposing a new mechanism, concluding "X doesn't exist", or measuring/benchmarking a system that is already running — first run all three of: (1) search the tracker for the* concern *(product, SKU or epic names — not the ticket id); the tracker records what is already built, not just what is planned. (2) grep the ecosystem for the concern. (3)* `memory_search` *the FULL memory: an injected memory block is usually a truncated top-ranked slice, and a* `[+N more]` *marker means the rest was cut. Build or derive from scratch only after all three come back empty. If no memory store is configured, say in your reply that memory search was unavailable and continue with (1) and (2); a missing store is not a reason to stop.* A question one file read settles does not trigger this. If a retrieval tool ranks hits, inspect several and verify each cited `file:line` against the source; the top-ranked hit is not ground truth.
 
 ### 4. RETURN CONTRACT
 The exact schema/format of the reply, **with a filled example**. Prefer JSON with named keys — the orchestrator parses it, so ambiguity here becomes a parse failure or a wrong write. Say what each key means and what an empty/failure value looks like. If the reply is prose, give the exact headings expected.
@@ -128,7 +128,10 @@ RETURN CONTRACT: reply with exactly this JSON:
   "evidence": "<commit hash + file:line proving present/absent>",
   "proposed_action": "move_to_done" | "note_keep_deployed" | "split_then_done" | "note_move_to_todo" | "note_only_manual",
   "confidence": "high" | "medium" | "low",
-  "memory_handoff": "<reusable fact + evidence for the orchestrator to persist via memory_write, or null if nothing new was learned>"
+  "notes": {
+    "finding": "<reusable fact for the orchestrator to persist via memory_write, or null if nothing new was learned>",
+    "evidence": "<the source excerpt or command output backing `finding`, or null>"
+  }
 }
 
 VERIFICATION REQUIREMENT: before returning a verdict other than UNCERTAIN, you

@@ -40,7 +40,12 @@ RETURN CONTRACT: reply with exactly this JSON, no prose around it:
   "unresolved": [
     {"id": "<ticket id>", "reason": "<why you could not classify -- e.g. parent
      bucket unknown, ambiguous purpose>"}
-  ]
+  ],
+  "notes": {
+    "finding": "<reusable fact for the orchestrator to persist, or null if
+     nothing new was learned>",
+    "evidence": "<the source excerpt or command output backing `finding`, or null>"
+  }
 }
 
 VERIFICATION REQUIREMENT: before returning, re-read every verdict where you could

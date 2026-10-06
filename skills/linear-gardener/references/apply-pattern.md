@@ -28,8 +28,17 @@ mutation BatchMove {
 Send it with the API key resolved per SKILL.md's Auth section (`$LINEAR_API_KEY` / `$LINEAR_KEY_FILE`, or your config's `auth.api_key_env` / `auth.api_key_file_env` overrides):
 
 ```bash
+# bash (uses ${!name} indirection). Env var first, then the JSON key file.
+KEY_ENV=$(jq -r '.auth.api_key_env // "LINEAR_API_KEY"' gardener.config.json)
+FILE_ENV=$(jq -r '.auth.api_key_file_env // "LINEAR_KEY_FILE"' gardener.config.json)
+LINEAR_KEY="${!KEY_ENV:-}"
+if [ -z "$LINEAR_KEY" ] && [ -n "${!FILE_ENV:-}" ]; then
+  LINEAR_KEY=$(jq -r '.env.LINEAR_API_KEY // empty' "${!FILE_ENV}")
+fi
+[ -n "$LINEAR_KEY" ] || { echo "no Linear API key resolved" >&2; exit 1; }
+
 curl -s https://api.linear.app/graphql \
-  --config <(printf 'header = "Authorization: %s"\n' "$LINEAR_API_KEY") \
+  --config <(printf 'header = "Authorization: %s"\n' "$LINEAR_KEY") \
   -H "Content-Type: application/json" \
   --data-binary @batch-0.json
 ```
