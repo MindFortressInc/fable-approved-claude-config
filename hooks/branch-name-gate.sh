@@ -78,7 +78,7 @@ fi
 
 q="query { issues(filter: { number: { eq: ${num} }, team: { id: { eq: \"${TEAM}\" } } }) { nodes { identifier branchName } } }"
 resp=$(curl -s --max-time 8 -X POST "$API" \
-  -H "Authorization: $key" -H "Content-Type: application/json" \
+  --config <(printf 'header = "Authorization: %s"\n' "$key") -H "Content-Type: application/json" \
   -d "$(jq -n --arg q "$q" '{query:$q}')")
 canonical=$(jq -r '.data.issues.nodes[0].branchName // ""' <<<"$resp" 2>/dev/null)
 

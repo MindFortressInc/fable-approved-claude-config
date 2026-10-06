@@ -33,7 +33,7 @@
 set +e
 TEAM="${LINEAR_DEV_TEAM_ID:-}"
 INPROGRESS="${LINEAR_INPROGRESS_STATE_ID:-}"
-MATT="${LINEAR_ASSIGNEE_ID:-}"
+ASSIGNEE="${LINEAR_ASSIGNEE_ID:-}"
 PREFIX="${LINEAR_BRANCH_PREFIX:-dev}"
 API="https://api.linear.app/graphql"
 
@@ -86,7 +86,7 @@ emit() { jq -n --arg m "$1" '{systemMessage:$m}'; }
 # --- read current ticket state + assignee ---
 rq="query { issues(filter: { number: { eq: ${num} }, team: { id: { eq: \"${TEAM}\" } } }) { nodes { id identifier state { type } assignee { id name } } } }"
 rresp=$(curl -s --max-time 8 -X POST "$API" \
-  -H "Authorization: $key" -H "Content-Type: application/json" \
+  --config <(printf 'header = "Authorization: %s"\n' "$key") -H "Content-Type: application/json" \
   -d "$(jq -n --arg q "$rq" '{query:$q}')")
 
 node=$(jq -c '.data.issues.nodes[0] // empty' <<<"$rresp" 2>/dev/null)
@@ -108,13 +108,13 @@ case "$stype" in backlog|unstarted|triage) flip=1 ;; esac
 # assign only when unassigned; flag a conflict when held by someone else
 assign=0; other=""
 if [ -z "$INPROGRESS" ]; then flip=0; fi          # no target state configured -> don't flip
-if [ -z "$MATT" ]; then assign=0
+if [ -z "$ASSIGNEE" ]; then assign=0
 elif [ -z "$aid" ]; then assign=1
-elif [ "$aid" != "$MATT" ]; then other="$aname"; flip=0   # held by someone else: touch nothing, just alert
+elif [ "$aid" != "$ASSIGNEE" ]; then other="$aname"; flip=0   # held by someone else: touch nothing, just alert
 fi
 
 fields=$(jq -n --argjson flip "$flip" --arg sid "$INPROGRESS" \
-               --argjson assign "$assign" --arg aid "$MATT" \
+               --argjson assign "$assign" --arg aid "$ASSIGNEE" \
   '{} + (if $flip==1 then {stateId:$sid} else {} end)
       + (if $assign==1 then {assigneeId:$aid} else {} end)')
 
@@ -122,7 +122,7 @@ ok=1
 if [ "$fields" != "{}" ]; then
   mq='mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }'
   mresp=$(curl -s --max-time 8 -X POST "$API" \
-    -H "Authorization: $key" -H "Content-Type: application/json" \
+    --config <(printf 'header = "Authorization: %s"\n' "$key") -H "Content-Type: application/json" \
     -d "$(jq -n --arg q "$mq" --arg id "$iid" --argjson input "$fields" '{query:$q,variables:{id:$id,input:$input}}')")
   [ "$(jq -r '.data.issueUpdate.success // false' <<<"$mresp" 2>/dev/null)" = "true" ] || ok=0
 fi

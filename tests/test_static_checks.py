@@ -265,5 +265,42 @@ class StaticChecksTest(unittest.TestCase):
             self.assertIn("description", keys, "%s: frontmatter needs description" % rel)
 
 
+    def test_no_credential_on_a_command_line(self):
+        """No hook may hand a secret to a child process as an argv element.
+
+        argv is world-readable: `ps -Aww -o command=` from ANY local account
+        renders another user's full command line. So `curl -H "Authorization:
+        $key"` publishes a live tracker API key -- often write-scoped for the
+        whole workspace -- for the lifetime of the request, and hooks like
+        linear-startwork.sh fire on every branch create.
+
+        The supported way to pass the header is curl's own config file, read
+        from a process substitution so the value never becomes an argv element
+        of any process:
+
+            curl ... --config <(printf 'header = "Authorization: %s"\n' "$key")
+        """
+        pat = re.compile(
+            r"""-H\s+["']?(Authorization|X-Api-Key|Api-Key|PRIVATE-TOKEN)\s*:""",
+            re.IGNORECASE)
+        bad = []
+        for path in sorted(glob.glob(os.path.join(HOOKS_DIR, "*.sh"))):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for i, line in enumerate(fh, 1):
+                    stripped = line.lstrip()
+                    # A comment explaining the hazard is not the hazard.
+                    if stripped.startswith("#"):
+                        continue
+                    if pat.search(line):
+                        bad.append("%s:%d: %s" % (os.path.basename(path), i,
+                                                  stripped.rstrip()))
+        self.assertFalse(bad, (
+            "credential passed as a command-line argument (visible to any "
+            "local user via `ps`) in:\n  %s\nPass it through curl's config "
+            "file instead:\n  --config <(printf 'header = \"Authorization: "
+            "%%s\"\\n' \"$key\")"
+        ) % "\n  ".join(bad))
+
+
 if __name__ == "__main__":
     unittest.main()
