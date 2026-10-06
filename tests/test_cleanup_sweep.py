@@ -154,7 +154,7 @@ class CleanupSweepTest(unittest.TestCase):
     def test_pre_existing_credentials_scrubbed_in_place(self):
         # Entries written before the careful hook redacted on write may hold a
         # raw token; any sweep must scrub the log in place and never echo it.
-        pat = "github_pat_11BUMSRSQ0abcdefghijklmnopqrstuvwxyz0123456789"
+        pat = "github_pat_11FAKEFAKE0abcdefghijklmnopqrstuvwxyz0123456789"
         self._seed({
             "ts": 1, "cwd": "/tmp",
             "cmd": 'curl -H "Authorization: Bearer %s" x; rm -rf /tmp/scratch-x' % pat,
@@ -189,7 +189,7 @@ class CleanupSweepTest(unittest.TestCase):
 
     def test_pre_existing_credential_in_cwd_scrubbed(self):
         # A credential-shaped cwd field must be scrubbed too, not just cmd/reason.
-        pat = "github_pat_11BUMSRSQ0abcdefghijklmnopqrstuvwxyz0123456789"
+        pat = "github_pat_11FAKEFAKE0abcdefghijklmnopqrstuvwxyz0123456789"
         self._seed({
             "ts": 1, "cwd": "/tmp/%s" % pat,
             "cmd": "rm -rf /tmp/scratch-z",
@@ -209,7 +209,7 @@ class CleanupSweepTest(unittest.TestCase):
         # could silently clear the entry without deleting the real target, or
         # worse, resolve into an unrelated path. Such an entry must be kept
         # for manual review, never auto-run.
-        pat = "github_pat_11BUMSRSQ0abcdefghijklmnopqrstuvwxyz0123456789"
+        pat = "github_pat_11FAKEFAKE0abcdefghijklmnopqrstuvwxyz0123456789"
         target = os.path.join(self.sbx.dir, "victim2")
         os.makedirs(target)
         self._seed({

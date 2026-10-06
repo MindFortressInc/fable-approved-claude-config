@@ -55,7 +55,7 @@ class CheckCarefulTest(unittest.TestCase):
 
     def test_deferred_rm_redacts_credentials_in_log(self):
         # A deferred command carrying tokens must not land in the queue verbatim.
-        pat = "github_pat_11BUMSRSQ0abcdefghijklmnopqrstuvwxyz0123456789"
+        pat = "github_pat_11FAKEFAKE0abcdefghijklmnopqrstuvwxyz0123456789"
         classic = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         cmd = (
             'TOK=%s; curl -H "Authorization: Bearer %s" https://x.invalid | '  # example-url: RFC 2606 .invalid fixture, never dialled
@@ -86,7 +86,7 @@ class CheckCarefulTest(unittest.TestCase):
     def test_deferred_rm_redacts_credentials_in_cwd(self):
         # A credential-shaped CWD (e.g. a scratch dir named after a token)
         # must not land in the queue verbatim either — same sink, same risk.
-        pat = "github_pat_11BUMSRSQ0abcdefghijklmnopqrstuvwxyz0123456789"
+        pat = "github_pat_11FAKEFAKE0abcdefghijklmnopqrstuvwxyz0123456789"
         cwd = "/Users/x/%s" % pat
         rc, out, _ = self._run("rm -rf /Users/x/some-project", cwd=cwd)
         self.assertEqual(decision(out), "deny")
@@ -101,7 +101,7 @@ class CheckCarefulTest(unittest.TestCase):
         # marker to refuse auto-resolving a path that no longer matches
         # reality. This must be set by check-careful.sh at WRITE time, not
         # just by cleanup-sweep.py's read-time self-heal for legacy entries.
-        pat = "github_pat_11BUMSRSQ0abcdefghijklmnopqrstuvwxyz0123456789"
+        pat = "github_pat_11FAKEFAKE0abcdefghijklmnopqrstuvwxyz0123456789"
         cwd = "/Users/x/%s" % pat
         rc, out, _ = self._run("rm -rf /Users/x/some-project", cwd=cwd)
         self.assertEqual(decision(out), "deny")
@@ -124,7 +124,7 @@ class CheckCarefulTest(unittest.TestCase):
         # silently) — confirm the redaction plumbing doesn't fire spuriously
         # and, more importantly, that nothing is written when there's nothing
         # to defer.
-        pat = "github_pat_11BUMSRSQ0abcdefghijklmnopqrstuvwxyz0123456789"
+        pat = "github_pat_11FAKEFAKE0abcdefghijklmnopqrstuvwxyz0123456789"
         rc, out, _ = self._run("rm -rf .venv", cwd="/Users/x/%s" % pat)
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "{}")
