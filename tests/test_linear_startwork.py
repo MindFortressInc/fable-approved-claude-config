@@ -70,5 +70,45 @@ class LinearStartworkTest(unittest.TestCase):
         self.assertEqual(out.strip(), "")  # silent no-op
 
 
+    # -- heredoc BODIES are data; quoted branch names are still names ----------
+
+    def test_branch_created_after_heredoc_is_reported(self):
+        # `scan="${cmd%%<<*}"` used to truncate at the first `<<`, so this create
+        # was never seen and the ticket stayed untouched.
+        msg = self._msg(
+            "cat > notes.md <<'EOF'\n"
+            "just some notes\n"
+            "EOF\n"
+            "git checkout -b me/eng-9999-x"
+        )
+        self.assertIn("me/eng-9999-x", msg)
+        self.assertIn("couldn't find", msg)
+
+    def test_branch_name_in_heredoc_body_is_not_creation(self):
+        rc, out, _ = run_hook(
+            self.sbx, "linear-startwork.sh",
+            {"tool_input": {"command": "cat > notes.md <<'EOF'\n"
+                                       "then run: git checkout -b me/eng-9999-x\n"
+                                       "EOF"},
+             "cwd": self.repo},
+            shim_path=True,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "")
+
+    def test_quoted_heredoc_operator_does_not_swallow_the_create(self):
+        msg = self._msg('echo "shift left: a << b"\ngit checkout -b me/eng-9999-x')
+        self.assertIn("me/eng-9999-x", msg)
+
+    def test_quoted_worktree_branch_is_extracted_not_the_start_point(self):
+        msg = self._msg('git worktree add /tmp/wt -b "me/eng-9999-x" origin/develop')
+        self.assertIn("me/eng-9999-x", msg)
+        self.assertNotIn("origin/develop", msg)
+
+    def test_quoted_checkout_branch_is_extracted(self):
+        msg = self._msg('git checkout -b "me/eng-9999-x"')
+        self.assertIn("me/eng-9999-x", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

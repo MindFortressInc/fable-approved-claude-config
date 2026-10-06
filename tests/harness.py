@@ -34,6 +34,7 @@ HOOK_FILES = [
     "prlaunch-gate.sh",
     "branch-name-gate.sh",
     "linear-startwork.sh",
+    "shell-code-only.sh",  # sourced by the two gates above for heredoc stripping
     "check-careful.sh",
     "careful-rm.py",
     "cleanup-sweep.py",
