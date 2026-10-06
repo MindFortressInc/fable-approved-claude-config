@@ -13,6 +13,10 @@ unattended loop. Shared by the cleanup sweep:
   cleanup-sweep.py --run N    DELETE entry N's parsed targets, then drop entry N
   cleanup-sweep.py --run-all  --run every entry (descending, so indices hold)
   cleanup-sweep.py --remove N drop entry index N WITHOUT deleting (declined)
+  cleanup-sweep.py --append   queue one JSON entry read from stdin (the hook)
+
+Every path that writes the log does so under one shared lock (`queue_lock()`),
+including check-careful.sh's append — see that function for why.
 
 Why `--run` instead of re-running the queued command:
   The careful hook (check-careful.sh) defers ANY unrecognized `rm -r` — so
@@ -31,9 +35,37 @@ import glob
 import shutil
 import shlex
 import json
+import fcntl
 import importlib.util
+from contextlib import contextmanager
 
 LOG = os.path.expanduser("~/.claude/cleanup-needed.log")
+LOCK = LOG + ".lock"
+
+# Credential-shaped strings must never rest in the queue (we hit this: a GitHub
+# PAT sat in cleanup-needed.log in plaintext). check-careful.sh redacts on
+# write; this mirror scrubs entries written before that fix (or by an older
+# hook) the first time any sweep touches the log. Keep in sync with
+# redact_secrets() in check-careful.sh.
+_SECRET_PATTERNS = [
+    # {20,} mirrors the gh*_/sk-/AKIA patterns below: without a minimum,
+    # an ordinary path like `github_pat_backup` was redacted as a secret.
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "***REDACTED***"),
+    (re.compile(r"(^|[^A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{20,}"), r"\1***REDACTED***"),
+    (re.compile(r"(^|[^A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}"), r"\1***REDACTED***"),
+    # AKIA = permanent AWS access-key ID; ASIA = AWS STS temporary access-key
+    # ID — same 4-letter-prefix + 16-alnum shape, must be redacted the same.
+    (re.compile(r"(^|[^A-Za-z0-9_])(?:AKIA|ASIA)[0-9A-Z]{16}"), r"\1***REDACTED***"),
+    # IGNORECASE: an all-caps `AUTHORIZATION: BEARER <secret>` slipped past
+    # the first-letter-only classes.
+    (re.compile(r"(authorization:?\s*(?:bearer|token)\s+)[^\s\"']+", re.IGNORECASE), r"\1***REDACTED***"),
+]
+
+
+def _redact(text):
+    for pat, repl in _SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
 
 # Reuse the rm parser (segments / rm_targets) so target extraction matches the
 # exact logic the careful hook used to defer the delete in the first place.
@@ -51,8 +83,52 @@ def _careful_rm():
     return _CR
 
 
+@contextmanager
+def queue_lock():
+    """Exclusive lock over the cleanup queue — held by EVERY writer of LOG.
+
+    The queue is a read-then-full-rewrite surface (`save()` truncates), and
+    ~/.claude is shared by many parallel Claude Code workers: check-careful.sh
+    queues a deferred delete on every unrecognized `rm -r`, in any session,
+    while /cleanup, /wrapup, /PRlaunch and /babysit-prs all run sweeps. Without
+    a shared lock, an append landing between a sweep's `load()` and its
+    `save()` is silently erased — the entry was never in the list written back.
+    So the hook appends through `--append` (which takes this lock) and every
+    sweep rewrite happens under it, giving appends and rewrites one total order.
+
+    Deliberately NOT held across the deletions in `--run`/`--run-all`:
+    `shutil.rmtree` of a big worktree takes seconds to tens of seconds, and
+    check-careful.sh is a PreToolUse hook that must never block that long. The
+    sweeps instead re-read the queue under the lock and drop only the entries
+    they resolved (`drop_entries`), so a concurrent append survives regardless
+    of how long the deleting took.
+    """
+    d = os.path.dirname(LOCK)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fh = open(LOCK, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fh.close()  # closing the fd releases the flock
+
+
 def load():
-    out = []
+    """Load queue entries, scrubbing any credential-shaped strings.
+
+    Entries written before check-careful.sh redacted on write may hold a raw
+    token; if any redaction fired, the log is rewritten in place immediately so
+    the plaintext credential stops resting on disk.
+    """
+    out, dirty = [], False
+    # cmd/cwd are path-bearing: extract_targets() resolves delete targets
+    # against them. If redaction rewrites either, the entry no longer
+    # describes real filesystem paths — auto-running it (--run/--run-all)
+    # could silently no-op (redacted path doesn't exist -> looks "cleared"
+    # without deleting anything) or resolve into an unrelated path. `reason`
+    # is display-only and never feeds path resolution, so it doesn't count.
+    PATH_FIELDS = ("cmd", "cwd")
     try:
         with open(LOG) as f:
             for line in f:
@@ -60,11 +136,27 @@ def load():
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
+                    e = json.loads(line)
                 except ValueError:
-                    out.append({"cmd": line, "cwd": "", "reason": "", "ts": 0})
+                    e = {"cmd": line, "cwd": "", "reason": "", "ts": 0}
+                if not isinstance(e, dict):
+                    # `null`, a list or a bare number is as malformed as bad
+                    # JSON here — e.get() below would raise on all of them.
+                    e = {"cmd": line, "cwd": "", "reason": "", "ts": 0}
+                for k in ("cmd", "reason", "cwd"):
+                    v = e.get(k, "")
+                    if isinstance(v, str):
+                        r = _redact(v)
+                        if r != v:
+                            e[k] = r
+                            dirty = True
+                            if k in PATH_FIELDS:
+                                e["_redacted_path_field"] = True
+                out.append(e)
     except FileNotFoundError:
         pass
+    if dirty:
+        save(out)
     return out
 
 
@@ -78,6 +170,33 @@ def save(entries):
     with open(LOG, "w") as f:
         for e in entries:
             f.write(json.dumps(e) + "\n")
+
+
+def append(entry):
+    """Queue one deferred delete (check-careful.sh's `--append`), under the lock."""
+    with queue_lock():
+        with open(LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+def drop_entries(dropped):
+    """Remove `dropped` entries from the queue without clobbering concurrent appends.
+
+    Re-reads the queue under the lock rather than writing back the caller's
+    (now possibly stale) snapshot, and removes one occurrence per dropped entry
+    by value — indices from the snapshot no longer hold once another process
+    has appended.
+    """
+    if not dropped:
+        return
+    with queue_lock():
+        current = load()
+        for e in dropped:
+            for i, c in enumerate(current):
+                if c == e:
+                    current.pop(i)
+                    break
+        save(current)
 
 
 _VAR = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)')
@@ -176,8 +295,12 @@ def run_entry(entries, n):
     """Delete entry n's parsed targets; drop the entry iff fully resolved.
     Returns True if the entry was dropped."""
     e = entries[n]
-    targets = extract_targets(e.get("cmd", ""), e.get("cwd", ""))
     print(f"\n[{n}] in {e.get('cwd') or '?'}")
+    if e.get("_redacted_path_field"):
+        print("    ⚠ cmd/cwd was credential-redacted — path no longer matches reality; "
+              "left in queue for manual review, not auto-run")
+        return False
+    targets = extract_targets(e.get("cmd", ""), e.get("cwd", ""))
     if not targets:
         print("    no delete targets parsed (nothing to do) — left in queue for manual review")
         return False
@@ -200,7 +323,37 @@ def run_entry(entries, n):
 
 def main():
     args = sys.argv[1:]
-    entries = load()
+
+    if args and args[0] == "--append":
+        # check-careful.sh pipes one JSON entry in. Appending through here (not
+        # `>> $CLEANUP_LOG`) is what puts hook appends and sweep rewrites under
+        # the SAME lock.
+        raw = sys.stdin.read().strip()
+        if not raw:
+            return
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            entry = {"cmd": raw, "cwd": "", "reason": "", "ts": 0}
+        append(entry)
+        return
+
+    if args and args[0] == "--remove":
+        try:
+            n = int(args[1])
+        except (IndexError, ValueError):
+            print("usage: cleanup-sweep.py --remove N", file=sys.stderr)
+            sys.exit(2)
+        # Whole read-modify-write under one lock: it does no slow work.
+        with queue_lock():
+            entries = load()
+            if 0 <= n < len(entries):
+                entries.pop(n)
+                save(entries)
+        return
+
+    with queue_lock():
+        entries = load()  # consistent snapshot (save() truncates in place)
 
     if args and args[0] == "--count":
         print(len(entries))
@@ -211,16 +364,6 @@ def main():
             e["i"] = i
             print(json.dumps(e))
         return
-    if args and args[0] == "--remove":
-        try:
-            n = int(args[1])
-        except (IndexError, ValueError):
-            print("usage: cleanup-sweep.py --remove N", file=sys.stderr)
-            sys.exit(2)
-        if 0 <= n < len(entries):
-            entries.pop(n)
-            save(entries)
-        return
     if args and args[0] == "--run":
         try:
             n = int(args[1])
@@ -230,16 +373,20 @@ def main():
         if not (0 <= n < len(entries)):
             print(f"no entry [{n}] (queue has {len(entries)})", file=sys.stderr)
             sys.exit(2)
-        run_entry(entries, n)
-        save(entries)
+        e = entries[n]
+        if run_entry(entries, n):
+            drop_entries([e])
         return
     if args and args[0] == "--run-all":
         if not entries:
             print("🧹 No cleanups pending.")
             return
+        dropped = []
         for n in range(len(entries) - 1, -1, -1):  # descending: indices stay valid
-            run_entry(entries, n)
-        save(entries)
+            e = entries[n]
+            if run_entry(entries, n):
+                dropped.append(e)
+        drop_entries(dropped)
         print(f"\n=== {len(entries)} entr{'y' if len(entries) == 1 else 'ies'} remaining ===")
         return
 
@@ -253,6 +400,8 @@ def main():
         print(f"    $ {e.get('cmd', '')}")
         for ln in (e.get("reason", "") or "").splitlines():
             print(f"    {ln}")
+        if e.get("_redacted_path_field"):
+            print("    ⚠ cmd/cwd was credential-redacted — review manually before --run")
 
 
 if __name__ == "__main__":

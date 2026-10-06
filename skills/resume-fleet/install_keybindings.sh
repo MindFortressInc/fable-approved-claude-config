@@ -10,7 +10,13 @@ mkdir -p "$(dirname "$KB")"
 [ -f "$KB" ] || printf '// Place your key bindings in this file to override the defaults\n[\n]\n' > "$KB"
 
 if grep -q '"f17"' "$KB"; then
-  echo "resume-fleet keybindings already present in $KB"; exit 0
+  if grep -q 'workbench.action.terminal.focusNext' "$KB"; then
+    echo "resume-fleet keybindings already present in $KB"; exit 0
+  fi
+  # f17 is bound to something ELSE — installing on top would make the fleet's
+  # F17 presses fire the user's binding. Bail loudly instead of claiming success.
+  echo "ERROR: f17 already bound to a non-resume-fleet command in $KB — resolve manually" >&2
+  exit 1
 fi
 
 BLOCK='    // --- resume-fleet automation (rare F-keys) ---

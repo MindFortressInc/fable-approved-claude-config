@@ -84,6 +84,25 @@ if [ -z "$WARN" ] && printf '%s' "$CMD" | grep -qE 'docker\s+(rm\s+-f|system\s+p
   WARN="This force-removes Docker containers or prunes images/volumes — running containers or cached data can be lost."
 fi
 
+# --- Credential redaction --------------------------------------------------
+# cleanup-needed.log stores the full verbatim command text of every deferred
+# delete, so a command that happened to carry a token inline would otherwise
+# park a live credential in plaintext on disk (we hit this: a GitHub PAT did
+# exactly that). Scrub credential-shaped strings before anything is persisted.
+# Covered: GitHub fine-grained PATs, classic GitHub tokens (ghp_/gho_/ghu_/
+# ghs_/ghr_), sk- API keys, AWS access key IDs (AKIA, permanent) and AWS STS
+# temporary access-key IDs (ASIA), Authorization Bearer/token headers. The
+# leading (^|[^A-Za-z0-9_]) guard keeps short prefixes like sk- from matching
+# inside ordinary words (e.g. "task-...").
+redact_secrets() {
+  printf '%s' "$1" | sed -E \
+    -e 's/github_pat_[A-Za-z0-9_]{20,}/***REDACTED***/g' \
+    -e 's/(^|[^A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{20,}/\1***REDACTED***/g' \
+    -e 's/(^|[^A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}/\1***REDACTED***/g' \
+    -e 's/(^|[^A-Za-z0-9_])(AKIA|ASIA)[0-9A-Z]{16}/\1***REDACTED***/g' \
+    -e 's/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:?[[:space:]]*([Bb][Ee][Aa][Rr][Ee][Rr]|[Tt][Oo][Kk][Ee][Nn])[[:space:]]+)[^[:space:]"'"'"']+/\1***REDACTED***/g'
+}
+
 # --- Output --------------------------------------------------------------
 LOOPMODE_FILE="$HOME/.claude/hooks/loop-mode"
 CLEANUP_LOG="$HOME/.claude/cleanup-needed.log"
@@ -117,8 +136,33 @@ fi
 if [ "$WARN_IS_RM" = true ]; then
   NOW=$(date +%s 2>/dev/null || echo 0)
   CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null || true)
-  jq -nc --argjson ts "${NOW:-0}" --arg cwd "$CWD" --arg cmd "$CMD" --arg w "$WARN" \
-    '{ts:$ts, cwd:$cwd, cmd:$cmd, reason:$w}' >> "$CLEANUP_LOG" 2>/dev/null || true
+  # Never persist raw credentials: redact the command text, the itemized
+  # warning derived from it, and the cwd (a scratch dir can be named after a
+  # token) before any of it lands in the cleanup queue.
+  SAFE_CMD=$(redact_secrets "$CMD" 2>/dev/null) || SAFE_CMD="[careful] redaction failed — command text withheld"
+  SAFE_WARN=$(redact_secrets "$WARN" 2>/dev/null) || SAFE_WARN=""
+  SAFE_CWD=$(redact_secrets "$CWD" 2>/dev/null) || SAFE_CWD="[careful] redaction failed — cwd withheld"
+  # Flag path-bearing fields that redaction altered: cleanup-sweep.py's
+  # extract_targets() resolves delete targets against cmd/cwd, so a redacted
+  # value no longer describes a real filesystem path — the sweep must refuse
+  # to auto-run it (see _redacted_path_field in cleanup-sweep.py).
+  REDACTED_PATH_FIELD=false
+  if [ "$SAFE_CMD" != "$CMD" ] || [ "$SAFE_CWD" != "$CWD" ]; then
+    REDACTED_PATH_FIELD=true
+  fi
+  # Append THROUGH cleanup-sweep.py --append so this write and a concurrent
+  # sweep's read-modify-write rewrite share one lock: a bare
+  # `>> "$CLEANUP_LOG"` here is silently erased if a sweep in another session
+  # rewrites the queue from a snapshot taken just before it. Falls back to the
+  # bare append if the helper is missing/unusable — a queued-but-racy entry
+  # beats a dropped one, and this hook must never fail a delete deferral.
+  ENTRY=$(jq -nc --argjson ts "${NOW:-0}" --arg cwd "$SAFE_CWD" --arg cmd "$SAFE_CMD" --arg w "$SAFE_WARN" \
+    --argjson redacted_path_field "$REDACTED_PATH_FIELD" \
+    '{ts:$ts, cwd:$cwd, cmd:$cmd, reason:$w, _redacted_path_field:$redacted_path_field}' 2>/dev/null || true)
+  if [ -n "$ENTRY" ]; then
+    printf '%s\n' "$ENTRY" | python3 "$HOME/.claude/hooks/cleanup-sweep.py" --append 2>/dev/null \
+      || printf '%s\n' "$ENTRY" >> "$CLEANUP_LOG" 2>/dev/null || true
+  fi
   jq -n '{
     systemMessage: "[careful] Did not run an unrecognized delete — queued it for cleanup instead (run /cleanup to review/clear). This never blocks a goal or loop.",
     hookSpecificOutput: {hookEventName:"PreToolUse", permissionDecision:"deny", permissionDecisionReason:"[careful] Deferred this delete to ~/.claude/cleanup-needed.log — NOT executed (intentional; deletes never block a goal/loop). Safe to continue; do NOT retry. Review later with /cleanup."}
