@@ -29,7 +29,7 @@ Send it with the API key resolved per SKILL.md's Auth section (`$LINEAR_API_KEY`
 
 ```bash
 curl -s https://api.linear.app/graphql \
-  -H "Authorization: $LINEAR_API_KEY" \
+  --config <(printf 'header = "Authorization: %s"\n' "$LINEAR_API_KEY") \
   -H "Content-Type: application/json" \
   --data-binary @batch-0.json
 ```

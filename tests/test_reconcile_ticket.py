@@ -133,6 +133,18 @@ class ReconcileTicketTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "")
 
+    def test_unset_advance_from_list_says_why_on_stderr(self):
+        rc, out, err = self._run({"FAKE_ISSUE_NODE": ISSUE_NODE, "FAKE_PR_STATE": "MERGED",
+                                  "LINEAR_ADVANCE_FROM_STATE_IDS": ""})
+        self.assertEqual(rc, 0)
+        self.assertIn("LINEAR_ADVANCE_FROM_STATE_IDS", err)
+
+    def test_whitespace_in_advance_from_list_is_ignored(self):
+        rc, out, _ = self._run({"FAKE_ISSUE_NODE": issue_node(IN_REVIEW), "FAKE_PR_STATE": "MERGED",
+                                "LINEAR_ADVANCE_FROM_STATE_IDS": IN_PROGRESS + ", " + IN_REVIEW})
+        self.assertEqual(rc, 0)
+        self.assertIn("Deployed", out)
+
     def test_advance_from_override_replaces_the_list(self):
         rc, out, _ = self._run({"FAKE_ISSUE_NODE": issue_node("CUSTOM-WIP"), "FAKE_PR_STATE": "MERGED",
                                 "LINEAR_ADVANCE_FROM_STATE_IDS": "OTHER-STATE,CUSTOM-WIP"})

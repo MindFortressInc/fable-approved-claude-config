@@ -91,7 +91,8 @@ fi
 # exactly that). Scrub credential-shaped strings before anything is persisted.
 # Covered: GitHub fine-grained PATs, classic GitHub tokens (ghp_/gho_/ghu_/
 # ghs_/ghr_), sk- API keys, AWS access key IDs (AKIA, permanent) and AWS STS
-# temporary access-key IDs (ASIA), Authorization Bearer/token headers. The
+# temporary access-key IDs (ASIA), Linear lin_api_ keys, Slack xox?- tokens, and
+# Authorization headers (Bearer/Token/Basic, or a raw `Authorization: <key>`). The
 # leading (^|[^A-Za-z0-9_]) guard keeps short prefixes like sk- from matching
 # inside ordinary words (e.g. "task-...").
 redact_secrets() {
@@ -100,7 +101,10 @@ redact_secrets() {
     -e 's/(^|[^A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{20,}/\1***REDACTED***/g' \
     -e 's/(^|[^A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}/\1***REDACTED***/g' \
     -e 's/(^|[^A-Za-z0-9_])(AKIA|ASIA)[0-9A-Z]{16}/\1***REDACTED***/g' \
-    -e 's/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:?[[:space:]]*([Bb][Ee][Aa][Rr][Ee][Rr]|[Tt][Oo][Kk][Ee][Nn])[[:space:]]+)[^[:space:]"'"'"']+/\1***REDACTED***/g'
+    -e 's/(^|[^A-Za-z0-9_])lin_api_[A-Za-z0-9]{20,}/\1***REDACTED***/g' \
+    -e 's/(^|[^A-Za-z0-9_])xox[abposr]-[A-Za-z0-9-]{10,}/\1***REDACTED***/g' \
+    -e 's/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:?[[:space:]]*([Bb][Ee][Aa][Rr][Ee][Rr]|[Tt][Oo][Kk][Ee][Nn]|[Bb][Aa][Ss][Ii][Cc])[[:space:]]+)[^[:space:]"'"'"']+/\1***REDACTED***/g' \
+    -e 's/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*)[^[:space:]"'"'"'*]{8,}/\1***REDACTED***/g'
 }
 
 # --- Output --------------------------------------------------------------

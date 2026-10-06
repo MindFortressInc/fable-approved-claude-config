@@ -71,6 +71,21 @@ class CheckCarefulTest(unittest.TestCase):
         # the delete target itself survives redaction so /cleanup can still act
         self.assertIn("/Users/x/some-project", logged)
 
+    def test_deferred_rm_redacts_raw_authorization_and_linear_keys(self):
+        # Linear personal keys are sent bare (`Authorization: lin_api_...`, no
+        # Bearer), and Basic auth carries a credential too.
+        lin = "lin_api_" + "A" * 32
+        basic = "dXNlcjpwYXNzd29yZDEyMzQ1"
+        cmd = ('curl -H "Authorization: %s" x; curl -H "Authorization: Basic %s" y; '
+               'LINEAR_API_KEY=%s rm -rf /Users/x/lin-project') % (lin, basic, lin)
+        rc, out, _ = self._run(cmd, cwd="/Users/x")
+        self.assertEqual(decision(out), "deny")
+        with open(self.sbx.cleanup_log) as fh:
+            logged = fh.read()
+        self.assertNotIn(lin, logged)
+        self.assertNotIn(basic, logged)
+        self.assertIn("/Users/x/lin-project", logged)
+
     def test_deferred_rm_redacts_aws_temporary_credentials(self):
         # ASIA-prefixed IDs are AWS STS temporary access-key IDs — same shape
         # as AKIA (4-letter prefix + 16 alnum), must be redacted the same way.

@@ -45,7 +45,13 @@ command -v curl >/dev/null 2>&1 || exit 0
 command -v gh   >/dev/null 2>&1 || exit 0
 [ -z "$TEAM" ] && exit 0
 [ -z "$DEPLOYED" ] && exit 0
-[ -z "$ADVANCE_FROM" ] && exit 0
+ADVANCE_FROM=$(tr -d '[:space:]' <<<"$ADVANCE_FROM")   # "id1, id2" must still match id2
+if [ -z "$ADVANCE_FROM" ]; then
+  # Configured otherwise but missing the allowlist: say so once (stderr) rather
+  # than silently doing nothing -- this variable became required.
+  echo "reconcile-ticket: LINEAR_ADVANCE_FROM_STATE_IDS unset — skipping (see README, tracker hygiene)" >&2
+  exit 0
+fi
 
 key="${LINEAR_API_KEY:-}"
 if [ -z "$key" ] && [ -n "${LINEAR_KEY_FILE:-}" ]; then

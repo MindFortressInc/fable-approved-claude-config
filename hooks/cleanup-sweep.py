@@ -58,7 +58,12 @@ _SECRET_PATTERNS = [
     (re.compile(r"(^|[^A-Za-z0-9_])(?:AKIA|ASIA)[0-9A-Z]{16}"), r"\1***REDACTED***"),
     # IGNORECASE: an all-caps `AUTHORIZATION: BEARER <secret>` slipped past
     # the first-letter-only classes.
-    (re.compile(r"(authorization:?\s*(?:bearer|token)\s+)[^\s\"']+", re.IGNORECASE), r"\1***REDACTED***"),
+    (re.compile(r"(^|[^A-Za-z0-9_])lin_api_[A-Za-z0-9]{20,}"), r"\1***REDACTED***"),
+    (re.compile(r"(^|[^A-Za-z0-9_])xox[abposr]-[A-Za-z0-9-]{10,}"), r"\1***REDACTED***"),
+    (re.compile(r"(authorization:?\s*(?:bearer|token|basic)\s+)[^\s\"']+", re.IGNORECASE), r"\1***REDACTED***"),
+    # A raw `Authorization: <key>` (Linear personal keys are sent bare). {8,}
+    # keeps a scheme word already handled above (Bearer/Token/Basic) unmatched.
+    (re.compile(r"(authorization:\s*)[^\s\"'*]{8,}", re.IGNORECASE), r"\1***REDACTED***"),
 ]
 
 

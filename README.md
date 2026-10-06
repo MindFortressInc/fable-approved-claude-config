@@ -178,9 +178,9 @@ Two paired hooks keep the issue tracker honest about what's actually being worke
 
 - **`branch-name-gate.sh`** (PreToolUse) — on branch **creation**, requires the branch to carry the ticket's exact canonical `gitBranchName`, so the PR links and Linear's own status automation fires. No ticket token → deny (the PR would never link); token present but off-slug → deny and hand back the exact name to re-run. Put `LINEAR_SKIP=1` in the command to bypass for genuinely ticket-less branches (infra/config repos).
 - **`reconcile-ticket.sh`** (CLI, called by `wrapup` and `babysit-prs`) — advances a ticket to **Deployed** only when *every* linked PR is merged into its repo's default branch (a stacked PR merged into its parent reports MERGED early), fixing the multi-PR race where the tracker's per-PR automation leaves a cross-repo ticket stuck In Progress after the first sibling merges. It advances only FROM the states you list — an Epics-style container status is often started-type too, and a "started and not Deployed" rule bounced parked containers straight back to Deployed. Advance-only, never sets Done, fail-open; needs `LINEAR_DEPLOYED_STATE_ID` and `LINEAR_ADVANCE_FROM_STATE_IDS` (comma-separated, typically In Progress + In Review) on top of the shared config.
-
-All three hooks pass the Linear key to `curl` through `--config <(printf …)` rather than `-H "Authorization: …"`: argv is world-readable via `ps`, so a header on the command line publishes the key for the life of the request. A static check in `tests/test_static_checks.py` fails if any hook reintroduces it. Both creation gates scan a heredoc- and quote-aware projection of the command (`hooks/shell-code-only.sh`): the old "truncate at the first `<<`" stripper let a branch created *after* a heredoc skip the gate entirely, and a quoted branch name was stripped as data.
 - **`linear-startwork.sh`** (PostToolUse) — the other half: once that branch lands, take the ticket — flip a not-started state to In Progress and assign you if it's unassigned (never reassigns someone else's ticket, never regresses In Review/Deployed/Done). It detects creation via `checkout -b/-B`, `switch -c/-C`, bare `git branch`, **and `git worktree add … -b`** — the last is what the worktree-per-ticket pattern actually uses, so without it the ticket silently never moves (we hit exactly this).
+
+All three Linear hooks above pass the Linear key to `curl` through `--config <(printf …)` rather than `-H "Authorization: …"`: argv is world-readable via `ps`, so a header on the command line publishes the key for the life of the request. A static check in `tests/test_static_checks.py` fails if any hook reintroduces it. Both creation gates scan a heredoc- and quote-aware projection of the command (`hooks/shell-code-only.sh`): the old "truncate at the first `<<`" stripper let a branch created *after* a heredoc skip the gate entirely, and a quoted branch name was stripped as data.
 
 ## Cross-cutting: work taxonomy (Linear conventions)
 
@@ -241,7 +241,7 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
 
    ```bash
    mkdir -p ~/.claude/hooks
-   cp hooks/*.sh hooks/*.py ~/.claude/hooks/
+   for f in hooks/*.sh hooks/*.py; do case "$f" in *.test.sh) ;; *) cp "$f" ~/.claude/hooks/ ;; esac; done
    chmod +x ~/.claude/hooks/*.sh ~/.claude/hooks/*.py
    ```
 

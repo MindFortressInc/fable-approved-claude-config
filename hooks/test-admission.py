@@ -34,6 +34,7 @@ Ledger: JSONL at TEST_ADMISSION_LOG (default ~/.claude/test-admission.log).
 The gate fails OPEN on its own errors -- a bug here must not brick Bash.
 """
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -66,6 +67,7 @@ VALUE_OPTS = {
     "--junit-xml", "--basetemp", "--log-level", "--durations", "--ignore",
     "--ignore-glob", "--deselect", "--confcutdir", "--override-ini",
     "--maxprocesses", "--timeout-method", "--color", "--capture",
+    "--cov", "--cov-report", "--cov-config", "--cov-fail-under",
 }
 # Options under which pytest collects or reports but runs no tests: exempt.
 NO_RUN_OPTS = {"--collect-only", "--co", "--version", "-V", "-h", "--help",
@@ -263,8 +265,31 @@ def admit_full(session_id, cwd, command):
         name = f"claim-{time.time():.6f}-{os.getpid()}.json"
         with open(os.path.join(STATE_DIR, name), "w") as f:
             json.dump({"ts": time.time(), "session_id": session_id, "cwd": cwd,
-                       "command": command[:300]}, f)
+                       "command": _redact(command)[:300]}, f)
     return None
+
+
+def _redactor():
+    """cleanup-sweep.py's credential scrubber, so a token typed inline in a
+    pytest command never rests in the ledger or a claim file. Identity when the
+    helper is absent (a partial vendor of hooks/)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleanup-sweep.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_cleanup_sweep_redact", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._redact
+    except Exception:
+        return lambda text: text
+
+
+_REDACT = []
+
+
+def _redact(text):
+    if not _REDACT:  # lazy: only the deny/bypass/claim paths pay for the import
+        _REDACT.append(_redactor())
+    return _REDACT[0](text)
 
 
 def log(decision, reason, payload, command):
@@ -272,8 +297,8 @@ def log(decision, reason, payload, command):
         with open(LEDGER, "a") as f:
             f.write(json.dumps({
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "decision": decision,
-                "reason": reason, "session_id": payload.get("session_id"),
-                "cwd": payload.get("cwd"), "command": command[:300]}) + "\n")
+                "reason": _redact(reason), "session_id": payload.get("session_id"),
+                "cwd": payload.get("cwd"), "command": _redact(command)[:300]}) + "\n")
     except Exception:
         pass
 

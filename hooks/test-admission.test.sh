@@ -96,5 +96,15 @@ check "unbalanced quote still parsed" "$(j Bash 'pytest tests/a -n auto -k "foo'
 grep -q '"decision": "deny"' "$TEST_ADMISSION_LOG" && grep -q '"decision": "bypass"' "$TEST_ADMISSION_LOG" \
   && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: ledger records deny + bypass"; }
 
+# --- coverage flags take a value; an inline token never reaches the ledger
+reset
+ps_set "500 1 00:10 $PY -m pytest -q"
+check "--cov <pkg> is still a full suite" "$(j Bash 'pytest --cov app -q' s9)"                   DENY
+reset
+: > "$TEST_ADMISSION_LOG"
+check "deny with inline token"     "$(j Bash 'GH_TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA pytest tests/a -n 8')" DENY
+if grep -q 'ghp_AAAA' "$TEST_ADMISSION_LOG"; then fail=$((fail+1)); echo "FAIL: ledger stores raw token"
+else grep -q 'REDACTED' "$TEST_ADMISSION_LOG" && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: ledger row not redacted"; }; fi
+
 echo "test-admission: $pass passed, $fail failed"
 [ $fail -eq 0 ]
