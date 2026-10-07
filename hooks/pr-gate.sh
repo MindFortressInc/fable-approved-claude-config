@@ -78,14 +78,15 @@ scan=$(shell_code_only "$(sed -E 's/\\([A-Za-z0-9_])/\1/g' <<<"$cmd")")
 # a separator (`;` `&` `|` `(` `)` `{` `}` `!`), optionally behind any run of
 # `VAR=value` assignments, leading redirections (`>/tmp/out gh pr create …`),
 # command-introducing or wrapper words (`if`, `then`, `sudo`, `time`, `timeout`,
-# `nice`, `env`, …) and the flag/numeric operands those wrappers take
-# (`sudo -E`, `timeout 60`, `nice -n 5`). `gh` may be invoked by path
-# (`/opt/homebrew/bin/gh`). grep is line-oriented, so `^` also covers newline as
+# `nice`, `env`, …) together with ANY operands they take (`sudo -u root`,
+# `timeout -s KILL 60`, `env -u FOO`, `exec -a name`). `gh` may be invoked by
+# path (`/opt/homebrew/bin/gh`) and with global options before the subcommand
+# (`gh -R owner/repo pr create`). grep is line-oriented, so `^` also covers newline as
 # a separator — which is why the heredoc bodies had to go first.
 #
 # Over-matching here only ever DENIES (the gate then asks for a ledger);
 # under-matching lets a real PR open ungated, so the prefix run errs wide.
-TRIGGER_RE='(^|[;&|(){}!])[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|[0-9]*[<>]{1,2}&?[[:space:]]*[^[:space:];&|<>]*|-[^[:space:];&|<>]*|[0-9][^[:space:];&|<>]*|if|then|else|elif|while|until|do|time|exec|command|builtin|sudo|doas|nohup|env|nice|ionice|timeout|gtimeout|xargs|caffeinate|stdbuf)[[:space:]]+)*([^[:space:];&|()<>]*/)?gh[[:space:]]+pr[[:space:]]+create([[:space:];&|)}]|$)'
+TRIGGER_RE='(^|[;&|(){}!])[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|[0-9]*[<>]{1,2}&?[[:space:]]*[^[:space:];&|<>]*|-[^[:space:];&|<>]*|[0-9][^[:space:];&|<>]*|(if|then|else|elif|while|until|do|time|exec|command|builtin|sudo|doas|nohup|env|nice|ionice|timeout|gtimeout|xargs|caffeinate|stdbuf)([[:space:]]+[^[:space:];&|<>()]+)*)[[:space:]]+)*([^[:space:];&|()<>]*/)?gh([[:space:]]+-[^[:space:];&|<>()]+([[:space:]]+[^-[:space:];&|<>()][^[:space:];&|<>()]*)?)*[[:space:]]+pr[[:space:]]+create([[:space:];&|)}]|$)'
 grep -qE "$TRIGGER_RE" <<<"$scan" || exit 0
 
 # Escape hatches read `$scan`, not `$cmd`: a PR body that DESCRIBES the hatch

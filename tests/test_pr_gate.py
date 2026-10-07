@@ -359,12 +359,18 @@ class PrGateTest(unittest.TestCase):
         # Wrapper words with operands, an absolute path to gh, and an escaped
         # command word all run the real thing -- each must still be gated.
         for pre in ("/opt/homebrew/bin/", "timeout 60 ", "nice ", "nice -n 5 ",
-                    "sudo -E ", "env -i ", "\\"):
+                    "sudo -E ", "env -i ", "\\", "sudo -u root ",
+                    "timeout -s KILL 60 ", "exec -a x ", "env -u FOO "):
             with self.subTest(prefix=pre):
                 cmd = "cd %s && %s%s --fill" % (self.repo, pre, GHPR)
                 rc, out, _ = self._run(cmd)
                 self.assertEqual(decision(out), "deny", cmd)
                 self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_gh_global_repo_flag_still_denied(self):
+        cmd = "cd %s && gh -R o/r pr create --fill" % self.repo
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny", cmd)
 
     def test_ordinary_command_mentioning_the_verb_still_passes(self):
         for cmd in ("echo gh pr create later", "git log --grep 'gh pr create'",
