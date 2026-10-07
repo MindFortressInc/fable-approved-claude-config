@@ -182,6 +182,29 @@ Two paired hooks keep the issue tracker honest about what's actually being worke
 
 All three Linear hooks above pass the Linear key to `curl` through `--config <(printf …)` rather than `-H "Authorization: …"`: argv is world-readable via `ps`, so a header on the command line publishes the key for the life of the request. A static check in `tests/test_static_checks.py` fails if any hook reintroduces it. Both creation gates scan a heredoc- and quote-aware projection of the command (`hooks/shell-code-only.sh`): the old "truncate at the first `<<`" stripper let a branch created *after* a heredoc skip the gate entirely, and a quoted branch name was stripped as data.
 
+## Cross-cutting: collision check (is another agent already building this?)
+
+Parallel agents that derive branch names from the same ticket id will, sooner or later, both build the same ticket — and the one that "clears the way" deletes the other's unpushed work. [`hooks/collision-check.sh`](hooks/collision-check.sh) `<TICKET> [--repo <name>]` is the detection half: `/execute` and `/orchestrate` run it before `git worktree add`. It is read-only and runs five probes: the **Linear state** (In Review, or started/completed with a linked PR or an assignee), **live worktrees** across every primary clone (the only probe that sees committed-but-unpushed work), **local branches**, **remote branches** (`ls-remote`), and **open PRs** (`gh pr list`, via [`hooks/collision-pr-cache.py`](hooks/collision-pr-cache.py), a 60-second per-repo cache shared across tickets). It matches the ticket token with or without the hyphen (`dev-42` and `dev42`) in the worktree path or the branch name.
+
+Exit codes: **0** clear · **1** collision (halt and report — never `git worktree remove` or `git branch -D` your way past it) · **2** usage or config error · **3** DEGRADED: no collision found, but a probe could not run, so the answer is *unknown*, not clear. Hits that resolve to the caller's own worktree (the one containing `$PWD`, when its path or branch carries the ticket token) print as `· self` and don't count, so a builder re-checking its own ticket isn't stopped by its own branch, PR, or startwork state flip.
+
+**Unconfigured means exit 3.** No setting has an org-specific default, and a probe with no config degrades the verdict rather than passing silently. An explicit `COLLISION_CHECK_SKIP_*` is the only way to switch a probe off and still get exit 0. Configure it through the `env` block of `~/.claude/settings.json` so every Bash call sees the values:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `COLLISION_CHECK_ROOTS` | *(none — unset degrades)* | Colon-separated directories to scan. Each entry is either a primary clone itself or a directory whose immediate subdirectories are primary clones (e.g. `$HOME/code:$HOME/.claude`). |
+| `LINEAR_BRANCH_PREFIX` | `dev` | Ticket token prefix, shared with `linear-startwork.sh`. The ticket can be given as `DEV-42`, `dev42`, or `42`. |
+| `LINEAR_API_KEY` / `LINEAR_KEY_FILE` | *(none — unset degrades)* | The Linear key, resolved the same way as the tracker hooks: the env var first, then `.env.LINEAR_API_KEY` from the JSON file. |
+| `LINEAR_DEV_TEAM_ID` | *(none — unset degrades)* | UUID of the team whose issues the Linear-state probe queries. |
+| `LINEAR_API_URL` | `https://api.linear.app/graphql` | Tracker GraphQL endpoint. |
+| `COLLISION_CHECK_OWN_ORGS` | *(none — unset degrades)* | Colon-separated GitHub owners (orgs or users) your branches land in. The PR probe skips other owners with an `ℹ` line, and only own-org repos get the REST fallback when GraphQL hits its secondary rate limit. |
+| `COLLISION_CHECK_RETIRED_REMOTES` | *(empty)* | Colon-separated `owner/name` list whose HTTP 404 is expected (a deleted repo you still have cloned). Any other 404 degrades, because GitHub also 404s a private repo your token can't see. |
+| `COLLISION_CHECK_SKIP_LINEAR` / `_SKIP_REMOTE` / `_SKIP_PRS` | *(empty)* | Non-empty = explicitly skip that probe (Linear state / remote branches / open PRs). Printed as a `·` line. |
+| `COLLISION_CHECK_SELF_DIR` | `$PWD` | The caller's workspace for the `· self` rule. It only counts if that worktree's path or branch carries the ticket token. |
+| `COLLISION_CHECK_PR_CACHE_DIR` | `<tmp>/collision-pr-cache-<uid>` | Private PR-listing cache. Empty disables it. Failed or capped listings are never cached. |
+
+Needs `git`. The Linear probe also needs `curl` + `jq`, and the PR probe needs `gh` + `python3`. `hooks/collision-check.test.sh` (real throwaway repos, stubbed `gh`/`curl`, no network) and `tests/test_collision_pr_cache.py` pin the behaviour, including that a fully unconfigured run exits 3.
+
 ## Cross-cutting: work taxonomy (Linear conventions)
 
 The vocabulary `PRlaunch`, `wrapup`, `bulldozer`, and `assign` all assume for filing and routing follow-up work. Canonical — those skills reference this section instead of restating it.
