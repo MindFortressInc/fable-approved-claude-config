@@ -51,24 +51,27 @@ OWNER_EMAIL = "owner@example.com"
 # Fixture git repo helper
 # --------------------------------------------------------------------------
 
-def _run(repo, *args):
+def _run(repo, *args, env=None):
     proc = subprocess.run(
         ["git", "-C", repo, *args],
         capture_output=True, text=True,
+        env=None if env is None else {**os.environ, **env},
     )
     assert proc.returncode == 0, f"git {args} failed: {proc.stderr}"
     return proc.stdout
 
 
-def _commit(repo, message, files):
-    """Write `files` ({relpath: content}) and commit them."""
+def _commit(repo, message, files, date=None):
+    """Write `files` ({relpath: content}) and commit them (at `date`, an
+    ISO-8601 timestamp, when given)."""
     for relpath, content in files.items():
         full = os.path.join(repo, relpath)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w") as f:
             f.write(content)
         _run(repo, "add", relpath)
-    _run(repo, "commit", "-m", message, "--allow-empty")
+    env = {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date} if date else None
+    _run(repo, "commit", "-m", message, "--allow-empty", env=env)
     return _run(repo, "rev-parse", "HEAD").strip()
 
 
@@ -195,6 +198,59 @@ class TestCheckPremise(unittest.TestCase):
         v = check_premise(self.repo, "main", finding)
         self.assertEqual(v.status, "AMBIGUOUS")
         self.assertEqual(v.fix_sha, "")
+
+
+class TestFiledAtGuard(unittest.TestCase):
+    """A pattern that was already gone when the ticket was filed is not a fix
+    this ticket can cite — most likely the parser grabbed the wrong span."""
+
+    PAT = "sed -E \"s/'[^']*'//g\""
+
+    def setUp(self):
+        self.repo = make_repo()
+        _commit(self.repo, "add", {"hooks/g.sh": self.PAT + "\n"}, date="2026-01-01T00:00:00Z")
+        self.fix_sha = _commit(self.repo, "remove", {"hooks/g.sh": "lex\n"},
+                               date="2026-02-01T00:00:00Z")
+        self.finding = Finding("ENG-X", "hooks/g.sh", None, self.PAT)
+
+    def test_filed_after_removal_is_ambiguous(self):
+        v = check_premise(self.repo, "main", self.finding, filed_at="2026-03-01T00:00:00.000Z")
+        self.assertEqual(v.status, "AMBIGUOUS")
+        self.assertEqual(v.fix_sha, "")
+
+    def test_filed_before_any_commit_is_ambiguous(self):
+        v = check_premise(self.repo, "main", self.finding, filed_at="2025-06-01T00:00:00.000Z")
+        self.assertEqual(v.status, "AMBIGUOUS")
+
+    def test_filed_while_present_is_confirmed_gone(self):
+        v = check_premise(self.repo, "main", self.finding, filed_at="2026-01-15T00:00:00.000Z")
+        self.assertEqual(v.status, "CONFIRMED_GONE")
+        self.assertEqual(v.fix_sha, self.fix_sha)
+
+    def test_live_run_never_closes_a_ticket_filed_after_removal(self):
+        t = Ticket("uuid-ENG-9", "ENG-9", "t",
+                   f"The bug: (`{self.PAT}`) is naive.\n\n**Files:** `hooks/g.sh` (~line 1)",
+                   None, created_at="2026-03-01T00:00:00.000Z")
+        client = FakeLinearClient([t])
+        results = run_reconcile(client, epic="E", repo=self.repo, default_branch="main",
+                                owner_email=None, live=True)
+        self.assertEqual(results[0].verdict, "AMBIGUOUS")
+        self.assertEqual(client.closed, [])
+
+
+class TestFixCommitParentGuard(unittest.TestCase):
+    def test_commit_whose_parent_lacks_pattern_is_not_cited(self):
+        repo = make_repo()
+        unrelated = _commit(repo, "init", {"hooks/g.sh": "echo hi\n"})
+        _commit(repo, "more", {"hooks/g.sh": "echo bye\n"})
+        mod = sys.modules["reconcile"]
+        orig = mod.find_removal_commit
+        mod.find_removal_commit = lambda *a: unrelated
+        try:
+            v = check_premise(repo, "main", Finding("ENG-X", "hooks/g.sh", None, "some_pattern(x)"))
+        finally:
+            mod.find_removal_commit = orig
+        self.assertEqual(v.status, "AMBIGUOUS")
 
 
 # --------------------------------------------------------------------------

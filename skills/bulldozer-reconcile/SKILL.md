@@ -74,6 +74,12 @@ For each **open** child of the epic:
    - **Absent, file unreadable, or no removal commit found** →
      `AMBIGUOUS`, left untouched. Absence alone is never enough — evidence
      before assertion.
+   - **Absent now, but also absent when the ticket was filed** (the file at
+     `git rev-list -1 --before=<createdAt> <default-branch>` lacks the
+     pattern) → `AMBIGUOUS`. The parser most likely grabbed the wrong span,
+     and an old unrelated removal of that string is not this ticket's fix.
+   - **Candidate commit whose parent lacks the pattern** → `AMBIGUOUS`: a
+     commit can only be cited as the fix if it actually removed the pattern.
    - **Absent, with a specific commit found (`git log <default-branch> -S
      <pattern> -- <file>`) that is confirmed via `git merge-base
      --is-ancestor <sha> <default-branch>`** → `CONFIRMED_GONE`. Restricting

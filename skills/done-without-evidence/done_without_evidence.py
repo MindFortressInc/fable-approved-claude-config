@@ -175,12 +175,20 @@ def sweep_issues(issues, label=WHITELIST_LABEL):
     return out
 
 
-def render_report(violations, team_name, now):
-    """Pure markdown rendering — no network, no filesystem."""
+def render_report(violations, team_name, now, truncated_at=None):
+    """Pure markdown rendering — no network, no filesystem. `truncated_at` is
+    the number of issues scanned when the fetch stopped with more remaining;
+    the report then says so, so a partial sweep can never read as "clean"."""
     lines = []
     lines.append(f"### Done-without-evidence sweep — {team_name}")
     lines.append(f"_generated {now.strftime('%Y-%m-%d %H:%MZ')}_")
     lines.append("")
+    if truncated_at:
+        lines.append(
+            f"⚠ **Partial sweep:** stopped after {truncated_at} closed issue(s) with more "
+            "remaining — older tickets were NOT examined."
+        )
+        lines.append("")
     if not violations:
         lines.append(
             "**Result:** clean — no closed ticket lacks started/PR/commit evidence."
@@ -245,19 +253,26 @@ query ClosedIssues($team: String!, $after: String) {
 """
 
 
+MAX_PAGES = 50  # backstop: 5,000 issues
+
+
 def fetch_closed_issues(team_name, limit=None, gql_fn=gql):
+    """Return (issues, truncated). `truncated` is True when the fetch stopped —
+    at --limit or at the MAX_PAGES backstop — while more issues remained."""
     out, after, pages = [], None, 0
     while True:
         data = gql_fn(CLOSED_ISSUES_QUERY, {"team": team_name, "after": after})
         blk = data["issues"]
         out.extend(blk["nodes"])
         pages += 1
+        more = blk["pageInfo"]["hasNextPage"]
         if limit and len(out) >= limit:
-            return out[:limit]
-        if not blk["pageInfo"]["hasNextPage"] or pages >= 50:  # backstop
-            break
+            return out[:limit], (len(out) > limit or more)
+        if not more:
+            return out, False
+        if pages >= MAX_PAGES:
+            return out, True
         after = blk["pageInfo"]["endCursor"]
-    return out
 
 
 TEAM_ID_QUERY = """
@@ -403,10 +418,10 @@ def post_comment(issue_id, body, gql_fn=gql):
 
 def run_sweep(team, project=None, limit=None, dry_run=False, gql_fn=gql,
               state_path=DEFAULT_STATE_PATH):
-    issues = fetch_closed_issues(team, limit=limit, gql_fn=gql_fn)
+    issues, truncated = fetch_closed_issues(team, limit=limit, gql_fn=gql_fn)
     violations = sweep_issues(issues)
     now = datetime.now(timezone.utc)
-    report = render_report(violations, team, now)
+    report = render_report(violations, team, now, truncated_at=len(issues) if truncated else None)
 
     result = {
         "report": report,

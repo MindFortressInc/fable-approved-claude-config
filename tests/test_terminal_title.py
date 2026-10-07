@@ -75,6 +75,14 @@ class TerminalTitleTest(unittest.TestCase):
             written = fh.read()
         self.assertEqual(written, "\x1b]0;%s evil]0;pwned title\x07" % tt.PREFIX)
 
+    def test_emit_strips_c1_controls(self):
+        # ST (\x9c) and CSI (\x9b) terminate/start sequences on some terminals.
+        fake_tty = os.path.join(self.tmp, "tty")
+        self.assertTrue(tt.emit("a\x9cb\x9b2Jc\x85d é", fake_tty))
+        with open(fake_tty) as fh:
+            written = fh.read()
+        self.assertEqual(written, "\x1b]0;%s ab2Jcd é\x07" % tt.PREFIX)
+
     def test_emit_without_tty_is_a_noop(self):
         self.assertFalse(tt.emit("title", None))
 

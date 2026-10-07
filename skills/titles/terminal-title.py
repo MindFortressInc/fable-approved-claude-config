@@ -166,8 +166,9 @@ def emit(title, tty_path):
         return False
     # The title is model-generated text going inside an OSC sequence: strip
     # control chars (ESC, BEL, ...) so it can't terminate the sequence early
-    # or inject further escapes into the terminal.
-    title = "".join(ch for ch in title if ch >= " " and ch != "\x7f")
+    # or inject further escapes into the terminal. That includes DEL and the C1
+    # range (\x80-\x9f): some terminals honour ST (\x9c) / CSI (\x9b) directly.
+    title = "".join(ch for ch in title if ch >= " " and not ("\x7f" <= ch <= "\x9f"))
     try:
         with open(tty_path, "w") as t:
             t.write("\x1b]0;{} {}\x07".format(PREFIX, title))

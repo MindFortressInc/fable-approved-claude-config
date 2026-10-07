@@ -212,7 +212,19 @@ def is_ancestor(repo: str, sha: str, ref: str) -> bool:
     return proc.returncode == 0
 
 
-def check_premise(repo: str, default_branch: str, finding: Finding) -> Verdict:
+def commit_at(repo: str, ref: str, when: str) -> Optional[str]:
+    """The tip of `ref` as of `when` (an ISO-8601 timestamp), or None."""
+    proc = _git(repo, "rev-list", "-1", f"--before={when}", ref)
+    sha = proc.stdout.strip() if proc.returncode == 0 else ""
+    return sha or None
+
+
+def check_premise(repo: str, default_branch: str, finding: Finding,
+                  filed_at: Optional[str] = None) -> Verdict:
+    """`filed_at` (the ticket's createdAt, when known) requires the pattern to
+    have been on `default_branch` when the ticket was filed — so a misparsed
+    pattern that merely existed at some point in history can't cite an
+    unrelated old removal as "the fix"."""
     content, err = get_file_at_ref(repo, default_branch, finding.file)
     if content is None:
         return Verdict(
@@ -225,6 +237,17 @@ def check_premise(repo: str, default_branch: str, finding: Finding) -> Verdict:
             "STILL_PRESENT",
             f"pattern still present in {finding.file} at {default_branch}",
         )
+
+    if filed_at:
+        base = commit_at(repo, default_branch, filed_at)
+        at_filing, _ = get_file_at_ref(repo, base, finding.file) if base else (None, None)
+        if at_filing is None or finding.pattern not in at_filing:
+            return Verdict(
+                "AMBIGUOUS",
+                f"pattern was not in {finding.file} on {default_branch} when the ticket "
+                f"was filed ({filed_at}) — the parsed pattern may not be the defect, "
+                f"so this is NOT auto-closeable",
+            )
 
     fix_sha = find_removal_commit(repo, default_branch, finding.file, finding.pattern)
     if not fix_sha:
@@ -248,6 +271,16 @@ def check_premise(repo: str, default_branch: str, finding: Finding) -> Verdict:
             f"of {default_branch} — treating as still-outstanding",
         )
 
+    # The cited commit must actually be the one that removed the pattern: its
+    # parent has to contain it. Anything else is not evidence of a fix.
+    before, _ = get_file_at_ref(repo, f"{fix_sha}^", finding.file)
+    if before is None or finding.pattern not in before:
+        return Verdict(
+            "AMBIGUOUS",
+            f"candidate {fix_sha} did not remove the pattern from {finding.file} "
+            f"(absent from its parent) — cannot cite it as the fix",
+        )
+
     loc = f"{finding.file}:{finding.line_hint}" if finding.line_hint else finding.file
     return Verdict(
         "CONFIRMED_GONE",
@@ -267,6 +300,7 @@ class Ticket:
     title: str
     description: str
     assignee_email: Optional[str] = None
+    created_at: Optional[str] = None  # ISO-8601; gates "was this real when filed?"
 
 
 @dataclass
@@ -312,7 +346,7 @@ def run_reconcile(client, epic: str, repo: str, default_branch: str,
             ))
             continue
 
-        verdict = check_premise(repo, default_branch, finding)
+        verdict = check_premise(repo, default_branch, finding, filed_at=ticket.created_at)
         action = "none"
         if verdict.status == "CONFIRMED_GONE" and live:
             comment = (
@@ -409,7 +443,7 @@ class LiveLinearClient:
             "team { id key } "
             "children(first: 100, after: $after) { "
             "pageInfo { hasNextPage endCursor } "
-            "nodes { id identifier title description "
+            "nodes { id identifier title description createdAt "
             "state { name type } assignee { email } } } } }"
         )
         out: List[Ticket] = []
@@ -418,7 +452,9 @@ class LiveLinearClient:
             data = self._gql(query, {"id": epic_uuid, "after": after})
             issue = data.get("issue")
             if issue is None:
-                break
+                # Never let a missing epic read as "no open children" — that
+                # renders as a clean report over nothing.
+                raise RuntimeError(f"epic {epic_uuid} not found")
             if self._team_id is None:
                 self._team_id = issue["team"]["id"]
             conn = issue["children"]
@@ -431,6 +467,7 @@ class LiveLinearClient:
                     title=n["title"],
                     description=n.get("description") or "",
                     assignee_email=(n.get("assignee") or {}).get("email"),
+                    created_at=n.get("createdAt"),
                 ))
             if not conn["pageInfo"]["hasNextPage"]:
                 break

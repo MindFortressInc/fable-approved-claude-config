@@ -427,5 +427,41 @@ class CliDryRunTests(unittest.TestCase):
         self.assertEqual(dwe.load_state(self.state_path)["issue_id"], "standing-1")
 
 
+class TruncationTests(unittest.TestCase):
+    """A sweep that stops with issues remaining must say so — a partial scan
+    must never render as a "clean" verdict."""
+
+    @staticmethod
+    def _paged_stub(pages):
+        state = {"i": 0}
+
+        def fake_issues(v):
+            i = state["i"]
+            state["i"] += 1
+            return {"issues": {"pageInfo": {"hasNextPage": i + 1 < pages, "endCursor": str(i)},
+                               "nodes": [make_issue(identifier="ENG-%d" % i, started_at="x")]}}
+        return GqlStub([("issues", fake_issues)])
+
+    def test_backstop_hit_is_reported(self):
+        issues, truncated = dwe.fetch_closed_issues("Eng", gql_fn=self._paged_stub(dwe.MAX_PAGES + 5))
+        self.assertEqual(len(issues), dwe.MAX_PAGES)
+        self.assertTrue(truncated)
+        out = dwe.run_sweep(team="Eng", dry_run=True, gql_fn=self._paged_stub(dwe.MAX_PAGES + 5))
+        self.assertIn("Partial sweep", out["report"])
+
+    def test_limit_with_more_remaining_is_reported(self):
+        issues, truncated = dwe.fetch_closed_issues("Eng", limit=2, gql_fn=self._paged_stub(5))
+        self.assertEqual(len(issues), 2)
+        self.assertTrue(truncated)
+
+    def test_complete_fetch_is_not_truncated(self):
+        issues, truncated = dwe.fetch_closed_issues("Eng", gql_fn=self._paged_stub(3))
+        self.assertEqual(len(issues), 3)
+        self.assertFalse(truncated)
+        out = dwe.run_sweep(team="Eng", dry_run=True, gql_fn=self._paged_stub(3))
+        self.assertNotIn("Partial sweep", out["report"])
+        self.assertIn("clean", out["report"])
+
+
 if __name__ == "__main__":
     unittest.main()
