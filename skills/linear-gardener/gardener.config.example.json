@@ -13,7 +13,7 @@
   "session_epic_size": 5,
   "classifier": {
     "chunk_size": 120,
-    "model": "sonnet"
+    "model": null
   },
   "initiative_map": {
     "_comment": "destination project name -> initiative name; omit an entry to skip initiative wiring for that project",

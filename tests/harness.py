@@ -34,6 +34,7 @@ HOOK_FILES = [
     "prlaunch-gate.sh",
     "branch-name-gate.sh",
     "linear-startwork.sh",
+    "shell-code-only.sh",  # sourced by the two gates above for heredoc stripping
     "check-careful.sh",
     "careful-rm.py",
     "cleanup-sweep.py",
@@ -52,6 +53,8 @@ _LINEAR_ENV = {
     "LINEAR_INPROGRESS_STATE_ID": "11111111-1111-1111-1111-111111111111",
     "LINEAR_ASSIGNEE_ID": "22222222-2222-2222-2222-222222222222",
     "LINEAR_DEPLOYED_STATE_ID": "33333333-3333-3333-3333-333333333333",
+    # In Progress (same id as LINEAR_INPROGRESS_STATE_ID) + an In Review id.
+    "LINEAR_ADVANCE_FROM_STATE_IDS": "11111111-1111-1111-1111-111111111111,55555555-5555-5555-5555-555555555555",
     "LINEAR_BRANCH_PREFIX": "eng",
 }
 
@@ -313,4 +316,58 @@ esac
 # gh shim: echoes the PR state named in FAKE_PR_STATE (default MERGED).
 GH_SHIM = r"""#!/bin/bash
 echo "${FAKE_PR_STATE:-MERGED}"
+"""
+
+# gh shim for `gh api repos/<o>/<r>/pulls/<n> --jq <expr>`: applies the caller's
+# REAL --jq filter to $FAKE_PR_JSON, so a test exercises the hook's actual
+# expression rather than a canned answer. With FAKE_PR_JSON unset, the PR is
+# derived from FAKE_PR_STATE (MERGED -> merged into its default branch `main`).
+# Any other gh subcommand fails loudly, and FAKE_GH_FAIL=1 simulates an API error.
+GH_API_PR_SHIM = r"""#!/bin/bash
+[ "$1" = "api" ] || { echo "unexpected gh call: $*" >&2; exit 1; }
+[ "${FAKE_GH_FAIL:-}" = "1" ] && exit 1
+expr=""; prev=""
+for a in "$@"; do [ "$prev" = "--jq" ] && expr="$a"; prev="$a"; done
+json="${FAKE_PR_JSON:-}"
+if [ -z "$json" ]; then
+  if [ "${FAKE_PR_STATE:-MERGED}" = "MERGED" ]; then m=true; else m=false; fi
+  json="{\"merged\":$m,\"base\":{\"ref\":\"main\",\"repo\":{\"default_branch\":\"main\"}}}"
+fi
+if [ -n "$expr" ]; then jq -r "$expr" <<<"$json"; else printf '%s\n' "$json"; fi
+"""
+
+# Same behaviour as CURL_SHIM, but first appends the full invocation to
+# $CURL_CAPTURE_FILE so a test can assert what the outbound request carried.
+# The Authorization header no longer travels in argv -- the hooks write it into
+# a `--config` file over a process substitution so `ps` cannot read the key --
+# so capturing only "$*" would capture everything EXCEPT the credential. The
+# shim therefore resolves --config and appends the file's contents too: what a
+# test inspects stays "the header curl was actually asked to send".
+CURL_CAPTURE_SHIM = r"""#!/bin/bash
+echo "$*" >> "$CURL_CAPTURE_FILE"
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--config" ] || [ "$prev" = "-K" ]; then
+    cat "$a" >> "$CURL_CAPTURE_FILE" 2>/dev/null \
+      || echo "UNREADABLE-CONFIG:$a" >> "$CURL_CAPTURE_FILE"
+  fi
+  prev="$a"
+done
+args="$*"
+if [ "${FAKE_MODE:-}" = "error" ]; then
+  echo ''
+  exit 0
+fi
+case "$args" in
+  *issueUpdate*)
+    echo '{"data":{"issueUpdate":{"success":true}}}'
+    ;;
+  *)
+    if [ -n "${FAKE_ISSUE_NODE:-}" ]; then
+      printf '{"data":{"issues":{"nodes":[%s]}}}' "$FAKE_ISSUE_NODE"
+    else
+      echo '{"data":{"issues":{"nodes":[]}}}'
+    fi
+    ;;
+esac
 """

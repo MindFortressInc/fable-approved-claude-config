@@ -36,15 +36,41 @@ cmd=$(jq -r '.tool_input.command // ""' <<<"$input" 2>/dev/null)
 [ -z "$cmd" ] && exit 0
 [ -z "$TEAM" ] && exit 0          # unconfigured -> no-op (don't gate)
 
-# Escape hatch (owner-authorized): ticket-less branches.
-[[ "$cmd" == *"LINEAR_SKIP=1"* ]] && exit 0
-
 # Detect on the command STRUCTURE, not string data: commit messages
 # (`-m "…"`, `-F - <<EOF …`) and echoed text routinely contain literal
 # "git checkout -b …" that must NOT be read as a real branch creation. Drop the
-# heredoc body (everything from the first <<) and quoted spans before scanning.
-scan="${cmd%%<<*}"
+# spans bash treats as DATA — heredoc BODIES, here-strings, quoted spans,
+# comments — and scan only what is left.
+#
+# This used to be `scan="${cmd%%<<*}"`, which truncated the command at the FIRST
+# `<<`, so a branch create that FOLLOWED a heredoc was invisible here and the
+# gate failed OPEN. The shared walk (shell-code-only.sh) holds both directions:
+# code after a heredoc is scanned, a create-looking string inside the body is not.
+lib="$(dirname "$0")/shell-code-only.sh"
+# shellcheck source=hooks/shell-code-only.sh
+[ -r "$lib" ] && . "$lib"
+# Helper absent (a partial vendor of this hooks dir): fall back to the old
+# stripper rather than scanning nothing, which would silently disable the gate.
+declare -F shell_code_only >/dev/null 2>&1 \
+  || shell_code_only() { printf '%s\n' "${1%%<<*}"; }
+# Same story for the operand recovery — identity, not nothing.
+declare -F unquote_plain_operands >/dev/null 2>&1 \
+  || unquote_plain_operands() { printf '%s\n' "$1"; }
+# Un-quote the create-flag operand FIRST. Both strippers drop a quoted span
+# whole, so a quoted branch name never survived to the extraction below:
+# `-b "me/dev-1-x" origin/main` arrived as `-b  origin/main` (denied, blaming the
+# start point) and a trailing `-b "me/dev-1-x"` arrived as `-b ` (no operand —
+# no create found, anything allowed). $cmd itself is left untouched; only what
+# we SCAN is normalised.
+scan=$(shell_code_only "$(unquote_plain_operands "$cmd")")
+# A no-op on the walk's output (it already drops quoted spans); this is the line
+# that strips them on the fallback path above.
 scan=$(printf '%s' "$scan" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")
+
+# Escape hatch (owner-authorized): ticket-less branches. Read from $scan, not the
+# raw command: a heredoc body or commit message that MENTIONS the hatch is prose,
+# not a use of it, and must not disarm the gate.
+[[ "$scan" == *"LINEAR_SKIP=1"* ]] && exit 0
 
 # Only act on branch CREATION verbs (same detection as linear-startwork.sh).
 newbranch=$(grep -oiE '(checkout +-[bB]|switch +-[cC]) +[^ ;&|]+' <<<"$scan" | head -1 | awk '{print $NF}')
@@ -78,7 +104,7 @@ fi
 
 q="query { issues(filter: { number: { eq: ${num} }, team: { id: { eq: \"${TEAM}\" } } }) { nodes { identifier branchName } } }"
 resp=$(curl -s --max-time 8 -X POST "$API" \
-  -H "Authorization: $key" -H "Content-Type: application/json" \
+  --config <(printf 'header = "Authorization: %s"\n' "$key") -H "Content-Type: application/json" \
   -d "$(jq -n --arg q "$q" '{query:$q}')")
 canonical=$(jq -r '.data.issues.nodes[0].branchName // ""' <<<"$resp" 2>/dev/null)
 

@@ -33,7 +33,7 @@
 set +e
 TEAM="${LINEAR_DEV_TEAM_ID:-}"
 INPROGRESS="${LINEAR_INPROGRESS_STATE_ID:-}"
-MATT="${LINEAR_ASSIGNEE_ID:-}"
+ASSIGNEE="${LINEAR_ASSIGNEE_ID:-}"
 PREFIX="${LINEAR_BRANCH_PREFIX:-dev}"
 API="https://api.linear.app/graphql"
 
@@ -48,8 +48,32 @@ cmd=$(jq -r '.tool_input.command // ""' <<<"$input")
 # Detect on the command STRUCTURE, not string data: commit messages
 # (`-m "…"`, `-F - <<EOF …`) and echoed text routinely contain literal
 # "git checkout -b …" that must NOT be read as a real branch creation. Drop the
-# heredoc body (everything from the first <<) and quoted spans before scanning.
-scan="${cmd%%<<*}"
+# spans bash treats as DATA — heredoc BODIES, here-strings, quoted spans,
+# comments — and scan only what is left.
+#
+# This used to be `scan="${cmd%%<<*}"`, which truncated the command at the FIRST
+# `<<`, so a branch create that FOLLOWED a heredoc was invisible here and the
+# gate failed OPEN. The shared walk (shell-code-only.sh) holds both directions:
+# code after a heredoc is scanned, a create-looking string inside the body is not.
+lib="$(dirname "$0")/shell-code-only.sh"
+# shellcheck source=hooks/shell-code-only.sh
+[ -r "$lib" ] && . "$lib"
+# Helper absent (a partial vendor of this hooks dir): fall back to the old
+# stripper rather than scanning nothing, which would silently disable the gate.
+declare -F shell_code_only >/dev/null 2>&1 \
+  || shell_code_only() { printf '%s\n' "${1%%<<*}"; }
+# Same story for the operand recovery — identity, not nothing.
+declare -F unquote_plain_operands >/dev/null 2>&1 \
+  || unquote_plain_operands() { printf '%s\n' "$1"; }
+# Un-quote the create-flag operand FIRST. Both strippers drop a quoted span
+# whole, so a quoted branch name never survived to the extraction below:
+# `-b "me/dev-1-x" origin/main` arrived as `-b  origin/main` (denied, blaming the
+# start point) and a trailing `-b "me/dev-1-x"` arrived as `-b ` (no operand —
+# no create found, anything allowed). $cmd itself is left untouched; only what
+# we SCAN is normalised.
+scan=$(shell_code_only "$(unquote_plain_operands "$cmd")")
+# A no-op on the walk's output (it already drops quoted spans); this is the line
+# that strips them on the fallback path above.
 scan=$(printf '%s' "$scan" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")
 
 # Only act on branch CREATION verbs.
@@ -86,7 +110,7 @@ emit() { jq -n --arg m "$1" '{systemMessage:$m}'; }
 # --- read current ticket state + assignee ---
 rq="query { issues(filter: { number: { eq: ${num} }, team: { id: { eq: \"${TEAM}\" } } }) { nodes { id identifier state { type } assignee { id name } } } }"
 rresp=$(curl -s --max-time 8 -X POST "$API" \
-  -H "Authorization: $key" -H "Content-Type: application/json" \
+  --config <(printf 'header = "Authorization: %s"\n' "$key") -H "Content-Type: application/json" \
   -d "$(jq -n --arg q "$rq" '{query:$q}')")
 
 node=$(jq -c '.data.issues.nodes[0] // empty' <<<"$rresp" 2>/dev/null)
@@ -108,13 +132,13 @@ case "$stype" in backlog|unstarted|triage) flip=1 ;; esac
 # assign only when unassigned; flag a conflict when held by someone else
 assign=0; other=""
 if [ -z "$INPROGRESS" ]; then flip=0; fi          # no target state configured -> don't flip
-if [ -z "$MATT" ]; then assign=0
+if [ -z "$ASSIGNEE" ]; then assign=0
 elif [ -z "$aid" ]; then assign=1
-elif [ "$aid" != "$MATT" ]; then other="$aname"; flip=0   # held by someone else: touch nothing, just alert
+elif [ "$aid" != "$ASSIGNEE" ]; then other="$aname"; flip=0   # held by someone else: touch nothing, just alert
 fi
 
 fields=$(jq -n --argjson flip "$flip" --arg sid "$INPROGRESS" \
-               --argjson assign "$assign" --arg aid "$MATT" \
+               --argjson assign "$assign" --arg aid "$ASSIGNEE" \
   '{} + (if $flip==1 then {stateId:$sid} else {} end)
       + (if $assign==1 then {assigneeId:$aid} else {} end)')
 
@@ -122,7 +146,7 @@ ok=1
 if [ "$fields" != "{}" ]; then
   mq='mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }'
   mresp=$(curl -s --max-time 8 -X POST "$API" \
-    -H "Authorization: $key" -H "Content-Type: application/json" \
+    --config <(printf 'header = "Authorization: %s"\n' "$key") -H "Content-Type: application/json" \
     -d "$(jq -n --arg q "$mq" --arg id "$iid" --argjson input "$fields" '{query:$q,variables:{id:$id,input:$input}}')")
   [ "$(jq -r '.data.issueUpdate.success // false' <<<"$mresp" 2>/dev/null)" = "true" ] || ok=0
 fi

@@ -25,7 +25,7 @@ Copy `gardener.config.example.json` → `gardener.config.json` (same directory) 
 | `promote_threshold` | Open-children count above which an epic is really a PROJECT, not a session chunk (see Work Taxonomy below). | `5` |
 | `session_epic_size` | Target ticket count per re-chunked session epic. | `5` |
 | `classifier.chunk_size` | Tickets per read-only classifier chunk in stage 4. | `120` |
-| `classifier.model` | Model tier for the read-only classifier workers in stage 4. | `sonnet` |
+| `classifier.model` | Model override for the read-only classifier workers in stage 4 (passed as the `Agent` tool's `model:` param; the worker is always `subagent_type: "opus-worker"`, so `null` keeps that agent's own model). | `null` |
 | `initiative_map` | Destination project → initiative name, for stage 7's initiative wiring. Omit an entry to skip wiring for that project. | `{}` |
 | `board_conventions.rewrite_summary_page` | Whether stage 7 rewrites each destination board's summary/description to match its new contents. | `true` |
 | `board_conventions.overview_pointers` | Whether stage 7 adds the 3-bullets + table + run-note overview convention. | `true` |
@@ -50,7 +50,7 @@ Any epic whose open-children count exceeds `promote_threshold` is really a PROJE
 Whatever's left oversized after stage 2 (still too big to be one epic, but not big enough to be its own project) gets split into `session_epic_size`-ticket session epics chained via blocked-by. Chain them so the sequence is explicit; don't leave the split tickets as siblings with no ordering when real ordering exists.
 
 ### 4. Stray sweep via classifier fleet — read-only, purpose-over-layer
-Chunk the inventory into `classifier.chunk_size`-ticket chunks. Spawn parallel READ-ONLY classifiers, one per chunk, briefed with the six-section brief contract from the `briefs` skill (CONTEXT/TASK/CONSTRAINTS/RETURN CONTRACT/VERIFICATION REQUIREMENT/STOP CONDITIONS — see `references/classifier-brief-template.md` for a filled-in template). Give each classifier: per-ticket title, labels, parent, a short body snippet, plus a `title_index.json` covering the WHOLE inventory (not just its chunk) so it can resolve cross-chunk parent lookups when a ticket's parent lives in a different chunk. Buckets are decided **purpose-over-layer** — what the ticket is FOR, not which repo/layer/label surface it happens to touch.
+Chunk the inventory into `classifier.chunk_size`-ticket chunks. Spawn parallel READ-ONLY classifiers (`Agent`, `subagent_type: "opus-worker"`), one per chunk, briefed with the six-section brief contract from the `briefs` skill (CONTEXT/TASK/CONSTRAINTS/RETURN CONTRACT/VERIFICATION REQUIREMENT/STOP CONDITIONS — see `references/classifier-brief-template.md` for a filled-in template). Give each classifier: per-ticket title, labels, parent, a short body snippet, plus a `title_index.json` covering the WHOLE inventory (not just its chunk) so it can resolve cross-chunk parent lookups when a ticket's parent lives in a different chunk. Buckets are decided **purpose-over-layer** — what the ticket is FOR, not which repo/layer/label surface it happens to touch.
 
 Merge all chunk verdicts, then run the parent/child-mismatch check: **tree-coherence requires a child's destination bucket to equal its parent's destination bucket.** Whole trees move together — a child classified into a different bucket than its parent's verdict is a conflict to resolve before stage 5, never something stage 5 applies as-is.
 

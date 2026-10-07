@@ -9,8 +9,28 @@ KB="$HOME/Library/Application Support/$EDITOR_DIR/User/keybindings.json"
 mkdir -p "$(dirname "$KB")"
 [ -f "$KB" ] || printf '// Place your key bindings in this file to override the defaults\n[\n]\n' > "$KB"
 
-if grep -q '"f17"' "$KB"; then
+# Pair key and command within ONE binding entry: two separate entries (f17 -> X,
+# some-other-key -> focusNext) must not read as "already installed".
+# exit 0 = f17 -> focusNext present, 1 = f17 bound to something else, 2 = unbound.
+f17=0
+python3 - "$KB" <<'CHECK' || f17=$?
+import re, sys
+entries = [e for e in re.findall(r"\{[^{}]*\}", open(sys.argv[1]).read())
+           if re.search(r'"key"\s*:\s*"f17"', e)]
+if not entries:
+    sys.exit(2)
+ok = any(re.search(r'"command"\s*:\s*"workbench\.action\.terminal\.focusNext"', e)
+         for e in entries)
+sys.exit(0 if ok else 1)
+CHECK
+if [ "$f17" -eq 0 ]; then
   echo "resume-fleet keybindings already present in $KB"; exit 0
+fi
+if [ "$f17" -ne 2 ]; then
+  # f17 is bound to something ELSE — installing on top would make the fleet's
+  # F17 presses fire the user's binding. Bail loudly instead of claiming success.
+  echo "ERROR: f17 already bound to a non-resume-fleet command in $KB — resolve manually" >&2
+  exit 1
 fi
 
 BLOCK='    // --- resume-fleet automation (rare F-keys) ---

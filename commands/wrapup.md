@@ -23,7 +23,7 @@ Goal: every ticket touched this session reflects current reality.
   - Scope changed → update description or add comment
 - Add a comment summarizing this session's progress on the ticket if not obvious from PR links.
 - **Verify PR↔ticket links landed.** For each ticket with a PR this session, fetch the issue and confirm the PR URL is actually in its `attachments`/links. The branch-token / `Closes <TICKET-ID>` auto-link usually fires, but tickets are systematically under-linked — if it's missing, attach it explicitly (`save_issue` with `links: [{url, title}]`). (Work-START state — In Progress + assignment — is handled automatically by the `linear-startwork.sh` hook on branch creation; you're only reconciling the *end* state here.)
-- **Auto-reconcile multi-PR status drift.** Only after the link-verification above confirms **every** PR for the ticket is attached, run `~/.claude/hooks/reconcile-ticket.sh <TICKET-ID> [<TICKET-ID> …]` for the session's tickets. It advances a ticket to **Deployed** only when *every* linked PR is merged — fixing the multi-PR race where the tracker leaves a ticket stuck In Progress/In Review after just one of several cross-repo PRs merges (the no-op cases are silent). ⚠️ The reconciler trusts the tracker's attachment set as complete (it's the branch-name gate that keeps links complete) — so an *under-linked* ticket, where a still-open PR was never attached, could advance early; this is why link-verification must run first. Advance-only; never sets Done (Done stays a manual, prod-verified promotion).
+- **Auto-reconcile multi-PR status drift.** Only after the link-verification above confirms **every** PR for the ticket is attached, run `~/.claude/hooks/reconcile-ticket.sh <TICKET-ID> [<TICKET-ID> …]` for the session's tickets. It advances a ticket to **Deployed** only when *every* linked PR is merged into its repo's default branch, and only from the states you list in `LINEAR_ADVANCE_FROM_STATE_IDS` (typically In Progress / In Review — never an Epics-style container) — fixing the multi-PR race where the tracker leaves a ticket stuck In Progress/In Review after just one of several cross-repo PRs merges (the no-op cases are silent). ⚠️ The reconciler trusts the tracker's attachment set as complete (it's the branch-name gate that keeps links complete) — so an *under-linked* ticket, where a still-open PR was never attached, could advance early; this is why link-verification must run first. Advance-only; never sets Done (Done stays a manual, prod-verified promotion).
 - If you're unsure whether a state change is warranted, ask the owner before flipping it.
 - **Follow-up work surfaced this session → file a ticket, don't just note it.** Out-of-scope review findings, deferred fixes, known gaps, "we should also…" items — if it's legitimate and won't ship this session, create an issue (batch related ones; link the source PR + `file:line` where relevant). The "Open follow-ups" report section is a summary of filed tickets, not a substitute for filing them. Out-of-scope ≠ discard.
   - **Route every follow-up into one of the three filing buckets — never file it parentless, ownership per bucket:**
@@ -117,9 +117,14 @@ Goal: clear delete-debt the careful hook deferred during unattended loops (it qu
 ```bash
 DEPTH=$(python3 ~/.claude/hooks/cleanup-sweep.py --count); echo "$DEPTH"
 # Durable record (guarded no-op if the helper is absent) — feeds a weekly scorecard:
-[ -x ~/.claude/hooks/ledger-append.sh ] && ~/.claude/hooks/ledger-append.sh \
-  "$(jq -nc --argjson n "${DEPTH:-0}" '{skill:"wrapup", event:"cleanup_depth", count:$n}')"
+if [ -x ~/.claude/hooks/ledger-append.sh ]; then
+  ~/.claude/hooks/ledger-append.sh \
+    "$(jq -nc --argjson n "${DEPTH:-0}" '{skill:"wrapup", event:"cleanup_depth", count:$n}')" \
+    || echo "WARN: cleanup_depth row REJECTED — this wrapup is missing from the durable record" >&2
+fi
 ```
+
+**Say the WARN out loud in the report if it fires** (`hooks/ledger-append.sh` exits 1 and writes nothing on a bad payload). The `||` hangs off the INVOCATION, not off the `[ -x … ]` test — an absent helper stays a deliberate silent no-op; a REJECTED row must be noise, never a silent gap in the scorecard. The emit still never gates the wrapup.
 
 - `0` → "Cleanup: nothing pending" in the report.
 - `>0` → run the **`/cleanup`** sweep: show the queued deletes (`cleanup-sweep.py`), confirm which to run, then **`cleanup-sweep.py --run <i>`** each approved entry (or `--run-all`) — it parses the actual delete targets and removes them directly. Do NOT re-run the queued `cmd` (the hook re-defers it, and some entries recreate scratch). Use `--remove <i>` only for declined entries. Report how many were cleared vs. left.

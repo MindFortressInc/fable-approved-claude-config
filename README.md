@@ -55,6 +55,10 @@ hooks/reconcile-ticket.sh        # advance a ticket to Deployed only when EVERY 
 hooks/ledger-append.sh           # append-one-validated-JSON-line automation ledger (fail-loud validator)
 hooks/model-preamble.sh          # SessionStart: inject a strict process-first preamble for weaker-than-frontier models
 skills/briefs/                   # the six-section worker-brief contract every orchestrator's subagent prompt follows
+agents/opus-worker.md            # the default worker subagent every orchestrator spawns (Opus, effort high)
+hooks/bash-stdin-guard.py        # guardrail: restore the </dev/null stdin guard Claude Code omits on heredoc commands
+hooks/test-admission.py          # guardrail: machine-wide pytest admission — xdist worker cap + one full suite at a time
+hooks/shell-code-only.sh         # helper: code-only projection of a Bash command (heredoc/quote aware) for the Linear gates
 skills/skillify/                 # turn a repo's tribal knowledge into a project skill library (discover→map→author→review)
 tests/ + run-tests.sh            # the safety-hook regression suite (isolated temp-HOME sandboxes; CI-wired)
 ruff.toml                        # the lint contract CI enforces (explicit-include ratchet, version-pinned)
@@ -73,11 +77,11 @@ skills/…                         # + the supporting superpowers set: using-sup
 
 ## 0.25 Pick the group yourself — orchestrate
 
-[`skills/orchestrate/SKILL.md`](skills/orchestrate/SKILL.md) is what runs when you don't have a work-list yet — you only know the *project*. It's `/execute`'s batch pipeline with two deltas: the orchestrator itself picks the ~3–8 unit group (collision-checked against in-flight branches/PRs so it never crosses another session's lane), and every build unconditionally runs in a fresh cheap-model subagent per unit, briefed per the `briefs` contract — never inline, regardless of how small the fix looks. It validates every unit's premise before building any of them (expect real kills — a contradicted premise here is the win, not a failure), then validates every worker's "shipped" claim before accepting it, because a green report you didn't check is a hallucination vector.
+[`skills/orchestrate/SKILL.md`](skills/orchestrate/SKILL.md) is what runs when you don't have a work-list yet — you only know the *project*. It's `/execute`'s batch pipeline with two deltas: the orchestrator itself picks the ~3–8 unit group (collision-checked against in-flight branches/PRs so it never crosses another session's lane), and every unit unconditionally runs in ONE fresh `opus-worker` subagent ([`agents/opus-worker.md`](agents/opus-worker.md)) that validates first, stops for the orchestrator's `BUILD`, then builds with the files it already read still in context — briefed per the `briefs` contract, never inline, regardless of how small the fix looks. (Why Opus and not a cheaper model: in a paired bake-off on real tickets, Opus at effort `high` won on judged quality *and* cost less per task than Sonnet at `xhigh` — per-token price does not predict per-task cost.) It validates every unit's premise before building any of them (expect real kills — a contradicted premise here is the win, not a failure), then validates every worker's "shipped" claim before accepting it, because a green report you didn't check is a hallucination vector.
 
 ## 0.3 Structure the backlog first — epicbuilder
 
-[`skills/epicbuilder/SKILL.md`](skills/epicbuilder/SKILL.md) (`/epicbuilder <fuzzy project(s)>`) is `/orchestrate`'s front half: a project can't be orchestrated, assigned, or bulldozed off a flat Todo/Backlog pile — those consumers all eat epics. It inventories a project's loose tickets, fans classification out to a read-only cheap-model fleet (existing-epic-first, so a concern that's already an epic gets tickets parented in rather than duplicated), proposes ~3–8-ticket session epics chained by real dependency order, and parks true self-contained 1-offs under the project's standing **Bulldozer 1-offs** epic so `/bulldozer` has a queue. Cross-board strays get flagged, never moved — that's a separate hygiene pass's job. Single writer applies the announced map, then a children-count verification pass before it's trusted.
+[`skills/epicbuilder/SKILL.md`](skills/epicbuilder/SKILL.md) (`/epicbuilder <fuzzy project(s)>`) is `/orchestrate`'s front half: a project can't be orchestrated, assigned, or bulldozed off a flat Todo/Backlog pile — those consumers all eat epics. It inventories a project's loose tickets, fans classification out to a read-only `opus-worker` classifier fleet (existing-epic-first, so a concern that's already an epic gets tickets parented in rather than duplicated), proposes ~3–8-ticket session epics chained by real dependency order, and parks true self-contained 1-offs under the project's standing **Bulldozer 1-offs** epic so `/bulldozer` has a queue. Cross-board strays get flagged, never moved — that's a separate hygiene pass's job. Single writer applies the announced map, then a children-count verification pass before it's trusted.
 
 ## 0.5 Brief the workers — briefs (and build repo knowledge — skillify)
 
@@ -173,8 +177,10 @@ Four deterministic guardrails. The first two are adapted from [garrytan/gstack](
 Two paired hooks keep the issue tracker honest about what's actually being worked on — so status reflects reality without anyone remembering to click. Both are **opt-in via env** and **fail open**: set `LINEAR_API_KEY` (or `LINEAR_KEY_FILE`, a JSON file holding `.env.LINEAR_API_KEY`), `LINEAR_DEV_TEAM_ID`, and — for the status/assignee flip — `LINEAR_INPROGRESS_STATE_ID` + `LINEAR_ASSIGNEE_ID`; the ticket-token prefix defaults to `dev` (`LINEAR_BRANCH_PREFIX` to change it). Find the UUIDs with `get_team` / `list_issue_statuses` / `get_user` in the Linear MCP. Unconfigured — or on any missing dep, API error, or timeout — both exit 0 and never block git.
 
 - **`branch-name-gate.sh`** (PreToolUse) — on branch **creation**, requires the branch to carry the ticket's exact canonical `gitBranchName`, so the PR links and Linear's own status automation fires. No ticket token → deny (the PR would never link); token present but off-slug → deny and hand back the exact name to re-run. Put `LINEAR_SKIP=1` in the command to bypass for genuinely ticket-less branches (infra/config repos).
-- **`reconcile-ticket.sh`** (CLI, called by `wrapup` and `babysit-prs`) — advances a ticket to **Deployed** only when *every* linked PR is merged, fixing the multi-PR race where the tracker's per-PR automation leaves a cross-repo ticket stuck In Progress after the first sibling merges. Advance-only, never sets Done, fail-open; needs `LINEAR_DEPLOYED_STATE_ID` on top of the shared config.
+- **`reconcile-ticket.sh`** (CLI, called by `wrapup` and `babysit-prs`) — advances a ticket to **Deployed** only when *every* linked PR is merged into its repo's default branch (a stacked PR merged into its parent reports MERGED early), fixing the multi-PR race where the tracker's per-PR automation leaves a cross-repo ticket stuck In Progress after the first sibling merges. It advances only FROM the states you list — an Epics-style container status is often started-type too, and a "started and not Deployed" rule bounced parked containers straight back to Deployed. Advance-only, never sets Done, fail-open; needs `LINEAR_DEPLOYED_STATE_ID` and `LINEAR_ADVANCE_FROM_STATE_IDS` (comma-separated, typically In Progress + In Review) on top of the shared config.
 - **`linear-startwork.sh`** (PostToolUse) — the other half: once that branch lands, take the ticket — flip a not-started state to In Progress and assign you if it's unassigned (never reassigns someone else's ticket, never regresses In Review/Deployed/Done). It detects creation via `checkout -b/-B`, `switch -c/-C`, bare `git branch`, **and `git worktree add … -b`** — the last is what the worktree-per-ticket pattern actually uses, so without it the ticket silently never moves (we hit exactly this).
+
+All three Linear hooks above pass the Linear key to `curl` through `--config <(printf …)` rather than `-H "Authorization: …"`: argv is world-readable via `ps`, so a header on the command line publishes the key for the life of the request. A static check in `tests/test_static_checks.py` fails if any hook reintroduces it. Both creation gates scan a heredoc- and quote-aware projection of the command (`hooks/shell-code-only.sh`): the old "truncate at the first `<<`" stripper let a branch created *after* a heredoc skip the gate entirely, and a quoted branch name was stripped as data.
 
 ## Cross-cutting: work taxonomy (Linear conventions)
 
@@ -194,7 +200,7 @@ The vocabulary `PRlaunch`, `wrapup`, `bulldozer`, and `assign` all assume for fi
 
 ## Cross-cutting: how we do memory
 
-Not shippable in this repo (it's wired to our internal platform), but worth describing because it changes what an agent can do across sessions. We replaced Claude Code's native file-based memory (which truncates: first ~200 lines / 25 KB of `MEMORY.md`) with **retrieval-backed memory served over MCP**:
+Not shippable in this repo, but worth describing because it changes what an agent can do across sessions. We replaced Claude Code's native file-based memory (which truncates: first ~200 lines / 25 KB of `MEMORY.md`) with **retrieval-backed memory served over MCP**:
 
 - An **MCP server** exposes two tools — `memory_search` and `memory_write` — backed by a memory service with namespaces for prescriptive rules vs. facts.
 - A **UserPromptSubmit hook** runs a relevance query against the store on every prompt and injects the top-ranked memories into context — so the right gotchas, decisions, and runbooks surface *for the task at hand* instead of whatever fit in the first 25 KB.
@@ -202,6 +208,8 @@ Not shippable in this repo (it's wired to our internal platform), but worth desc
 - **`/wrapup` step 4** is the write path: end of session, dedupe against existing entries, update rather than duplicate, skip anything derivable from the repo.
 
 The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirks, and per-repo policies recorded once get injected exactly when relevant, sessions later. If you build your own, the architecture above is the whole trick — ranked retrieval per prompt beats a static file the moment your memory outgrows the truncation window.
+
+**Getting it:** none of the memory hooks live in this repo — they depend on a local install of our memory service. Reeve memory is being packaged as the `reeve` Claude Code plugin in [MindFortressInc/reeve-claude-plugin](https://github.com/MindFortressInc/reeve-claude-plugin) (in progress; that repo carries the install steps once it ships). No hook or script in this repo depends on it; where a skill mentions `memory_search` / `memory_write`, an adopter without a memory store simply reports the finding in its output instead of saving it.
 
 ---
 
@@ -220,13 +228,20 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
    cp -R skills/* ~/.claude/skills/
    ```
 
+   And the worker agent the orchestrator skills spawn (`subagent_type: "opus-worker"`):
+
+   ```bash
+   mkdir -p ~/.claude/agents
+   cp agents/*.md ~/.claude/agents/
+   ```
+
    (Skip the superpowers-derived skills if you already run the [superpowers](https://github.com/obra/superpowers) plugin — they ship there, and the live plugin auto-updates while these snapshots don't. `mf-frontend-design` is ours and only lives here.)
 
 2. (Recommended) Install the hooks:
 
    ```bash
    mkdir -p ~/.claude/hooks
-   cp hooks/*.sh hooks/*.py ~/.claude/hooks/
+   for f in hooks/*.sh hooks/*.py; do case "$f" in *.test.sh) ;; *) cp "$f" ~/.claude/hooks/ ;; esac; done
    chmod +x ~/.claude/hooks/*.sh ~/.claude/hooks/*.py
    ```
 
@@ -239,6 +254,8 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
          {
            "matcher": "Bash",
            "hooks": [
+             { "type": "command", "command": "~/.claude/hooks/bash-stdin-guard.py", "timeout": 10 },
+             { "type": "command", "command": "~/.claude/hooks/test-admission.py", "timeout": 10 },
              { "type": "command", "command": "~/.claude/hooks/pr-gate.sh", "timeout": 10 },
              { "type": "command", "command": "~/.claude/hooks/check-careful.sh", "timeout": 10 },
              { "type": "command", "command": "~/.claude/hooks/check-worktree.sh", "timeout": 10 },
@@ -265,9 +282,11 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
    }
    ```
 
+   `bash-stdin-guard.py` fixes a real hang: Claude Code appends `< /dev/null` to every Bash command *except* one containing a heredoc, so in such a block any command that reads stdin with no file argument (`jq -r .`, `sort`, `python3 -`) blocks forever and the tool call never returns — we measured one session held for 6 hours by a `jq` missing its filename. The hook prepends `exec < /dev/null`, giving the shell the stdin the CLI would have given it anyway. `test-admission.py` denies (never rewrites — `updatedInput` from two hooks does not chain) any pytest run above `TEST_MAX_WORKERS` xdist workers (default 2) and any second concurrent full-suite run on the machine (`TEST_MAX_FULL`, default 1): two parallel agent fleets each running the full suite with `-n auto` once pushed a 64 GB machine deep into swap. `TEST_ADMISSION_BYPASS=1` in the command is the escape hatch; both hooks fail open on their own errors.
+
    (`branch-name-gate.sh` and `linear-startwork.sh` are the optional Linear pair below — they no-op unless you set the `LINEAR_*` env vars, so they're harmless to wire in unconfigured.)
 
-3. (Optional) Run the hook test suite — `bash run-tests.sh` — before and after adapting anything. Every test runs the real hook scripts in an isolated temp-HOME sandbox (fake `curl`/`gh` shims, throwaway git repos), so a local edit that breaks a guardrail fails loudly. `.github/workflows/tests.yml` wires the same suite into CI.
+3. (Optional) Run the hook test suite — `bash run-tests.sh` — before and after adapting anything. Every test runs the real hook scripts in an isolated temp-HOME sandbox (fake `curl`/`gh` shims, throwaway git repos), so a local edit that breaks a guardrail fails loudly. Shell suites (`hooks/*.test.sh`) run inside the same pytest pass via `tests/test_shell_suites.py`, which globs them so a new one is gated the day it lands. `.github/workflows/tests.yml` wires the same suite into CI.
 
 4. Adapt the stack-specific bits: the secondary reviewer command in PRlaunch phase 2 (we use the CodeRabbit CLI), the tracker references (we use ticket IDs like `XXX-123`), the infra checklists in deep-review Step 5d (written for FastAPI + Alembic + Celery + Docker — keep the categories, swap the specifics), and your team's merge policy in phase 5.
 

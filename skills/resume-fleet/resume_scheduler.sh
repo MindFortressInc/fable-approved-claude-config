@@ -27,7 +27,15 @@ dry=0
 for r in $(seq 1 "$ROUNDS"); do
   echo "[$(date '+%H:%M:%S')] --- retry round $r/$ROUNDS ---" >> "$LOG"
   blocked="$(MODE=act LOG="$LOG" bash "$FLEET" | tail -n1)"
-  if [ "${blocked:-0}" -eq 0 ]; then
+  # A failed fleet run yields empty/non-numeric output — that's a failure, not
+  # "0 blocked": don't let it feed the dry streak and end the schedule early.
+  if ! [[ "$blocked" =~ ^[0-9]+$ ]]; then
+    echo "[$(date '+%H:%M:%S')] round $r: fleet run FAILED (no count) — not counting as dry" >> "$LOG"
+    dry=0   # a failure breaks consecutiveness: two dry rounds must be adjacent
+    [ "$r" -lt "$ROUNDS" ] && sleep "$GAP"
+    continue
+  fi
+  if [ "$blocked" -eq 0 ]; then
     dry=$((dry+1))
     echo "[$(date '+%H:%M:%S')] round $r: 0 blocked (dry streak $dry/$DRY_STOP)" >> "$LOG"
     [ "$dry" -ge "$DRY_STOP" ] && { echo "[$(date '+%H:%M:%S')] settled -> stopping" >> "$LOG"; break; }

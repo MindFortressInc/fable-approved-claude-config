@@ -22,11 +22,19 @@ One outcome, stated as **the artifact to produce** — "return a JSON verdict on
 ### 3. CONSTRAINTS
 The scope fences that keep the worker in its lane: never merge, never reassign a ticket, read-only, path allowlist, don't touch files another agent owns. Then paste the relevant **gotchas verbatim** — the zsh word-split trap, the "list_issues blows the token cap" warning, whatever bit the last run. Verbatim, because a paraphrased gotcha is a gotcha the worker will re-learn the hard way.
 
+Include the discovery obligation **written out**, never as a pointer to a rule the worker has not read — a fresh subagent sees only this prompt, and a Codex delegate reads `AGENTS.md`, never `CLAUDE.md`, so "follow rule #6" arrives as a dead reference. The operative text to paste: *when you are about to spend real work establishing something that may already exist or have already been measured — proposing a new mechanism, concluding "X doesn't exist", or measuring/benchmarking a system that is already running — first run all three of: (1) search the tracker for the* concern *(product, SKU or epic names — not the ticket id); the tracker records what is already built, not just what is planned. (2) grep the ecosystem for the concern. (3)* `memory_search` *the FULL memory: an injected memory block is usually a truncated top-ranked slice, and a* `[+N more]` *marker means the rest was cut. Build or derive from scratch only after all three come back empty. If no memory store is configured, say in your reply that memory search was unavailable and continue with (1) and (2); a missing store is not a reason to stop.* A question one file read settles does not trigger this. If a retrieval tool ranks hits, inspect several and verify each cited `file:line` against the source; the top-ranked hit is not ground truth.
+
 ### 4. RETURN CONTRACT
 The exact schema/format of the reply, **with a filled example**. Prefer JSON with named keys — the orchestrator parses it, so ambiguity here becomes a parse failure or a wrong write. Say what each key means and what an empty/failure value looks like. If the reply is prose, give the exact headings expected.
 
+When persistence applies, specify where its identifier or failure belongs within the declared return schema (for example, an existing `notes` or `evidence` field); workers must not invent undeclared keys.
+
+When the unit learns a meaningful, reusable factual gotcha, have it persist the finding with `memory_write(kind="fact")` before returning and include the returned memory identifier in its report. If the finding proposes a policy/rule change, return the proposal and evidence for operator review without writing it. Claims labeled `verified`, `confirmed`, or `validated` require evidence; carry the actual observation and supporting source or command output. For a read-only worker, return the finding and evidence for the orchestrator to persist instead. Both of those hand-offs need somewhere to land, so the declared schema must carry a `finding` field and an `evidence` field alongside the identifier — see the worked example's `notes` block. If persistence fails or the tool is unavailable, report that explicitly, with the finding and evidence still populated so the orchestrator can finish it; do not claim it was saved. No new learning means no required write.
+
 ### 5. VERIFICATION REQUIREMENT
 What the worker must **RUN** before claiming success — the test command, the build, the `git show` that proves the change landed, the reproduction that now passes. Evidence before assertion (global rule #1). Make explicit: **if the outcome can't be verified, the worker reports failure honestly** rather than asserting success it didn't observe.
+
+For a worker that runs in parallel with siblings, the test gate is the **targeted blast radius** — the new tests failing on base and passing on the branch, plus the grepped affected tests and the repo's ratchet tests — at **at most 2 xdist workers**. Never write "run the full suite" or `-n auto` into a parallel worker's requirement: the full suite is CI's job, and every fleet shares one machine (`hooks/test-admission.py` denies both).
 
 ### 6. STOP CONDITIONS
 When to bail instead of thrashing, and **what to return when it bails** so the orchestrator can act. Mirror the global 3-strikes / two-dead-ends rule: after ~2 failed attempts at the same fact or fix, stop and report the blocker with what was tried — don't burn the budget grinding. Name the specific dead-ends for this task (premise contradicted, ref missing, tests already red on checkout) and the shape of the "I stopped" return.
@@ -59,7 +67,13 @@ RETURN CONTRACT: reply with exactly this JSON, no prose around it:
   "pr_url": "<url or null>",
   "test_cmd": "<exact command you ran>",
   "test_result": "<pass/fail summary you observed>",
-  "notes": "<one line, or the blocker if status=blocked>"
+  "notes": {
+    "blocker": "<one line describing the blocker, or null if status=pr_opened>",
+    "finding": "<the reusable fact to persist, or null if nothing was learned>",
+    "evidence": "<the source excerpt or command output backing `finding`, or null>",
+    "memory_id": "<memory_write identifier when persistence applies, or null>",
+    "persistence_error": "<one line if memory_write failed or was unavailable, or null>"
+  }
 }
 
 VERIFICATION REQUIREMENT: before returning status "pr_opened" you MUST run the
@@ -113,7 +127,11 @@ RETURN CONTRACT: reply with exactly this JSON:
   "verdict": "DEPLOYED_LIVE" | "MERGED_PENDING_DEPLOY" | "PARTIAL" | "WRONG_NOT_DEPLOYED" | "UNCERTAIN",
   "evidence": "<commit hash + file:line proving present/absent>",
   "proposed_action": "move_to_done" | "note_keep_deployed" | "split_then_done" | "note_move_to_todo" | "note_only_manual",
-  "confidence": "high" | "medium" | "low"
+  "confidence": "high" | "medium" | "low",
+  "notes": {
+    "finding": "<reusable fact for the orchestrator to persist via memory_write, or null if nothing new was learned>",
+    "evidence": "<the source excerpt or command output backing `finding`, or null>"
+  }
 }
 
 VERIFICATION REQUIREMENT: before returning a verdict other than UNCERTAIN, you

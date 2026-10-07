@@ -18,8 +18,8 @@ One or more project names, space/comma separated, each fuzzy-resolved via `mcp__
 ### 1. Inventory the loose tickets
 In scope: open Todo/Backlog tickets that are **unparented**, or whose parent is Done/Canceled (orphans). Out of scope: anything In Progress/In Review/Deployed (in-flight lanes), tickets already under an open epic, and epics themselves. Bulk inventory via raw GraphQL or cursor-paged `list_issues` — never one giant `list_issues` call (token cap).
 
-### 2. Classify — read-only cheap-model fleet, orchestrator judges
-≲40 loose tickets → one classifier; more → chunk ~120/ticket-chunk, parallel read-only cheap-model classifiers with six-section briefs (`/briefs`), each given title/labels/parent/300-char snippet **plus a whole-inventory `title_index.json`** for cross-chunk parent lookups. One bucket per ticket:
+### 2. Classify — read-only opus-worker fleet, orchestrator judges
+≲40 loose tickets → one classifier; more → chunk ~120/ticket-chunk, parallel read-only classifiers (`Agent`, `subagent_type: "opus-worker"`) with six-section briefs (`/briefs`), each given title/labels/parent/300-char snippet **plus a whole-inventory `title_index.json`** for cross-chunk parent lookups. One bucket per ticket:
 
 | Bucket | Test | Action at apply |
 |---|---|---|
