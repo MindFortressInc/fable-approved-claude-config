@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -147,6 +148,26 @@ class LockTtlInvariantTest(LockTestBase):
         with open(self.lock, "w") as fh:
             json.dump({"owner": "wedge", "host": "h", "pid": 1, "launcher": "x",
                        "started": 1, "heartbeat": 99999999999999}, fh)
+        p = self.run_lock("acquire")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("ACQUIRED", p.stdout)
+
+    def test_a_12_digit_future_heartbeat_evading_the_length_cap_cannot_wedge_the_lock(self):
+        """The 12-digit length cap alone lets a
+        still-enormous-but-<=12-digit future value (e.g. 999999999999, ~year
+        33658) straight through -- it is never longer than 12 digits, so
+        `[ "${#hb}" -gt 12 ]` never fires. That produces a huge NEGATIVE age
+        (now - hb), which reads LOCKED for roughly 31,000 years: exactly the
+        wedge this sanitization exists to prevent, just past the length
+        check's blind spot rather than caught by it. Verified empirically
+        (bash invocation, not just this test) before the fix: RC=3 LOCKED
+        age=-998212621927s. A heartbeat can never legitimately be in the
+        future -- it is always written as `$(now)` -- so any hb > now must
+        degrade to 0 regardless of digit count."""
+        now = int(time.time())
+        with open(self.lock, "w") as fh:
+            json.dump({"owner": "wedge-12-digit", "host": "h", "pid": 1,
+                       "launcher": "x", "started": now, "heartbeat": 999999999999}, fh)
         p = self.run_lock("acquire")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("ACQUIRED", p.stdout)
@@ -287,6 +308,77 @@ class ReapSinceTest(LockTestBase):
         self.run_lock("reap-since", str(sweep_start))
         with open(victim) as fh:
             self.assertEqual(fh.read(), "PRECIOUS", "the reap wrote through a symlink")
+
+    def test_reap_backup_survives_a_replant_race_and_ends_up_a_regular_file(self):
+        """The half test_a_symlinked_backup_path_is_not_followed does NOT
+        cover: a symlink planted BETWEEN the old `rm -f "$LOCK.reaped"` and
+        the following `cp -f`, not one that was already sitting there before
+        reap-since ran. $LOCK.reaped lives in world-writable /tmp, so a local
+        attacker can win exactly that window and get its own target's
+        content overwritten when `cp -f` follows the freshly re-planted
+        symlink. The atomic mktemp+cp+mv sequence closes the window: `cp`
+        only ever writes into a private tmp path nobody else can guess, and
+        the visible swap at $LOCK.reaped is a single rename(2) that replaces
+        whatever sits there -- it never opens through it.
+
+        Race-based, so this stresses rather than formally proves the
+        property: hammer reap-since against a tight symlink-replant loop
+        (fast enough that many replants land inside the pre-atomic code's
+        rm/cp window), then -- with the racer stopped -- run one more clean
+        reap-since and confirm the backup that lands is a plain regular
+        file, never a symlink."""
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as fh:
+            fh.write("PRECIOUS")
+        backup_path = self.lock + ".reaped"
+
+        stop = threading.Event()
+
+        def replanter():
+            while not stop.is_set():
+                try:
+                    os.symlink(victim, backup_path)
+                except FileExistsError:
+                    try:
+                        os.unlink(backup_path)
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+
+        racer = threading.Thread(target=replanter, daemon=True)
+        racer.start()
+        try:
+            for _ in range(80):
+                sweep_start = int(time.time()) - 100
+                self.write_lock(owner="dead", started=sweep_start + 5)
+                self.run_lock("reap-since", str(sweep_start))
+                if open(victim).read() != "PRECIOUS":
+                    break
+        finally:
+            stop.set()
+            racer.join(timeout=2)
+
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "PRECIOUS",
+                              "a replanted symlink race let the reap write the "
+                              "lock JSON straight into the sentinel's target")
+
+        # Racer is stopped now -- one final clean reap-since must land a
+        # plain regular file at $LOCK.reaped, not a symlink the racer left
+        # mid-flight.
+        for path in (backup_path, backup_path + ".tmp-cleanup"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        sweep_start = int(time.time()) - 100
+        self.write_lock(owner="dead", started=sweep_start + 5)
+        self.run_lock("reap-since", str(sweep_start))
+        self.assertTrue(os.path.exists(backup_path), "no backup written")
+        self.assertFalse(os.path.islink(backup_path),
+                          "$LOCK.reaped ended up a symlink, not a regular file")
+        self.assertTrue(os.path.isfile(backup_path))
 
     def test_an_absurd_started_value_does_not_leak_a_shell_error(self):
         """A huge all-digit `started` passes the pattern filter but would make

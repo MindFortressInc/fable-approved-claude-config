@@ -86,7 +86,15 @@ case "${1:-}" in
       # reaped on this acquire.
       case "$hb" in ''|*[!0-9]*) hb=0 ;; esac
       [ "${#hb}" -gt 12 ] && hb=0
-      age=$(( $(now) - hb ))
+      # The length cap alone has a blind spot: a value that is still
+      # enormous but never longer than 12 digits (e.g. 999999999999, ~year
+      # 33658) sails through it and produces the same permanently-negative-age
+      # wedge the cap exists to prevent. A heartbeat can never legitimately be
+      # in the future -- it is always written as `$(now)` -- so any hb > now
+      # is corrupt too, regardless of digit count.
+      nowv="$(now)"
+      [ "$hb" -gt "$nowv" ] && hb=0
+      age=$(( nowv - hb ))
       if [ "$lo" != "$ME" ] && [ "$age" -lt "$TTL" ]; then
         echo "LOCKED owner=$lo age=${age}s ttl=${TTL}s"
         exit 3
