@@ -542,6 +542,12 @@ else
   IFS=':' read -r -a roots <<<"$COLLISION_CHECK_ROOTS"
   for r in "${roots[@]}"; do
     [ -n "$r" ] || continue
+    # settings.json `env` values reach us literally, unexpanded -- honour a
+    # leading ~ or $HOME so the documented form works there.
+    case "$r" in
+      "~"|"~/"*)         r="${HOME}${r#\~}" ;;
+      '$HOME'|'$HOME/'*) r="${HOME}${r#\$HOME}" ;;
+    esac
     r="${r%/}"
     if [ -e "$r/.git" ]; then
       CLONES+=("$r")   # the root is itself a primary clone

@@ -192,7 +192,7 @@ Exit codes: **0** clear · **1** collision (halt and report — never `git workt
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `COLLISION_CHECK_ROOTS` | *(none — unset degrades)* | Colon-separated directories to scan. Each entry is either a primary clone itself or a directory whose immediate subdirectories are primary clones (e.g. `$HOME/code:$HOME/.claude`). |
+| `COLLISION_CHECK_ROOTS` | *(none — unset degrades)* | Colon-separated directories to scan. Each entry is either a primary clone itself or a directory whose immediate subdirectories are primary clones (e.g. `~/code:~/.claude`; a leading `~` or `$HOME` is expanded, since `env`-block values arrive literally). |
 | `LINEAR_BRANCH_PREFIX` | `dev` | Ticket token prefix, shared with `linear-startwork.sh`. The ticket can be given as `DEV-42`, `dev42`, or `42`. |
 | `LINEAR_API_KEY` / `LINEAR_KEY_FILE` | *(none — unset degrades)* | The Linear key, resolved the same way as the tracker hooks: the env var first, then `.env.LINEAR_API_KEY` from the JSON file. |
 | `LINEAR_DEV_TEAM_ID` | *(none — unset degrades)* | UUID of the team whose issues the Linear-state probe queries. |

@@ -1007,6 +1007,13 @@ o=$(COLLISION_CHECK_ROOTS="$dp" LINEAR_BRANCH_PREFIX=dev "$SCRIPT" DEV-42 2>&1);
 check "names the worktree" "repo-dp.dev-42" "$o"
 
 echo
+echo "T45b: a literal ~ or \$HOME root (as a settings.json env value arrives) is expanded"
+for root in '~/dp-clones' '$HOME/dp-clones'; do
+  o=$(HOME="$SCRATCH" COLLISION_CHECK_ROOTS="$root" LINEAR_BRANCH_PREFIX=dev "$SCRIPT" DEV-42 2>&1); rc=$?
+  [[ $rc -eq 1 ]] && ok "$root -> exit 1 (scanned)" || bad "$root: expected exit 1, got $rc" "$o"
+done
+
+echo
 echo "T46: probe D matches the token in the REF only -- a hex-letter prefix cannot match a sha"
 # Prefix `abc` is spelled in hex digits, and this remote's main tip is abc42f...:
 # an unscoped grep over `<sha>\t<ref>` would report `main` as a collision.
