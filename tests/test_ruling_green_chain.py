@@ -253,7 +253,7 @@ class RulingCommentHarvestTests(unittest.TestCase):
         as a PR comment, and the finding still clears."""
         issues = [
             rate_limited_comment("2026-01-01T01:00:00Z"),
-            harvest_comment(at="2026-01-01T02:00:00Z", unapplied=1, major=1),
+            harvest_comment(at="2026-01-01T02:00:00Z", unapplied=1, minor=1),
             ruling_comment_v2("a.py:R1", authorized=False,
                               at="2026-01-01T03:00:00Z"),
         ]
@@ -349,7 +349,7 @@ class CliGreenChannelTests(unittest.TestCase):
         directions (out of the human queue AND out of the merge path)."""
         e = classify([
             rate_limited_comment("2026-01-01T01:00:00Z"),
-            harvest_comment(at="2026-01-01T02:00:00Z", unapplied=1, major=1),
+            harvest_comment(at="2026-01-01T02:00:00Z", unapplied=1, minor=1),
             ruling_comment_v2("a.py:R1", authorized=False,
                               at="2026-01-01T03:00:00Z"),
         ])
