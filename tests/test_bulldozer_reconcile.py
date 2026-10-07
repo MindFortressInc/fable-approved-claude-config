@@ -199,6 +199,19 @@ class TestCheckPremise(unittest.TestCase):
         self.assertEqual(v.status, "AMBIGUOUS")
         self.assertEqual(v.fix_sha, "")
 
+    def test_pattern_moved_to_another_file_is_ambiguous(self):
+        """A refactor that moves the defect to another file removes it from the
+        cited file but does not fix it — must NOT be auto-closed."""
+        pat = "sed -E \"s/'[^']*'//g\""
+        _commit(self.repo, "add", {"hooks/a.sh": pat + "\n"}, date="2026-01-01T00:00:00Z")
+        _commit(self.repo, "move helper", {"hooks/a.sh": "source b.sh\n", "hooks/b.sh": pat + "\n"},
+                date="2026-02-01T00:00:00Z")
+        finding = Finding("ENG-X", "hooks/a.sh", None, pat)
+        v = check_premise(self.repo, "main", finding, filed_at="2026-01-15T00:00:00.000Z")
+        self.assertEqual(v.status, "AMBIGUOUS")
+        self.assertEqual(v.fix_sha, "")
+        self.assertIn("hooks/b.sh", v.detail)
+
 
 class TestFiledAtGuard(unittest.TestCase):
     """A removal that predates the ticket is not a fix this ticket can cite —
@@ -325,14 +338,16 @@ class TestRunReconcile(unittest.TestCase):
         # Make a genuinely still-present case by pointing at a DIFFERENT repo
         # state: reuse the same repo/pattern but assert on a ticket whose
         # pattern truly remains — simplest is a second file that was never
-        # touched.
+        # touched. Its pattern must differ from PATTERN: a copy of PATTERN
+        # anywhere in the tree would (correctly) block closing ENG-201.
+        other_pattern = 'eval "$raw_cmd"'
         _commit(self.repo, "second still-buggy file", {
-            "hooks/other-gate.sh": PATTERN + "\n",
+            "hooks/other-gate.sh": other_pattern + "\n",
         })
         still_broken_ticket = Ticket(
             id="uuid-ENG-200", identifier="ENG-200", title="still broken",
             description=(
-                f"The bug: (`{PATTERN}`) is naive.\n\n"
+                f"The bug: (`{other_pattern}`) is naive.\n\n"
                 "**Files:** `hooks/other-gate.sh` (~lines 1-3)"
             ),
             assignee_email=None,

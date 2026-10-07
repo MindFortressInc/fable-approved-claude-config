@@ -104,6 +104,22 @@ class ScorecardPureTest(unittest.TestCase):
         cur["prlaunch"]["cr_cli_skipped"] = 1
         self.assertEqual(scorecard.flag_regressions(cur, empty), [])
 
+    def test_exactly_20pct_change_is_not_flagged(self):
+        prev = scorecard.aggregate([])
+        cur = scorecard.aggregate([])
+        prev["bulldozer"]["shipped"], cur["bulldozer"]["shipped"] = 5, 4
+        self.assertEqual(scorecard.flag_regressions(cur, prev), [])
+        self.assertNotIn("⚠", scorecard._delta(5, 4, "up"))
+
+    def test_non_object_gates_skips_unit_without_crashing(self):
+        agg = scorecard.aggregate([
+            {"skill": "prlaunch", "event": "unit", "gates": "na", "ts": "2026-07-02T10:05:00Z"},
+            {"skill": "prlaunch", "event": "unit", "gates": {"prlaunch_skip": True},
+             "ts": "2026-07-02T10:06:00Z"},
+        ])
+        self.assertEqual(agg["prlaunch"]["units"], 1)
+        self.assertEqual(agg["prlaunch"]["prlaunch_skip"], 1)
+
     def test_enrich_pr_states_with_stub_runner(self):
         prs = [
             {"repo": "web", "pr": 1},

@@ -287,9 +287,14 @@ query TeamWithProjects($team: String!) {
 }
 """
 
+# Case-insensitive, and includes workspace-scoped labels (team: null): Linear
+# rejects creating a team label whose name collides with either.
 LABEL_LOOKUP_QUERY = """
 query FindLabel($team: String!, $name: String!) {
-  issueLabels(filter: {team: {name: {eq: $team}}, name: {eq: $name}}) { nodes { id name } }
+  issueLabels(filter: {
+    name: {eqIgnoreCase: $name},
+    or: [{team: {name: {eq: $team}}}, {team: {null: true}}]
+  }) { nodes { id name } }
 }
 """
 

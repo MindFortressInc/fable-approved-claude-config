@@ -240,6 +240,22 @@ def check_premise(repo: str, default_branch: str, finding: Finding,
             f"pattern still present in {finding.file} at {default_branch}",
         )
 
+    # Absence from the cited file is not proof of a fix: the snippet may have
+    # moved to another file. Require it to be gone from the whole tree.
+    elsewhere = _git(repo, "grep", "-F", "-l", "-e", finding.pattern, default_branch, "--")
+    if elsewhere.returncode == 0:
+        hits = ", ".join(elsewhere.stdout.split()[:5])
+        return Verdict(
+            "AMBIGUOUS",
+            f"pattern absent from {finding.file} but still present at "
+            f"{default_branch} in: {hits} — possibly moved, NOT auto-closeable",
+        )
+    if elsewhere.returncode != 1:
+        return Verdict(
+            "AMBIGUOUS",
+            f"git grep failed at {default_branch}: {elsewhere.stderr.strip()}",
+        )
+
     fix_sha = find_removal_commit(repo, default_branch, finding.file, finding.pattern)
     if not fix_sha:
         return Verdict(

@@ -155,8 +155,10 @@ def aggregate(records):
                 agg["babysit"]["red_ci"] += _int(r.get("red_ci"))
         elif kind == "prlaunch":
             if r.get("event") == "unit":
-                agg["prlaunch"]["units"] += 1
                 gates = r.get("gates") or {}
+                if not isinstance(gates, dict):
+                    continue  # malformed unit record — skip, keep scoring the rest
+                agg["prlaunch"]["units"] += 1
                 cr = gates.get("cr_cli")
                 if isinstance(cr, str) and cr not in ("clean", ""):
                     agg["prlaunch"]["cr_cli_skipped"] += 1
@@ -195,9 +197,9 @@ def flag_regressions(cur_agg, prev_agg):
         if prev == 0:
             continue
         change = (cur - prev) / prev * 100.0
-        if better == "up" and change <= -20.0:
+        if better == "up" and change < -20.0:
             flags.append("%s down %.0f%% (%d→%d)" % (name, abs(change), prev, cur))
-        elif better == "down" and change >= 20.0:
+        elif better == "down" and change > 20.0:
             flags.append("%s up %.0f%% (%d→%d)" % (name, change, prev, cur))
     return flags
 
@@ -295,7 +297,7 @@ def _delta(prev, cur, better):
         return "new"
     change = (cur - prev) / prev * 100.0
     warn = ""
-    if (better == "up" and change <= -20) or (better == "down" and change >= 20):
+    if (better == "up" and change < -20) or (better == "down" and change > 20):
         warn = " ⚠"
     sign = "+" if change >= 0 else ""
     return "%s%.0f%%%s" % (sign, change, warn)

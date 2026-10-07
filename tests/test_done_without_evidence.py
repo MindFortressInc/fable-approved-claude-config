@@ -251,6 +251,12 @@ class EnsureLabelTests(unittest.TestCase):
         # must not have attempted a team lookup / create mutation at all
         self.assertTrue(all("issueLabelCreate" not in q for q, _ in stub.calls))
 
+    def test_lookup_is_case_insensitive_and_includes_workspace_labels(self):
+        # Linear rejects a team label whose name collides (case-insensitively)
+        # with an existing team OR workspace label — the lookup must see both.
+        self.assertIn("eqIgnoreCase", dwe.LABEL_LOOKUP_QUERY)
+        self.assertIn("{team: {null: true}}", dwe.LABEL_LOOKUP_QUERY)
+
     def test_missing_label_is_created_lazily(self):
         calls = {"create": 0}
 

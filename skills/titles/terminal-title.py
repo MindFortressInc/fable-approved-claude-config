@@ -17,7 +17,7 @@ Modes:
                     nor the transcript records carry a tty/pid. The reliable key is TIME:
                     a claude process writes its first transcript record 1–2s after launch,
                     so we match each tab's process-start to the session whose first record
-                    is closest (one-to-one, within tolerance).
+                    is closest (one-to-one and unambiguous, within tolerance).
   --transcript P    Force a specific transcript (testing).
 
 WHY the parent-tty walk instead of /dev/tty: hooks (and tool subprocesses) run WITHOUT a
@@ -75,9 +75,10 @@ def project_dir_for_cwd(cwd):
 def resolve_transcript(data):
     tp = data.get("transcript_path")
     if tp:
+        # An exact path that no longer exists must NOT fall through to "newest
+        # transcript" — that is another session's title. Caller uses cwd instead.
         tp = os.path.expanduser(tp)
-        if os.path.exists(tp):
-            return tp
+        return tp if os.path.exists(tp) else None
     pd = project_dir_for_cwd(data.get("cwd"))
     for g in ([os.path.join(pd, "*.jsonl")] if pd else []) + [
         os.path.expanduser("~/.claude/projects/*/*.jsonl")
@@ -161,14 +162,18 @@ def own_tty():
     return None
 
 
+def sanitize(title):
+    r"""Titles are model-generated text written to a terminal: strip control chars
+    (ESC, BEL, ...) so they can't terminate an OSC sequence early or inject further
+    escapes. That includes DEL and the C1 range (\x80-\x9f): some terminals honour
+    ST (\x9c) / CSI (\x9b) directly."""
+    return "".join(ch for ch in title if ch >= " " and not ("\x7f" <= ch <= "\x9f"))
+
+
 def emit(title, tty_path):
     if not tty_path:
         return False
-    # The title is model-generated text going inside an OSC sequence: strip
-    # control chars (ESC, BEL, ...) so it can't terminate the sequence early
-    # or inject further escapes into the terminal. That includes DEL and the C1
-    # range (\x80-\x9f): some terminals honour ST (\x9c) / CSI (\x9b) directly.
-    title = "".join(ch for ch in title if ch >= " " and not ("\x7f" <= ch <= "\x9f"))
+    title = sanitize(title)
     try:
         with open(tty_path, "w") as t:
             t.write("\x1b]0;{} {}\x07".format(PREFIX, title))
@@ -225,24 +230,22 @@ def run_all():
             dir_index[pd] = [[f, first_timestamp(f)] for f in glob.glob(os.path.join(pd, "*.jsonl"))]
         return dir_index[pd]
 
-    used = set()
-    done = []
-    # Match earliest-launched tabs first so close-in-time neighbors resolve deterministically.
-    for pid, tty, start in sorted(tabs, key=lambda x: (x[2] or 0)):
+    # Time is the only key, so nearest-timestamp alone can hand neighbours each
+    # other's sessions. Accept a match only when it is unambiguous both ways: the
+    # tab has exactly one transcript within tolerance, and that transcript is
+    # within tolerance of no other tab. Anything else keeps the cwd fallback until
+    # each tab's own hook restores its exact title next turn.
+    cands, claims = {}, {}
+    for pid, _, start in tabs:
         pd = project_dir_for_cwd(cwds.get(pid))
-        title = None
-        if pd and start:
-            best, best_d = None, None
-            for entry in sessions_for(pd):
-                f, fts = entry
-                if not fts or f in used:
-                    continue
-                d = abs(fts - start)
-                if best_d is None or d < best_d:
-                    best, best_d = entry, d
-            if best and best_d is not None and best_d <= MATCH_TOLERANCE_S:
-                used.add(best[0])
-                title = last_ai_title(best[0])
+        cands[pid] = [f for f, fts in sessions_for(pd)
+                      if fts and abs(fts - start) <= MATCH_TOLERANCE_S] if pd and start is not None else []
+        for f in cands[pid]:
+            claims[f] = claims.get(f, 0) + 1
+    done = []
+    for pid, tty, _ in tabs:
+        c = cands[pid]
+        title = last_ai_title(c[0]) if len(c) == 1 and claims[c[0]] == 1 else None
         fallback = not title
         if fallback:
             cwd = cwds.get(pid) or ""
@@ -274,7 +277,7 @@ def main():
                 note = "   (no aiTitle yet — self-sets next turn)"
             else:
                 note = ""
-            sys.stderr.write("%s  %s %s%s\n" % (tty, PREFIX, title, note))
+            sys.stderr.write("%s  %s %s%s\n" % (tty, PREFIX, sanitize(title), note))
         emitted = sum(1 for _, _, ok, _ in done if ok)
         fell_back = sum(1 for _, _, ok, fb in done if ok and fb)
         summary = "%d tab(s) retitled" % emitted

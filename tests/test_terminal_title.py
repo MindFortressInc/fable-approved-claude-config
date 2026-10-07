@@ -101,6 +101,63 @@ class TerminalTitleTest(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "")
         self.assertEqual(emitted, [("Hook topic", os.path.join(self.tmp, "tty"))])
 
+    def test_missing_exact_transcript_does_not_fall_through(self):
+        # A supplied transcript_path that no longer exists must not resolve to
+        # some other session's newest transcript.
+        self._transcript([{"type": "ai-title", "aiTitle": "Other session"}], name="other.jsonl")
+        data = {"transcript_path": os.path.join(self.tmp, "gone.jsonl"), "cwd": self.tmp}
+        self.assertIsNone(tt.resolve_transcript(data))
+
+    def _run_all(self, tabs, sessions):
+        """tabs: [(pid, tty, start)]; sessions: {name: (first_ts, aiTitle)}."""
+        for name, (ts, title) in sessions.items():
+            self._transcript([
+                {"type": "user", "timestamp": "1970-01-01T00:00:%02dZ" % ts},
+                {"type": "ai-title", "aiTitle": title},
+            ], name=name)
+        emitted = []
+        saved = (tt.claude_tabs, tt.cwds_for_pids, tt.project_dir_for_cwd, tt.emit)
+        tt.claude_tabs = lambda: tabs
+        tt.cwds_for_pids = lambda pids: {p: "/home/u/proj" for p in pids}
+        tt.project_dir_for_cwd = lambda cwd: self.tmp
+        tt.emit = lambda title, tty: emitted.append((tty, title)) or True
+        try:
+            done = tt.run_all()
+        finally:
+            tt.claude_tabs, tt.cwds_for_pids, tt.project_dir_for_cwd, tt.emit = saved
+        return {tty: (title, fb) for tty, title, _, fb in done}
+
+    def test_run_all_ambiguous_nearby_starts_fall_back_to_cwd(self):
+        # Starts at 0 and 1; their sessions' first records at 2 and 1.5. Nearest
+        # timestamp would swap them — ambiguity must keep the cwd fallback.
+        res = self._run_all(
+            [("10", "ttys001", 0.0), ("11", "ttys002", 1.0)],
+            {"a.jsonl": (2, "Tab A topic"), "b.jsonl": (1, "Tab B topic")},
+        )
+        self.assertEqual(res["ttys001"], ("proj", True))
+        self.assertEqual(res["ttys002"], ("proj", True))
+
+    def test_run_all_unambiguous_match_uses_ai_title(self):
+        res = self._run_all(
+            [("10", "ttys001", 0.0), ("11", "ttys002", 50.0)],
+            {"a.jsonl": (2, "Tab A topic"), "b.jsonl": (51, "Tab B topic")},
+        )
+        self.assertEqual(res["ttys001"], ("Tab A topic", False))
+        self.assertEqual(res["ttys002"], ("Tab B topic", False))
+
+    def test_all_summary_sanitizes_titles(self):
+        saved = tt.run_all, sys.argv
+        tt.run_all = lambda: [("ttys001", "evil\x1b]0;pwned\x07", True, False)]
+        sys.argv = ["terminal-title.py", "--all"]
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                tt.main()
+        finally:
+            tt.run_all, sys.argv = saved
+        self.assertNotIn("\x1b", err.getvalue())
+        self.assertNotIn("\x07", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
