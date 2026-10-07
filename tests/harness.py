@@ -35,6 +35,7 @@ HOOK_FILES = [
     "branch-name-gate.sh",
     "linear-startwork.sh",
     "shell-code-only.sh",  # sourced by the two gates above for heredoc stripping
+    "linear-review-gate.py",
     "check-careful.sh",
     "careful-rm.py",
     "cleanup-sweep.py",
@@ -215,6 +216,32 @@ def add_commit(path, env, msg="more"):
         ["git", "-C", path, "rev-parse", "HEAD"],
         env=env, capture_output=True, text=True,
     ).stdout.strip()
+
+
+def set_remote(path, url, env, name="origin"):
+    """Point `path`'s `name` remote at `url` (no network access ever happens)."""
+    subprocess.run(
+        ["git", "-C", path, "remote", "add", name, url],
+        check=True, env=env, capture_output=True, text=True,
+    )
+
+
+def make_worktree(repo, path, branch, env, msg="wt"):
+    """Add a worktree of `repo` at `path` on a NEW `branch`, plus one commit.
+
+    Used by the repo-identity tests, which need two worktrees of DIFFERENT repos
+    sharing a directory basename. The commit message differs per call so the
+    two HEAD shas differ (empty commits with identical message/author/second
+    would otherwise hash the same).
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-q", path, "-b", branch],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    return add_commit(path, env, msg)
 
 
 def run_python_hook(sandbox, hook_name, args=(), stdin_text=None, extra_env=None):

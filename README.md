@@ -33,7 +33,7 @@ skills/mf-frontend-design/       # 2. BUILD — the frontend-design skill every 
 skills/test-driven-development/  #    build-stage discipline                     (obra/superpowers, MIT)
 skills/systematic-debugging/     #    when something breaks                      (obra/superpowers, MIT)
 commands/PRlaunch.md             # 3. SHIP — the pipeline: 7 phases, gate order, disposition rules
-commands/deep-review.md          #    Deep Review Process v6.9 — the methodology gate 1 runs
+commands/deep-review.md          #    Deep Review Process v7.5 — the methodology gate 1 runs
 commands/wrapup.md               # 4. WRAP UP — tracker sync, GitHub sync, branch hygiene, memory, cleanup, report
 commands/babysit-prs.md          # 5. AFTER — hourly self-arming sweep of open PRs until reviews drain
 skills/babysit/                  #    the deterministic, tested classifier/planner that sweep executes
@@ -44,6 +44,9 @@ skills/assign/                   # 7. STAFF — roster-driven ticket discovery +
 skills/linear-gardener/          # standing board-hygiene pass — inventory/promote/re-chunk/sweep/apply, config-driven
 hooks/pr-gate.sh                 # enforcement: blocks `gh pr create` unless every gate is recorded at the current HEAD
 hooks/prlaunch-gate.sh           # the per-gate evidence ledger CLI the phases stamp and pr-gate verifies
+hooks/cr-review.sh               # gate 2's CodeRabbit CLI wrapper: one exit-code contract (0/70/71/75), optional seat pool
+hooks/cr-seats.sh                #    manage the OPTIONAL CodeRabbit seat pool (off until you register seats)
+hooks/review-gate-status.sh      #    OPTIONAL `review-gate/cr-cli` commit-status publisher (PRLAUNCH_PUBLISH_CR_STATUS=1)
 hooks/check-careful.sh           # guardrail: plain-English prompt on destructive bash; silent on routine cleanup (loop-mode aware)
 hooks/careful-rm.py              # parser behind check-careful: classifies rm -r targets (quote/comment/newline aware)
 hooks/cleanup-sweep.py           # helper: read/resolve the deferred-delete cleanup queue (used by cleanup/wrapup/PRlaunch/babysit)
@@ -52,6 +55,7 @@ hooks/check-worktree.sh          # guardrail: deny `git commit` in a primary clo
 hooks/check-no-edit-on-main.sh   # guardrail: deny editing a primary clone on its default branch — work in worktrees
 hooks/loop-mode-arm.sh           # helper: time-box check-careful's loop-mode so unattended /loop runs don't wedge
 hooks/reconcile-ticket.sh        # advance a ticket to Deployed only when EVERY linked PR is merged (multi-PR race fix)
+hooks/linear-review-gate.py      # deny moving a ticket to In Review when no PR is linked (fail-open, no-op without a key)
 hooks/ledger-append.sh           # append-one-validated-JSON-line automation ledger (fail-loud validator)
 hooks/model-preamble.sh          # SessionStart: inject a strict process-first preamble for weaker-than-frontier models
 skills/briefs/                   # the six-section worker-brief contract every orchestrator's subagent prompt follows
@@ -113,8 +117,8 @@ Each gate catches a bug class the others can't see:
 
 | Gate | Grades | Catches |
 |------|--------|---------|
-| **1. Deep review** ([deep-review.md](commands/deep-review.md), v6.9) | the **diff** | correctness, security, architecture — "will this overwrite the DB before the user accepts?" |
-| **2. Secondary reviewer** (CodeRabbit CLI or similar) | the **repo** | style, nits, patterns |
+| **1. Deep review** ([deep-review.md](commands/deep-review.md), v7.5) | the **diff** | correctness, security, architecture — "will this overwrite the DB before the user accepts?" |
+| **2. Secondary reviewer** (CodeRabbit CLI via [`hooks/cr-review.sh`](hooks/cr-review.sh), or similar) | the **repo** | style, nits, patterns |
 | **3. Outcome eval** | the **running product, from the user's seat** | the "basic stuff that always gets missed": raw `**markdown**` shown to users, an LLM that asks for context it already has, a spinner that never resolves, a layout broken at the real viewport |
 
 Gate 3 is the one most teams don't have. The failure it targets isn't *not testing* — it's **testing and grading the wrong signal**. It's dangerously easy to watch `POST … 200`, see "a bubble appeared", and write ✅ while the actual words on screen are wrong and the pixels show literal asterisks. The eval forces you to write PASS criteria *before* running anything, phrased as *what the user receives*, then quote the real output for every scenario. Transport (status codes, payloads, "element exists") is necessary, never sufficient.
@@ -123,7 +127,22 @@ Gate 3 is the one most teams don't have. The failure it targets isn't *not testi
 
 **Any code change in a later gate invalidates the earlier gates.** A gate's green is only valid for the exact code it ran against. Fixed something during the eval? That fix hasn't been deep-reviewed, linted, or re-tested. The pipeline loops until a full pass over the final committed tree produces zero new changes — and the hook enforces it: each of the four gates (deep review, secondary review, outcome eval, tests) is stamped into a per-branch JSON ledger with the HEAD sha it ran against ([`hooks/prlaunch-gate.sh`](hooks/prlaunch-gate.sh)), and [`hooks/pr-gate.sh`](hooks/pr-gate.sh) blocks `gh pr create` unless all four are recorded at the *current* HEAD. Any commit after a gate ran stales that gate's entry automatically. The outcome eval won't even record without a pre-registered scenarios file — writing PASS criteria *before* running anything is enforced, not aspirational.
 
-### Deep Review v6.9 highlights
+The ledger is keyed on the repo's **identity** (its origin remote name), not the checkout directory — two repos whose worktrees share a directory name used to share one ledger, so one repo's gates could unlock the other's PR. Callers never rebuild the path; they ask for it (`prlaunch-gate.sh path`, `path --scenarios`). The review gates record their **whole finding set** (`record deep_review --findings '<json>'`, every severity, not just a CRITICAL+HIGH count), and every stamp is also appended to an append-only `history`, so re-stamps on a reused branch don't erase what ran before. `pr-gate.sh` detects the PR-open verb at a real **command position** in the code-only projection of the command (heredoc bodies and quoted spans are data), so a commit message or brief that merely mentions it isn't blocked — while a real invocation after a heredoc, behind `if`/redirections, or inside `$(…)` still is.
+
+### Optional lanes — all off by default
+
+With nothing configured you get Claude's deep review plus single-account CodeRabbit. Everything below is opt-in:
+
+| Lane | Turn it on | Unset (default) |
+|------|-----------|-----------------|
+| **CodeRabbit seat pool** — rotate gate 2 across several CodeRabbit seats so parallel agent workers stop sharing one hourly bucket | register seats: `~/.claude/hooks/cr-seats.sh add <name> <api-key>` (or `adopt <name>` for the current login); `CR_SEATS_DIR` to relocate the pool. Only if your CodeRabbit plan/terms allow it | `cr-review.sh` runs the CLI once under your own login, like bare `coderabbit review` |
+| **`review-gate/cr-cli` commit status** — advisory status a CI review-gate check can read | `PRLAUNCH_PUBLISH_CR_STATUS=1` | the ledger entry is the only record; no GitHub call |
+| **Codex second-opinion lane** (deep-review Step 3) — a second model family reviews the same diff read-only; its findings are claims until Claude confirms them | `CODEX_REVIEW_ENABLED=1` **and** a `codex-review.sh` wrapper installed (not shipped here yet); model via `CODEX_REVIEW_MODEL` | lane skipped; review runs exactly as before. No model id is ever defaulted — unset `CODEX_REVIEW_MODEL` means the Codex account default |
+| **Automation ledger** — durable per-unit rows a scorecard can aggregate | install `hooks/ledger-append.sh`; `LEDGER_SKILL` / `BABYSIT_LAUNCH_ID` stamp rows when exported | the PRlaunch append is a silent no-op |
+
+Gate 2's wrapper gives every caller one exit-code contract, configured or not: `0` a review ran (its findings are on stdout), `75` rate-limited — the **only** code that earns PRlaunch's authorized skip — `70` the wrapper itself failed (retry; never a skip), `71` the CLI rejected our arguments (fix the invocation; never retry it unchanged), anything else a real CodeRabbit failure. `tests/test_unconfigured_defaults.py` pins the default path: no seat pool, no status publish, nothing that dispatches Codex, no model id anywhere.
+
+### Deep Review highlights (v6.9 → v7.5)
 
 A 10-step review process with empirical validation at its core — *evidence over opinion: a finding without proof is not a finding*. Notable machinery:
 
@@ -136,6 +155,11 @@ A 10-step review process with empirical validation at its core — *evidence ove
 - **Evidence-required findings** (v6.9): every finding carries `Evidence: <command run> → <output excerpt>` from an *executed* check — no evidence caps the finding at MEDIUM, and severity is assigned from a fixed decision table, not agent labels
 - **Adversarial refute pass** (v6.9): every CRITICAL/HIGH candidate gets independent refuter subagents briefed to *disprove* it before it can publish; refuted findings downgrade to INFO with the refutation recorded
 - **Evidence-based re-review** (v6.9): a fix is `RESOLVED` only when the original finding's evidence command re-runs clean on the new code — a diff-only check is `PARTIALLY RESOLVED (unconfirmed)`
+- **Repo-invariant loader, tenancy pass, test-vacuity check** (v7.0): the process learns each repo's rules by reading its `## Review Invariants` (never hardcoding them), checks every query binds the scope columns its model declares, and requires a cited test to *fail* against the reverted implementation
+- **Confidence threshold + precedent ledger** (v7.1): low-conviction findings without executed evidence are dropped, and refuters cite a codified ledger of past rulings instead of re-arguing them (rebuttable by evidence)
+- **AI-cheat pass + changed-surface enumeration** (v7.2–v7.3): eleven mechanical detectors for diffs that fake success (swallowed errors, relaxed assertions, mocks of things that don't exist, …) and a caller sweep for renamed/retyped symbols
+- **Ticket compliance** (v7.4): when a ticket resolves, an agent checks the diff against every requirement in it and flags scope drift
+- **Optional Codex second opinion** (v7.5, off by default): disagreement between model families is signal, not a verdict — Codex-only findings must pass the same evidence check before they can be published
 
 ## 4. Wrap up
 
@@ -174,9 +198,10 @@ Four deterministic guardrails. The first two are adapted from [garrytan/gstack](
 
 ## Cross-cutting: tracker hygiene (Linear)
 
-Two paired hooks keep the issue tracker honest about what's actually being worked on — so status reflects reality without anyone remembering to click. Both are **opt-in via env** and **fail open**: set `LINEAR_API_KEY` (or `LINEAR_KEY_FILE`, a JSON file holding `.env.LINEAR_API_KEY`), `LINEAR_DEV_TEAM_ID`, and — for the status/assignee flip — `LINEAR_INPROGRESS_STATE_ID` + `LINEAR_ASSIGNEE_ID`; the ticket-token prefix defaults to `dev` (`LINEAR_BRANCH_PREFIX` to change it). Find the UUIDs with `get_team` / `list_issue_statuses` / `get_user` in the Linear MCP. Unconfigured — or on any missing dep, API error, or timeout — both exit 0 and never block git.
+The tracker hooks keep the issue tracker honest about what's actually being worked on — so status reflects reality without anyone remembering to click. All are **opt-in via env** and **fail open**: set `LINEAR_API_KEY` (or `LINEAR_KEY_FILE`, a JSON file holding `.env.LINEAR_API_KEY`), `LINEAR_DEV_TEAM_ID`, and — for the status/assignee flip — `LINEAR_INPROGRESS_STATE_ID` + `LINEAR_ASSIGNEE_ID`; the ticket-token prefix defaults to `dev` (`LINEAR_BRANCH_PREFIX` to change it). Find the UUIDs with `get_team` / `list_issue_statuses` / `get_user` in the Linear MCP. Unconfigured — or on any missing dep, API error, or timeout — they exit 0 and never block anything.
 
 - **`branch-name-gate.sh`** (PreToolUse) — on branch **creation**, requires the branch to carry the ticket's exact canonical `gitBranchName`, so the PR links and Linear's own status automation fires. No ticket token → deny (the PR would never link); token present but off-slug → deny and hand back the exact name to re-run. Put `LINEAR_SKIP=1` in the command to bypass for genuinely ticket-less branches (infra/config repos).
+- **`linear-review-gate.py`** (PreToolUse, matcher `mcp__linear__save_issue`) — denies moving a ticket to **In Review** when no PR is linked: allowed if the same call carries a GitHub PR link or the ticket already has a PR attachment. Matches the state names "In Review"/"Review", plus `LINEAR_IN_REVIEW_STATE_ID` if set. Needs only the API key; without one it never denies.
 - **`reconcile-ticket.sh`** (CLI, called by `wrapup` and `babysit-prs`) — advances a ticket to **Deployed** only when *every* linked PR is merged into its repo's default branch (a stacked PR merged into its parent reports MERGED early), fixing the multi-PR race where the tracker's per-PR automation leaves a cross-repo ticket stuck In Progress after the first sibling merges. It advances only FROM the states you list — an Epics-style container status is often started-type too, and a "started and not Deployed" rule bounced parked containers straight back to Deployed. Advance-only, never sets Done, fail-open; needs `LINEAR_DEPLOYED_STATE_ID` and `LINEAR_ADVANCE_FROM_STATE_IDS` (comma-separated, typically In Progress + In Review) on top of the shared config.
 - **`linear-startwork.sh`** (PostToolUse) — the other half: once that branch lands, take the ticket — flip a not-started state to In Progress and assign you if it's unassigned (never reassigns someone else's ticket, never regresses In Review/Deployed/Done). It detects creation via `checkout -b/-B`, `switch -c/-C`, bare `git branch`, **and `git worktree add … -b`** — the last is what the worktree-per-ticket pattern actually uses, so without it the ticket silently never moves (we hit exactly this).
 
@@ -268,6 +293,12 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
              { "type": "command", "command": "~/.claude/hooks/check-freeze.sh", "timeout": 10 },
              { "type": "command", "command": "~/.claude/hooks/check-no-edit-on-main.sh", "timeout": 10 }
            ]
+         },
+         {
+           "matcher": "mcp__linear__save_issue",
+           "hooks": [
+             { "type": "command", "command": "~/.claude/hooks/linear-review-gate.py", "timeout": 10 }
+           ]
          }
        ],
        "PostToolUse": [
@@ -284,11 +315,11 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
 
    `bash-stdin-guard.py` fixes a real hang: Claude Code appends `< /dev/null` to every Bash command *except* one containing a heredoc, so in such a block any command that reads stdin with no file argument (`jq -r .`, `sort`, `python3 -`) blocks forever and the tool call never returns — we measured one session held for 6 hours by a `jq` missing its filename. The hook prepends `exec < /dev/null`, giving the shell the stdin the CLI would have given it anyway. `test-admission.py` denies (never rewrites — `updatedInput` from two hooks does not chain) any pytest run above `TEST_MAX_WORKERS` xdist workers (default 2) and any second concurrent full-suite run on the machine (`TEST_MAX_FULL`, default 1): two parallel agent fleets each running the full suite with `-n auto` once pushed a 64 GB machine deep into swap. `TEST_ADMISSION_BYPASS=1` in the command is the escape hatch; both hooks fail open on their own errors.
 
-   (`branch-name-gate.sh` and `linear-startwork.sh` are the optional Linear pair below — they no-op unless you set the `LINEAR_*` env vars, so they're harmless to wire in unconfigured.)
+   (`branch-name-gate.sh`, `linear-startwork.sh` and `linear-review-gate.py` are the optional Linear hooks below — they no-op unless you set the `LINEAR_*` env vars, so they're harmless to wire in unconfigured.)
 
 3. (Optional) Run the hook test suite — `bash run-tests.sh` — before and after adapting anything. Every test runs the real hook scripts in an isolated temp-HOME sandbox (fake `curl`/`gh` shims, throwaway git repos), so a local edit that breaks a guardrail fails loudly. Shell suites (`hooks/*.test.sh`) run inside the same pytest pass via `tests/test_shell_suites.py`, which globs them so a new one is gated the day it lands. `.github/workflows/tests.yml` wires the same suite into CI.
 
-4. Adapt the stack-specific bits: the secondary reviewer command in PRlaunch phase 2 (we use the CodeRabbit CLI), the tracker references (we use ticket IDs like `XXX-123`), the infra checklists in deep-review Step 5d (written for FastAPI + Alembic + Celery + Docker — keep the categories, swap the specifics), and your team's merge policy in phase 5.
+4. Adapt the stack-specific bits: the secondary reviewer command in PRlaunch phase 2 (we use the CodeRabbit CLI through `hooks/cr-review.sh`; the optional lanes above stay off until you configure them), the tracker references (we use ticket IDs like `XXX-123`), the infra checklists in deep-review Step 5d (written for FastAPI + Alembic + Celery + Docker — keep the categories, swap the specifics), and your team's merge policy in phase 5.
 
 ## Use
 

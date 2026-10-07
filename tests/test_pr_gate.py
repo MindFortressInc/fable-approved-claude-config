@@ -9,7 +9,10 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import HookSandbox, decision, load_json, make_git_repo, run_hook
+from harness import (
+    HookSandbox, decision, load_json, make_git_repo, make_worktree, run_hook,
+    run_hook_args, set_remote,
+)
 
 # Built from fragments so the literal token never trips the live pr-gate hook
 # while THIS test file is being edited by an agent. At runtime pytest just reads
@@ -203,6 +206,257 @@ class PrGateTest(unittest.TestCase):
         rc, out, _ = self._run(cmd)
         self.assertEqual(rc, 0)
         self.assertIsNone(decision(out))
+
+
+    # -- the trigger is a COMMAND POSITION, not a substring -------------------
+    # Direction 1 — a command that merely MENTIONS the phrase must pass through.
+    # Direction 2 (further down) — a command that really opens a PR must still
+    # be blocked. A fix that only satisfies direction 1 is a security regression.
+
+    def test_heredoc_body_mention_does_not_trigger(self):
+        # The live repro: writing a brief file whose CONTENTS mention the phrase
+        # on an unquoted line. The quote-stripping sed is per-line and matches
+        # PAIRS, so it cannot help here — and because the write happens outside
+        # any repo, the old hook denied with "cannot resolve a git repo from
+        # '$HOME'": an error naming an action nobody attempted.
+        outside = os.path.join(self.sbx.dir, "no-repo-here")
+        os.makedirs(outside, exist_ok=True)
+        cmd = (
+            "cat > %s/brief.md <<'EOF'\n"
+            "- Ship it: re-gate, push, then open a READY PR with %s --base main\n"
+            "EOF"
+        ) % (outside, GHPR)
+        rc, out, _ = run_hook(
+            self.sbx, "pr-gate.sh",
+            {"tool_input": {"command": cmd}, "cwd": outside},
+        )
+        self.assertEqual(rc, 0)
+        self.assertIsNone(decision(out), out)
+
+    def test_commit_message_heredoc_mention_does_not_trigger(self):
+        # The original repro: `git commit -m "$(cat <<'EOF' … EOF)"`
+        # whose message body mentions the phrase. The commit was refused.
+        cmd = (
+            "git commit -m \"$(cat <<'EOF'\n"
+            "docs: PRlaunch phase 5 calls it between git push and %s\n"
+            "EOF\n"
+            ")\""
+        ) % GHPR
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(decision(out), out)
+
+    def test_unquoted_prose_mention_does_not_trigger(self):
+        # Not quoted at all — only the position anchor can reject this one.
+        rc, out, _ = self._run("echo remember to " + GHPR + " later")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(decision(out), out)
+
+    def test_grep_pattern_mention_does_not_trigger(self):
+        rc, out, _ = self._run('grep -rn "%s" commands/' % GHPR)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(decision(out), out)
+
+    def test_directory_resolves_from_the_matched_position(self):
+        # The `cd` search must be cut where the trigger MATCHED, not at the first
+        # textual mention. With the old `${cmd%%…*}` split the mention truncated
+        # the search before the real `cd`, so the hook resolved the hook cwd and
+        # denied with "cannot resolve a git repo" — an error about the wrong
+        # action entirely, which is the expensive part of this bug.
+        outside = os.path.join(self.sbx.dir, "not-a-repo")
+        os.makedirs(outside, exist_ok=True)
+        cmd = "echo 'next step: %s' && cd %s && %s --fill" % (
+            GHPR, self.repo, GHPR)
+        rc, out, _ = run_hook(
+            self.sbx, "pr-gate.sh",
+            {"tool_input": {"command": cmd}, "cwd": outside},
+        )
+        self.assertEqual(decision(out), "deny")
+        reason = self._reason(out)
+        self.assertNotIn("cannot resolve a git repo", reason)
+        self.assertIn("no PRlaunch gate record", reason)
+        self.assertIn(self.repo_name, reason)
+
+    # -- Direction 2: FAIL-CLOSED — real invocations are still blocked --------
+
+    def test_invocation_on_its_own_line_still_denied(self):
+        rc, out, _ = self._run("cd %s\n%s --fill" % (self.repo, GHPR))
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_invocation_after_separator_still_denied(self):
+        rc, out, _ = self._run("cd %s && %s --fill" % (self.repo, GHPR))
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_invocation_with_heredoc_body_still_denied(self):
+        # PRlaunch's own shape: the invocation carries a heredoc PR body.
+        cmd = (
+            "%s --title \"t\" --body \"$(cat <<'EOF'\n"
+            "Closes ENG-1234\n"
+            "EOF\n"
+            ")\""
+        ) % GHPR
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_invocation_after_a_heredoc_still_denied(self):
+        # Truncating at the FIRST `<<` (the idiom branch-name-gate.sh uses) would
+        # drop this invocation entirely and fail OPEN.
+        cmd = (
+            "cat > %s/body.md <<'EOF'\n"
+            "Closes ENG-1234\n"
+            "EOF\n"
+            "%s --title t --body-file %s/body.md"
+        ) % (self.sbx.dir, GHPR, self.sbx.dir)
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_invocation_after_a_bogus_heredoc_marker_still_denied(self):
+        # `<<` inside a quoted string registers a delimiter that never closes.
+        # The stripper must re-emit what it skipped rather than swallow the rest
+        # of the command — otherwise this is a one-line gate bypass.
+        cmd = 'echo "compare << and >> here"\n%s --fill' % GHPR
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_quoted_heredoc_marker_cannot_swallow_the_invocation(self):
+        # CR CLI find: a `<<` inside a QUOTED string used to register a real
+        # delimiter, so the lines up to a matching terminator — including the
+        # actual invocation — were eaten as a "heredoc body". A one-command
+        # bypass. Quote state has to be tracked before heredocs are detected.
+        cmd = 'echo "note << EOF"\n%s --fill\nEOF' % GHPR
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_reserved_word_prefixed_invocation_still_denied(self):
+        # CR CLI find: `if <cmd>; then …` is a real command position.
+        cmd = "cd %s; if %s --fill; then :; fi" % (self.repo, GHPR)
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_leading_redirection_invocation_still_denied(self):
+        # CR CLI find: a leading redirection sits before the command word.
+        for redir in (">/tmp/pr.out", "> /tmp/pr.out", "2>&1"):
+            with self.subTest(redir=redir):
+                cmd = "cd %s && %s %s --fill" % (self.repo, redir, GHPR)
+                rc, out, _ = self._run(cmd)
+                self.assertEqual(decision(out), "deny", cmd)
+                self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_command_substitution_invocation_still_denied(self):
+        cmd = "cd %s && url=$(%s --fill)" % (self.repo, GHPR)
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_shell_comment_mention_does_not_trigger(self):
+        rc, out, _ = self._run("cd %s   # then run %s\ngit status" % (
+            self.repo, GHPR))
+        self.assertEqual(rc, 0)
+        self.assertIsNone(decision(out), out)
+
+    def test_skip_hatch_quoted_in_body_does_not_bypass(self):
+        # "PRLAUNCH_SKIP=1" inside the PR body is prose ABOUT the hatch, not a
+        # use of it, and must not disarm the gate on a real invocation.
+        cmd = GHPR + ' --title t --body "PRLAUNCH_SKIP=1 is for emergencies"'
+        rc, out, _ = self._run(cmd)
+        self.assertEqual(decision(out), "deny")
+        self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_missing_shell_lib_fails_closed(self):
+        # pr-gate.sh sources shell-code-only.sh for the code-only projection.
+        # Without the library it must scan the WHOLE command: a quoted mention
+        # may then over-trigger, but a real invocation can never slip through.
+        import shutil
+        import subprocess
+        lone = os.path.join(self.sbx.dir, "lone-hooks")
+        os.makedirs(lone)
+        for name in ("pr-gate.sh", "prlaunch-gate.sh"):
+            shutil.copy(os.path.join(os.path.dirname(self.sbx.hook_path(name)),
+                                     os.readlink(self.sbx.hook_path(name))), lone)
+        payload = '{"tool_input": {"command": "cd %s && %s --fill"}, "cwd": "%s"}' % (
+            self.repo, GHPR, self.repo)
+        proc = subprocess.run(["bash", os.path.join(lone, "pr-gate.sh")],
+                              input=payload, capture_output=True, text=True,
+                              env=self.sbx.env())
+        self.assertEqual(decision(proc.stdout), "deny", proc.stdout + proc.stderr)
+
+
+class PrGateWorktreeIdentityTest(unittest.TestCase):
+    """End-to-end: pr-gate must read the ledger prlaunch-gate WROTE.
+
+    Both scripts used to derive the path independently from
+    `basename "$(git rev-parse --show-toplevel)"`. In a worktree that is the
+    worktree's directory name, so two repos whose worktrees were both named
+    after the ticket shared one ledger -- and the hook that decides whether a
+    PR may open was reading another repository's evidence.
+    """
+
+    BRANCH = "me/eng-9254-y"
+
+    def setUp(self):
+        self.sbx = HookSandbox()
+        self.e = self.sbx.env()
+        self.svc = os.path.join(self.sbx.dir, "api-svc")
+        self.fe = os.path.join(self.sbx.dir, "web-app")
+        make_git_repo(self.svc, "trunk", self.e)
+        make_git_repo(self.fe, "trunk", self.e)
+        set_remote(self.svc, "git@github.com:Org/api-svc.git", self.e)
+        set_remote(self.fe, "git@github.com:Org/web-app.git", self.e)
+        # colliding worktree basename, identical branch -> identical old key
+        self.svc_wt = os.path.join(self.sbx.dir, "a-worktrees", "eng-9254")
+        self.fe_wt = os.path.join(self.sbx.dir, "b-worktrees", "eng-9254")
+        make_worktree(self.svc, self.svc_wt, self.BRANCH, self.e, "svc work")
+        make_worktree(self.fe, self.fe_wt, self.BRANCH, self.e, "fe work")
+
+    def tearDown(self):
+        self.sbx.close()
+
+    def _gate(self, wt, *args):
+        return run_hook_args(self.sbx, "prlaunch-gate.sh", ["--repo-dir", wt, *args])
+
+    def _run_from(self, wt):
+        return run_hook(
+            self.sbx, "pr-gate.sh",
+            {"tool_input": {"command": GHPR + " --fill"}, "cwd": wt},
+        )
+
+    def _record_all(self, wt):
+        scen = os.path.join(self.sbx.dir, "scen.md")
+        with open(scen, "w") as fh:
+            fh.write("scenario 1: user sees X, PASS if Y\n")
+        for args in (("deep_review",), ("cr_cli",), ("scenarios", scen),
+                     ("outcome_eval",), ("tests", "--cmd", "x")):
+            rc, out, err = self._gate(wt, "record", *args)
+            self.assertEqual(rc, 0, out + err)
+
+    def test_gated_worktree_is_allowed(self):
+        self._record_all(self.svc_wt)
+        rc, out, _ = self._run_from(self.svc_wt)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(decision(out), out)  # silent allow
+
+    def test_other_repo_gates_do_not_unlock_this_repo(self):
+        """The whole defect, at the point that matters: api-svc runs a
+        full PRlaunch; web-app must still be blocked."""
+        self._record_all(self.svc_wt)
+        rc, out, _ = self._run_from(self.fe_wt)
+        self.assertEqual(decision(out), "deny", out)
+        reason = load_json(out)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("no PRlaunch gate record", reason)
+        self.assertIn("web-app", reason)
+
+    def test_deny_reason_names_the_real_repo_not_the_worktree_dir(self):
+        rc, out, _ = self._run_from(self.svc_wt)
+        reason = load_json(out)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("api-svc", reason)
+        self.assertNotIn("eng-9254/", reason)
 
 
 if __name__ == "__main__":
