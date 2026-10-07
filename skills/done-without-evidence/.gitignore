@@ -1,0 +1,2 @@
+# Runtime cache of the standing report ticket's id — local state, never committed.
+state.json
