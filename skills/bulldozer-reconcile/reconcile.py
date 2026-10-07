@@ -221,10 +221,12 @@ def commit_at(repo: str, ref: str, when: str) -> Optional[str]:
 
 def check_premise(repo: str, default_branch: str, finding: Finding,
                   filed_at: Optional[str] = None) -> Verdict:
-    """`filed_at` (the ticket's createdAt, when known) requires the pattern to
-    have been on `default_branch` when the ticket was filed — so a misparsed
-    pattern that merely existed at some point in history can't cite an
-    unrelated old removal as "the fix"."""
+    """`filed_at` (the ticket's createdAt, when known) requires the cited
+    removal to have landed on `default_branch` AFTER the ticket was filed — so
+    a misparsed pattern that merely existed at some point in history can't cite
+    an unrelated old removal as "the fix". (The defect itself need not have
+    been on the branch at filing time: 1-offs are often filed against a PR
+    branch that merges the defect later.)"""
     content, err = get_file_at_ref(repo, default_branch, finding.file)
     if content is None:
         return Verdict(
@@ -237,17 +239,6 @@ def check_premise(repo: str, default_branch: str, finding: Finding,
             "STILL_PRESENT",
             f"pattern still present in {finding.file} at {default_branch}",
         )
-
-    if filed_at:
-        base = commit_at(repo, default_branch, filed_at)
-        at_filing, _ = get_file_at_ref(repo, base, finding.file) if base else (None, None)
-        if at_filing is None or finding.pattern not in at_filing:
-            return Verdict(
-                "AMBIGUOUS",
-                f"pattern was not in {finding.file} on {default_branch} when the ticket "
-                f"was filed ({filed_at}) — the parsed pattern may not be the defect, "
-                f"so this is NOT auto-closeable",
-            )
 
     fix_sha = find_removal_commit(repo, default_branch, finding.file, finding.pattern)
     if not fix_sha:
@@ -280,6 +271,16 @@ def check_premise(repo: str, default_branch: str, finding: Finding,
             f"candidate {fix_sha} did not remove the pattern from {finding.file} "
             f"(absent from its parent) — cannot cite it as the fix",
         )
+
+    if filed_at:
+        base = commit_at(repo, default_branch, filed_at)
+        if base and is_ancestor(repo, fix_sha, base):
+            return Verdict(
+                "AMBIGUOUS",
+                f"the only removal of the pattern ({fix_sha}) predates the ticket "
+                f"({filed_at}) — the parsed pattern may not be the defect, so this "
+                f"is NOT auto-closeable",
+            )
 
     loc = f"{finding.file}:{finding.line_hint}" if finding.line_hint else finding.file
     return Verdict(

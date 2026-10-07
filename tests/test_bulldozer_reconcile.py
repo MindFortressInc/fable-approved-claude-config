@@ -201,8 +201,8 @@ class TestCheckPremise(unittest.TestCase):
 
 
 class TestFiledAtGuard(unittest.TestCase):
-    """A pattern that was already gone when the ticket was filed is not a fix
-    this ticket can cite — most likely the parser grabbed the wrong span."""
+    """A removal that predates the ticket is not a fix this ticket can cite —
+    most likely the parser grabbed the wrong span."""
 
     PAT = "sed -E \"s/'[^']*'//g\""
 
@@ -218,9 +218,12 @@ class TestFiledAtGuard(unittest.TestCase):
         self.assertEqual(v.status, "AMBIGUOUS")
         self.assertEqual(v.fix_sha, "")
 
-    def test_filed_before_any_commit_is_ambiguous(self):
+    def test_filed_before_defect_landed_still_closes(self):
+        # Filed against a PR branch before that PR merged the defect: the
+        # removal still post-dates the ticket, so it IS this ticket's fix.
         v = check_premise(self.repo, "main", self.finding, filed_at="2025-06-01T00:00:00.000Z")
-        self.assertEqual(v.status, "AMBIGUOUS")
+        self.assertEqual(v.status, "CONFIRMED_GONE")
+        self.assertEqual(v.fix_sha, self.fix_sha)
 
     def test_filed_while_present_is_confirmed_gone(self):
         v = check_premise(self.repo, "main", self.finding, filed_at="2026-01-15T00:00:00.000Z")

@@ -74,10 +74,12 @@ For each **open** child of the epic:
    - **Absent, file unreadable, or no removal commit found** →
      `AMBIGUOUS`, left untouched. Absence alone is never enough — evidence
      before assertion.
-   - **Absent now, but also absent when the ticket was filed** (the file at
-     `git rev-list -1 --before=<createdAt> <default-branch>` lacks the
-     pattern) → `AMBIGUOUS`. The parser most likely grabbed the wrong span,
-     and an old unrelated removal of that string is not this ticket's fix.
+   - **The only removal predates the ticket** (the candidate commit is an
+     ancestor of `git rev-list -1 --before=<createdAt> <default-branch>`) →
+     `AMBIGUOUS`. The parser most likely grabbed the wrong span, and an old
+     unrelated removal of that string is not this ticket's fix. (The defect
+     itself may post-date the ticket — 1-offs are often filed against a PR
+     branch that merges it later — so only the removal's timing is checked.)
    - **Candidate commit whose parent lacks the pattern** → `AMBIGUOUS`: a
      commit can only be cited as the fix if it actually removed the pattern.
    - **Absent, with a specific commit found (`git log <default-branch> -S
