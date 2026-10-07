@@ -69,15 +69,23 @@ lib="$(dirname "$0")/shell-code-only.sh"
 declare -F shell_code_only >/dev/null 2>&1 \
   || shell_code_only() { printf '%s\n' "$1"; }
 
-scan=$(shell_code_only "$cmd")
+# A backslash before a word character changes nothing bash runs (`\gh` IS `gh`),
+# but the walk drops every escaped character, so `\gh pr create` would project
+# to `h pr create` and slip past the anchor. Unescape those first.
+scan=$(shell_code_only "$(sed -E 's/\\([A-Za-z0-9_])/\1/g' <<<"$cmd")")
 
 # A real invocation STARTS a command: at the beginning of a line, or right after
 # a separator (`;` `&` `|` `(` `)` `{` `}` `!`), optionally behind any run of
-# `VAR=value` assignments, leading redirections (`>/tmp/out gh pr create …`) or
-# command-introducing words (`if`, `then`, `sudo`, `time`, …). grep is
-# line-oriented, so `^` also covers newline as a separator — which is why the
-# heredoc bodies had to go first.
-TRIGGER_RE='(^|[;&|(){}!])[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|[0-9]*[<>]{1,2}&?[[:space:]]*[^[:space:];&|<>]*|if|then|else|elif|while|until|do|time|exec|command|sudo|nohup|env)[[:space:]]+)*gh[[:space:]]+pr[[:space:]]+create([[:space:];&|)}]|$)'
+# `VAR=value` assignments, leading redirections (`>/tmp/out gh pr create …`),
+# command-introducing or wrapper words (`if`, `then`, `sudo`, `time`, `timeout`,
+# `nice`, `env`, …) and the flag/numeric operands those wrappers take
+# (`sudo -E`, `timeout 60`, `nice -n 5`). `gh` may be invoked by path
+# (`/opt/homebrew/bin/gh`). grep is line-oriented, so `^` also covers newline as
+# a separator — which is why the heredoc bodies had to go first.
+#
+# Over-matching here only ever DENIES (the gate then asks for a ledger);
+# under-matching lets a real PR open ungated, so the prefix run errs wide.
+TRIGGER_RE='(^|[;&|(){}!])[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|[0-9]*[<>]{1,2}&?[[:space:]]*[^[:space:];&|<>]*|-[^[:space:];&|<>]*|[0-9][^[:space:];&|<>]*|if|then|else|elif|while|until|do|time|exec|command|builtin|sudo|doas|nohup|env|nice|ionice|timeout|gtimeout|xargs|caffeinate|stdbuf)[[:space:]]+)*([^[:space:];&|()<>]*/)?gh[[:space:]]+pr[[:space:]]+create([[:space:];&|)}]|$)'
 grep -qE "$TRIGGER_RE" <<<"$scan" || exit 0
 
 # Escape hatches read `$scan`, not `$cmd`: a PR body that DESCRIBES the hatch

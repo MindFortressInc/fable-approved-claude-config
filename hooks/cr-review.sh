@@ -100,7 +100,22 @@ HOURLY_MAX=$(num_or "${CR_SEAT_HOURLY_MAX:-}" 10)  # top-of-plan CLI reviews/hr/
 # working, not a miscount.
 COOLDOWN=$(num_or "${CR_SEAT_COOLDOWN:-}" 900)     # secs a seat rests after a limit hit
 LOCK_STALE=$(num_or "${CR_SEAT_LOCK_STALE:-}" 1800)
-LIMIT_RE='review limit|rate.?limit|limit reached|too many requests|429'
+# A limit refusal is only ever a FAILED run (rc != 0) -- a review that exited 0
+# is a verdict, whatever its findings say. On a failed run, stderr (CLI
+# diagnostics, never findings) may match anywhere; stdout is matched only on a
+# STATUS-shaped line (optional leading symbol / `error:`, the limit phrase, then
+# end of line or punctuation -- "Review limit reached", "Rate limit exceeded.
+# Try again in 15 minutes" -- never the phrase inside a sentence),
+# because an adverse review exits non-zero too and its findings routinely
+# mention rate limits or a line 429 -- that text must never read as an
+# authorized skip.
+LIMIT_RE='review limit|rate.?limit|limit reached|too many requests|(^|[^0-9:])429([^0-9]|$)'
+LIMIT_LINE_RE='^[^[:alnum:]]*(error:?[[:space:]]*)?((review|rate.?)[[:space:]]?limit(ed)?([[:space:]]+(reached|exceeded|hit))?|limit reached|too many requests)[[:space:]]*([.!:(,-].*)?$'
+limited() { # limited <rc> <stdout-file> <stderr-file>
+  (( $1 != 0 )) || return 1
+  grep -qiE "$LIMIT_RE" "$3" 2>/dev/null && return 0
+  grep -qiE "$LIMIT_LINE_RE" "$2" 2>/dev/null
+}
 
 # The CLI rejected our COMMAND LINE and exited before attempting a review.
 #
@@ -139,6 +154,9 @@ argparse_failed() { # argparse_failed <stderr-file> <rc>
 
 log() { printf 'cr-review: %s\n' "$1" >&2; }
 now() { date +%s; }
+# File mtime in epoch seconds on GNU (`stat -c`) or BSD/macOS (`stat -f`); 0 if
+# unreadable. GNU first: GNU `stat -f` means "filesystem status", not mtime.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
 # A per-invocation id so a caller (prlaunch-gate.sh's `record cr_cli --run-id`)
 # can correlate its ledger entry back to the exact wrapper run that
@@ -261,7 +279,7 @@ if (( ${#SEATS[@]} == 0 )); then
   # where a stale flag is most likely, so it cannot be the one path that still
   # conflates misconfiguration with a review verdict. Buffer-and-replay matches
   # the seat path below; the streams stay separate, so --agent JSON is unaffected.
-  out=$(mktemp -t cr-review-out); err=$(mktemp -t cr-review-err)
+  out=$(mktemp "${TMPDIR:-/tmp}/cr-review-out.XXXXXX"); err=$(mktemp "${TMPDIR:-/tmp}/cr-review-err.XXXXXX")
   run_cli "" "$out" "$err" "$@"
   rc=$CLI_RC
   cat "$out"; cat "$err" >&2
@@ -273,8 +291,8 @@ if (( ${#SEATS[@]} == 0 )); then
   # a limit refusal IS the "every seat is spent" verdict -- report 75 (the one
   # code PRlaunch accepts as an authorized skip) instead of the CLI's bare
   # non-zero, which a caller would have to treat as a real review failure.
-  # Same LIMIT_RE as the seat path; a zero exit is a review, whatever it says.
-  if (( rc != 0 )) && grep -qiE "$LIMIT_RE" "$out" "$err"; then
+  # Same limited() test as the seat path; a zero exit is a review, whatever it says.
+  if limited "$rc" "$out" "$err"; then
     rm -f "$out" "$err"
     log "the default identity is rate-limited and no seat pool is registered -- record the authorized cr_cli skip (run=$CR_RUN_ID)"
     finished=1
@@ -426,7 +444,7 @@ acquire() {
   if mkdir "$lock" 2>/dev/null; then printf '%s' "$$" > "$lock/pid"; prune_uses "$1"; return 0; fi
   # break a lock whose owner died or that outlived a plausible review
   local age owner
-  age=$(( $(now) - $(stat -f %m "$lock" 2>/dev/null || echo 0) ))
+  age=$(( $(now) - $(num "$(mtime "$lock")") ))
   owner=$(cat "$lock/pid" 2>/dev/null || echo 0)
   if (( age > LOCK_STALE )) || ! kill -0 "$owner" 2>/dev/null; then
     rm -rf "$lock"
@@ -451,8 +469,8 @@ rank_seats() {
     # no `.uses` line, so fall back to the newest reviews/ dir mtime or a seat
     # busy elsewhere looks least-recently-used and gets picked first.
     last=$(num "$(tail -1 "$s/.uses" 2>/dev/null)")
-    newest=$(num "$(find "$s/.coderabbit/reviews" -maxdepth 1 -mindepth 1 -type d -mmin -60 \
-               -exec stat -f %m {} \; 2>/dev/null | sort -n | tail -1)")
+    newest=$(num "$(find "$s/.coderabbit/reviews" -maxdepth 1 -mindepth 1 -type d -mmin -60 2>/dev/null \
+               | while IFS= read -r d; do mtime "$d"; done | sort -n | tail -1)")
     (( newest > last )) && last="$newest"
     printf '%s\t%s\t%s\n' "$(uses_in_window "$s")" "$last" "$s"
   done | sort -k1,1n -k2,2n | cut -f3
@@ -518,7 +536,7 @@ while :; do
     log "using seat '$name' ($(uses_in_window "$seat")/$(seat_max "$seat") used this hour) run=$CR_RUN_ID"
     # Buffer the two streams separately: `--agent` mode emits JSON lines on stdout and
     # callers parse them, so CLI stderr must never be folded in. Replayed verbatim below.
-    out=$(mktemp -t cr-review-out); err=$(mktemp -t cr-review-err)
+    out=$(mktemp "${TMPDIR:-/tmp}/cr-review-out.XXXXXX"); err=$(mktemp "${TMPDIR:-/tmp}/cr-review-err.XXXXXX")
     run_cli "$seat" "$out" "$err" "$@"
     rc=$CLI_RC
 
@@ -537,7 +555,7 @@ while :; do
       die_argparse
     fi
 
-    if grep -qiE "$LIMIT_RE" "$out" "$err"; then
+    if limited "$rc" "$out" "$err"; then
       printf '%s' "$(( $(now) + COOLDOWN ))" > "$seat/.limited_until"
       log "seat '$name' is rate-limited -- resting ${COOLDOWN}s, trying the next seat"
       rm -f "$out" "$err"; release "$seat"; held=""; skipped="$skipped $name:limited"

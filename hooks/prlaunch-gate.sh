@@ -19,12 +19,27 @@
 #       Register the outcome-eval scenario file BEFORE the eval runs.
 #       Stores {path, sha256 of the file, ts}. Precondition for outcome_eval.
 #   record deep_review|cr_cli|outcome_eval|tests [--skipped R] [--na R] [--cmd C]
+#                                         [--findings JSON|@file] [--seat S] [--run-id R]
 #       Stamp {sha: current HEAD, ts} for that gate. Rules:
-#         * outcome_eval is REFUSED unless scenarios were registered first,
-#           UNLESS --na is given (no user-facing surface needs no scenarios).
+#         * outcome_eval is REFUSED unless scenarios were registered first AND
+#           the registered file still hashes to the sha256 stored at
+#           registration -- editing or deleting the scenarios after the fact is
+#           drift and is refused. The verified hash is stamped onto the entry as
+#           scenarios_sha256. UNLESS --na is given (no user-facing surface needs
+#           no scenarios).
 #         * --skipped is only valid for cr_cli and requires a reason.
 #         * --na is only valid for outcome_eval and requires a reason.
 #         * --cmd records the verify command (used for tests).
+#         * --findings (deep_review / cr_cli only) records the gate's WHOLE
+#           finding set -- a JSON array, or @path to a file holding one; every
+#           element needs a `severity`. Stored with a per-severity histogram,
+#           and mirrored as a `gate_findings` row via ledger-append.sh.
+#         * --seat S / --run-id R (both optional, cr_cli only) -- identifies
+#           which CR seat and which cr-review.sh run produced the attestation.
+#           Surfaced by cr-review.sh's stderr log lines. Persisted
+#           into the gate's ledger entry (source of truth) AND into the
+#           advisory GitHub status description below -- the ledger copy must
+#           survive even when the status publish is skipped or fails.
 #       Also APPENDS {gate, sha, ts, ...same conditional fields} to a top-level
 #       `history` array. `.gates[gate]` stays the CURRENT-state view
 #       (latest stamp only, unchanged shape -- every existing reader is
@@ -32,17 +47,8 @@
 #       so which trees a gate ever passed on can still be reconstructed after
 #       branch reuse. Backfill for ledgers written before this change is
 #       impossible -- their prior stamps were already overwritten.
-#   path [--scenarios|--repo]
-#       Print the resolved ledger path (or the scenarios sidecar path, or the
-#       repo key). Callers must use this instead of rebuilding the path.
-#         * --seat S / --run-id R (both optional, cr_cli only) -- identifies
-#           which CR seat and which cr-review.sh run produced the attestation.
-#           Surfaced by cr-review.sh's stderr log lines. Persisted
-#           into the gate's ledger entry (source of truth) AND into the
-#           advisory GitHub status description below -- the ledger copy must
-#           survive even when the status publish is skipped or fails.
 #
-#       cr_cli ALSO publishes a GitHub commit status, context `review-gate/cr-cli`,
+#       `record cr_cli` ALSO publishes a GitHub commit status, context `review-gate/cr-cli`,
 #       at the exact sha just recorded ($head, same invocation -- never a stale
 #       re-read of the ledger, since a later record overwrites it).
 #       This is the ADVISORY attestation only: it NEVER writes the required
@@ -59,6 +65,9 @@
 #       OFF BY DEFAULT: nothing is published unless PRLAUNCH_PUBLISH_CR_STATUS=1
 #       is set (see hooks/review-gate-status.sh). Unset, the ledger write is
 #       the whole effect -- no network call, no commit status on your repo.
+#   path [--scenarios|--repo]
+#       Print the resolved ledger path (or the scenarios sidecar path, or the
+#       repo key). Callers must use this instead of rebuilding the path.
 #   publish-cr-cli
 #       Republish the ALREADY-RECORDED cr_cli attestation at the current HEAD.
 #       /PRlaunch records gates in phases 1-4 on the local branch

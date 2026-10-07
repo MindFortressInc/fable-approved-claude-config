@@ -504,5 +504,33 @@ check "ran under the caller's own HOME" "HOME=$SCRATCH/plainhome args=review --b
 check "ran exactly once" "1" "$(grep -c 'STUB invoked' <<<"$o")"
 [[ ! -e "$SCRATCH/plainhome/.claude/cr-seats" ]] && { echo "  PASS: no seat pool created"; pass=$((pass+1)); } || { echo "  FAIL: created a seat pool dir"; fail=$((fail+1)); }
 
+echo "T23: an ADVERSE review whose findings mention rate limits / line 429 is a verdict, not a skip"
+cat > "$SCRATCH/bin/coderabbit" <<'STUB23'
+#!/usr/bin/env bash
+echo "Review: src/limiter.py:429 -- the rate limit check returns too early (CRITICAL)"
+echo "Too many requests are retried without backoff"
+exit 1
+STUB23
+chmod +x "$SCRATCH/bin/coderabbit"
+o=$(CR_SEATS_DIR="$SCRATCH/empty" "$WRAP" --base main 2>&1); rc=$?
+[[ $rc -eq 1 ]] && { echo "  PASS: no-pool path keeps the CLI's exit 1"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 1)"; fail=$((fail+1)); }
+rm -f "$SCRATCH/seats"/*/.uses "$SCRATCH/seats"/*/.limited_until
+o=$(CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+[[ $rc -eq 1 ]] && { echo "  PASS: seat path keeps the CLI's exit 1"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 1)"; fail=$((fail+1)); }
+check "findings surfaced" "rate limit check returns too early" "$o"
+
+echo "T24: a SUCCESSFUL review that mentions limits is returned, never discarded as 75"
+cat > "$SCRATCH/bin/coderabbit" <<'STUB24'
+#!/usr/bin/env bash
+echo "✗ Review limit reached is handled in api/limits.py -- looks fine"
+exit 0
+STUB24
+chmod +x "$SCRATCH/bin/coderabbit"
+rm -f "$SCRATCH/seats"/*/.uses "$SCRATCH/seats"/*/.limited_until
+o=$(CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+[[ $rc -eq 0 ]] && { echo "  PASS: exit 0"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 0)"; fail=$((fail+1)); }
+check "review output kept" "handled in api/limits.py" "$o"
+check "no seat put on cooldown" "0" "$(ls "$SCRATCH/seats"/*/.limited_until 2>/dev/null | wc -l | tr -d ' ')"
+
 echo; echo "RESULT: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

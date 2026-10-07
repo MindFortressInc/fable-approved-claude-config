@@ -9,7 +9,8 @@
 # The CLI reads credentials from $HOME/.coderabbit/auth.json, so a seat is just a
 # fake HOME:  ~/.claude/cr-seats/<name>/.coderabbit/auth.json
 #
-#   cr-seats.sh add <name> <cr-api-key>   register a seat from an agentic API key
+#   cr-seats.sh add <name>                register a seat from an agentic API key
+#                                         (key on stdin or in $CR_SEAT_API_KEY)
 #   cr-seats.sh adopt <name>              register a seat from the current ~/.coderabbit
 #   cr-seats.sh list                      show seats + hourly usage
 #   cr-seats.sh headroom [horizon_s]     slots usable now (+ refreshing within horizon)
@@ -60,7 +61,14 @@ review_times() {
 
 die() { printf 'cr-seats: %s\n' "$1" >&2; exit 1; }
 
-seat_home() { printf '%s/%s' "$SEATS_DIR" "$1"; }
+# Seat names become directory names that `remove` deletes with rm -rf, so only
+# a plain name is accepted -- never `.`, `..`, a slash, or an empty string.
+seat_home() {
+  case "$1" in
+    ''|.|..|*[!A-Za-z0-9._-]*) die "invalid seat name '$1' (use letters, digits, . _ -)" ;;
+  esac
+  printf '%s/%s' "$SEATS_DIR" "$1"
+}
 
 # Reviews this seat's identity made in the last 3600s.
 #
@@ -86,9 +94,19 @@ link_gitconfig() {
 }
 
 cmd_add() {
-  local name="${1:-}" key="${2:-}"
-  [[ -n "$name" && -n "$key" ]] || die "usage: cr-seats.sh add <name> <cr-api-key>"
-  local h; h=$(seat_home "$name")
+  # The key is read from $CR_SEAT_API_KEY or stdin, so it never sits in this
+  # script's argv or your shell history. (A positional key still works, for old
+  # callers, but is visible in `ps`.) `coderabbit auth login` itself only takes
+  # the key as an argument, so it is briefly on that child's argv either way.
+  local name="${1:-}" key="${2:-${CR_SEAT_API_KEY:-}}"
+  [[ -n "$name" ]] || die "usage: cr-seats.sh add <name>   (key on stdin or in \$CR_SEAT_API_KEY)"
+  if [[ -z "$key" ]]; then
+    [[ -t 0 ]] && printf 'CodeRabbit API key for %s: ' "$name" >&2
+    IFS= read -rs key || true
+    [[ -t 0 ]] && printf '\n' >&2
+  fi
+  [[ -n "$key" ]] || die "no API key given for '$name' (stdin or \$CR_SEAT_API_KEY)"
+  local h; h=$(seat_home "$name") || exit 1
   mkdir -p "$h"; chmod 700 "$h"
   link_gitconfig "$h"
   HOME="$h" coderabbit auth login --api-key "$key" >/dev/null 2>&1 \
@@ -103,7 +121,7 @@ cmd_adopt() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: cr-seats.sh adopt <name>"
   [[ -f "$HOME/.coderabbit/auth.json" ]] || die "no ~/.coderabbit/auth.json to adopt"
-  local h; h=$(seat_home "$name")
+  local h; h=$(seat_home "$name") || exit 1
   mkdir -p "$h/.coderabbit"; chmod 700 "$h"
   cp "$HOME/.coderabbit/auth.json" "$h/.coderabbit/auth.json"
   chmod 600 "$h/.coderabbit/auth.json"
@@ -115,7 +133,7 @@ cmd_adopt() {
 cmd_remove() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: cr-seats.sh remove <name>"
-  local h; h=$(seat_home "$name")
+  local h; h=$(seat_home "$name") || exit 1
   [[ -d "$h" ]] || die "no such seat: $name"
   rm -rf "$h"
   printf 'removed seat: %s\n' "$name"

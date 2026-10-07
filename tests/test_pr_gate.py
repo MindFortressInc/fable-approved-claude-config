@@ -355,6 +355,25 @@ class PrGateTest(unittest.TestCase):
         self.assertEqual(decision(out), "deny")
         self.assertIn("no PRlaunch gate record", self._reason(out))
 
+    def test_wrapped_or_path_invocations_still_denied(self):
+        # Wrapper words with operands, an absolute path to gh, and an escaped
+        # command word all run the real thing -- each must still be gated.
+        for pre in ("/opt/homebrew/bin/", "timeout 60 ", "nice ", "nice -n 5 ",
+                    "sudo -E ", "env -i ", "\\"):
+            with self.subTest(prefix=pre):
+                cmd = "cd %s && %s%s --fill" % (self.repo, pre, GHPR)
+                rc, out, _ = self._run(cmd)
+                self.assertEqual(decision(out), "deny", cmd)
+                self.assertIn("no PRlaunch gate record", self._reason(out))
+
+    def test_ordinary_command_mentioning_the_verb_still_passes(self):
+        for cmd in ("echo gh pr create later", "git log --grep 'gh pr create'",
+                    "printf '%s\\n' gh pr create"):
+            with self.subTest(cmd=cmd):
+                rc, out, _ = self._run(cmd)
+                self.assertEqual(rc, 0)
+                self.assertIsNone(decision(out), out)
+
     def test_shell_comment_mention_does_not_trigger(self):
         rc, out, _ = self._run("cd %s   # then run %s\ngit status" % (
             self.repo, GHPR))
