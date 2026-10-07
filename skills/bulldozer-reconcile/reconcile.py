@@ -491,12 +491,15 @@ class LiveLinearClient:
         raise RuntimeError(f"no {self.done_state_name!r} state found for this team")
 
     def close_with_comment(self, issue_id: str, body: str) -> None:
+        # Resolve the target state BEFORE any write: a bad --done-state must
+        # fail with nothing posted, not leave a "Closing." comment on an open
+        # ticket that every later --live run would repeat.
+        done_id = self._resolve_done_state_id()
         self._gql(
             "mutation($id: String!, $body: String!) { "
             "commentCreate(input: {issueId: $id, body: $body}) { success } }",
             {"id": issue_id, "body": body},
         )
-        done_id = self._resolve_done_state_id()
         self._gql(
             "mutation($id: String!, $sid: String!) { "
             "issueUpdate(id: $id, input: {stateId: $sid}) { success } }",

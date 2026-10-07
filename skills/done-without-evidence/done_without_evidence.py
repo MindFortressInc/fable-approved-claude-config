@@ -349,14 +349,17 @@ def find_or_create_standing_ticket(team_name, gql_fn=gql, state_path=DEFAULT_STA
     short-circuits — no Linear call at all. `project_name` is required only
     when the ticket has to be created."""
     state = load_state(state_path)
-    if state.get("issue_id"):
+    # The cache is scoped to the team it was resolved for — a run on another
+    # team must never post onto this team's standing ticket.
+    if state.get("issue_id") and state.get("team") == team_name:
         return state["issue_id"], state.get("identifier"), state.get("url")
 
     data = gql_fn(FIND_STANDING_QUERY, {"team": team_name, "title": title})
     nodes = data["issues"]["nodes"]
     if nodes:
         iss = nodes[0]
-        save_state(state_path, {"issue_id": iss["id"], "identifier": iss["identifier"], "url": iss["url"]})
+        save_state(state_path, {"team": team_name, "issue_id": iss["id"],
+                                "identifier": iss["identifier"], "url": iss["url"]})
         return iss["id"], iss["identifier"], iss["url"]
 
     if not project_name:
@@ -392,7 +395,8 @@ def find_or_create_standing_ticket(team_name, gql_fn=gql, state_path=DEFAULT_STA
     if not res["success"]:
         die("issueCreate returned success=false")
     iss = res["issue"]
-    save_state(state_path, {"issue_id": iss["id"], "identifier": iss["identifier"], "url": iss["url"]})
+    save_state(state_path, {"team": team_name, "issue_id": iss["id"],
+                            "identifier": iss["identifier"], "url": iss["url"]})
     return iss["id"], iss["identifier"], iss["url"]
 
 

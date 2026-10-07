@@ -287,13 +287,25 @@ class StandingTicketTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_cached_state_skips_search_entirely(self):
-        dwe.save_state(self.state_path, {"issue_id": "cached-id", "identifier": "ENG-1",
+        dwe.save_state(self.state_path, {"team": "Eng", "issue_id": "cached-id", "identifier": "ENG-1",
                                           "url": "https://linear.app/x/ENG-1"})
         stub = GqlStub([])  # any call at all is a failure — cache must short-circuit
         iid, ident, url = dwe.find_or_create_standing_ticket(
             "Eng", gql_fn=stub, state_path=self.state_path)
         self.assertEqual(iid, "cached-id")
         self.assertEqual(stub.calls, [])
+
+    def test_cache_for_another_team_is_a_miss(self):
+        dwe.save_state(self.state_path, {"team": "Ops", "issue_id": "ops-ticket",
+                                          "identifier": "OPS-1", "url": "https://linear.app/x/OPS-1"})
+        stub = GqlStub([
+            ("issues", lambda v: {"issues": {"nodes": [
+                {"id": "eng-ticket", "identifier": "ENG-5", "url": "https://linear.app/x/ENG-5"}]}}),
+        ])
+        iid, _, _ = dwe.find_or_create_standing_ticket("Eng", gql_fn=stub, state_path=self.state_path)
+        self.assertEqual(iid, "eng-ticket")
+        self.assertEqual(stub.calls[0][1]["team"], "Eng")
+        self.assertEqual(dwe.load_state(self.state_path)["team"], "Eng")
 
     def test_found_by_search_is_cached_not_recreated(self):
         stub = GqlStub([
