@@ -24,6 +24,11 @@
 #       deliberately excludes the head SHA and line number — both move on
 #       every push, and the whole point is that an adjudicated finding STAYS
 #       adjudicated across a force-push/rebase without re-applying the waiver.
+#   - fix_attempts[repo#pr] = {count, last, at, head, guard_exit} — failed
+#       fix/rebase attempts. ONE "automation has tried enough, a human must
+#       look" bucket shared by the `fix` and `rebase` planners
+#       (babysit_classify.load_fix_attempts); `head` is the PR head the attempt
+#       failed against, so a real push re-arms the cap.
 #   - merges[]              = {pr, ticket, at} — rolling log of merges babysit did
 #       (last 50), so post-restart reporting has the history.
 #
@@ -295,12 +300,57 @@ case "$cmd" in
       --arg k "${1:?repo#pr}" --arg fk "${2:?finding-key}"
     echo "unwaived $1 [$2]" ;;
 
+  # ---- attempt cap -----------------------------------------------------------
+  # Each sweep is a fresh process, so a fix that fails validation every time
+  # looks like a first attempt forever, and the loop either retries endlessly
+  # or refuses to try at all. This counter makes "escalate after N"
+  # expressible. Cleared on success, so only REPEATED failure escalates.
+  attempts)            # attempts <repo#pr>  -> prints the failed-attempt count
+    ensure
+    jq -r --arg k "${1:?repo#pr}" '.fix_attempts[$k].count // 0' "$STORE" ;;
+
+  add-attempt)         # add-attempt <repo#pr> <reason> [head-sha] [guard-exit]
+    # The optional 3rd arg records WHICH HEAD the attempt failed against; the
+    # classifier re-arms the cap once the branch has been pushed to since (the
+    # code that failed is no longer there). Omit it and the record never
+    # re-arms on a head move -- the fail-safe direction. NOT a base sha,
+    # deliberately: a busy default branch moves between almost every pair of
+    # sweeps, so a base-keyed re-arm would lift the gate every sweep.
+    # The optional 4th arg is babysit_merge_guard.py's OWN exit code for a
+    # rebase attempt (2 = REFUSED: a judgment call, not a mechanical retry) --
+    # a structured field so no reader has to pattern-match the free-text
+    # reason.
+    save '.fix_attempts[$k] = {count: ((.fix_attempts[$k].count // 0) + 1),
+                               last: $r, at: $t, head: $h, guard_exit: $g}' \
+      --arg k "${1:?repo#pr}" --arg r "${2:-unspecified}" --arg t "$(ts)" \
+      --arg h "${3:-}" --arg g "${4:-}"
+    echo "attempt recorded for $1 (now $(jq -r --arg k "$1" '.fix_attempts[$k].count' "$STORE"))" ;;
+
+  clear-attempts)      # clear-attempts <repo#pr>  (the fix landed -- reset the attempt budget)
+    # AGENT-invoked on every successful push, so it is scoped to fix_attempts
+    # ONLY. If it also zeroed the CR-CLI round counter, every routine automated
+    # push would silently reset that cap and make it unreachable.
+    save 'del(.fix_attempts[$k])' --arg k "${1:?repo#pr}"
+    echo "attempts cleared for $1 (cr review rounds untouched -- not a human reset)" ;;
+
+  # One HUMAN ruling resets BOTH exhaustion counters: the CR-CLI round count and
+  # the attempt cap encode the same assertion ("automation has tried enough; a
+  # human has to look"), and resetting one alone routes the PR straight back to
+  # NEEDS_HUMAN on the next sweep through the other. ONE jq program in ONE
+  # `save` -- two saves would commit an observable half-reset state between
+  # them. HARD BOUNDARY: waived_findings / known_fp are human judgments about
+  # specific findings and are never touched here. `reset-cli-rounds` is an
+  # alias.
+  reset-pr|reset-cli-rounds)
+    save '.cli_reviewed[$k].rounds = 0 | del(.fix_attempts[$k])' --arg k "${1:?repo#pr}"
+    echo "reset $1: cr review rounds -> 0, fix attempts cleared (waived_findings/known_fp untouched)" ;;
+
   log-merge)           # log-merge <repo#pr> <ticket>
     save '.merges += [{pr:$p,ticket:$k,at:$t}] | .merges |= (.[-50:])' \
       --arg p "${1:?repo#pr}" --arg k "${2:-}" --arg t "$(ts)"
     echo "logged merge $1 ($2)" ;;
 
   *)
-    echo "usage: babysit-progress.sh {load|summary|cli-head <pr>|set-cli-head <pr> <sha>|set-cli-review <pr> <sha> <crit> <major> <minor> <trivial>|is-fp <pr>|add-fp <pr> <reason>|clear-fp <pr>|waive <pr> <finding-key> <reason> [by]|unwaive <pr> <finding-key>|log-merge <pr> <ticket>}" >&2
+    echo "usage: babysit-progress.sh {load|summary|cli-head <pr>|set-cli-head <pr> <sha>|set-cli-review <pr> <sha> <crit> <major> <minor> <trivial>|is-fp <pr>|add-fp <pr> <reason>|clear-fp <pr>|waive <pr> <finding-key> <reason> [by]|unwaive <pr> <finding-key>|attempts <pr>|add-attempt <pr> <reason> [head-sha] [guard-exit]|clear-attempts <pr>|reset-pr <pr>|log-merge <pr> <ticket>}" >&2
     exit 2 ;;
 esac

@@ -73,6 +73,11 @@ CI_TRIAGE_CAP = 2      # Step 4.6 red-CI triages per sweep
 CLI_CAP = 3            # Step 4.5 CR-CLI launches per sweep
 GH_ATTEMPTS = 4        # retry-on-empty attempts for EVERY gh call
 STALE_SESSION_H = 6    # >6h since last_iter_at -> fresh session, reset streak
+# The tiers a merge would act on. A PR already in one of these is never bumped:
+# it can be RATE_LIMITED on the cloud channel yet `strict` via a clean CR-CLI
+# review at head, and spending the hour's review budget on a PR nobody is
+# waiting on a review for is waste.
+GREEN_TIERS = ("strict", "cosmetic_yellow")
 
 # ---- greens gate: cosmetic allowlist + RED regex (Step 5) ------------------
 # COSMETIC = known non-gating deploy checks ONLY (explicit allowlist).
@@ -90,7 +95,23 @@ RATE_PHRASES = [
     "rate limit exceeded", "rate limited", "rate-limited",
     "prepaid credits", "credits have been exhausted",
     "ran out of credits", "out of credits", "credit balance is",
+    # The LITERAL text cloud CodeRabbit posts on a trial/plan limit bounce
+    # ("## Review limit reached"). It shares no substring with any entry above,
+    # so a bounce fell past the rate check into the whole-history
+    # any_no_actionable scan below -- which can find an OLDER, genuinely clean
+    # "no actionable comments" summary and read the PR CLEAN although the
+    # newest thing CodeRabbit said was "I did not review this".
+    "review limit reached",
 ]
+
+
+def is_rate_bounce(body):
+    """True when `body` is CodeRabbit DECLINING to review (rate limit, credit
+    exhaustion, plan review-limit) rather than a review. One spelling shared by
+    every caller, so the issue-comment and review-body scans cannot drift."""
+    return any(p in (body or "").lower() for p in RATE_PHRASES)
+
+
 NO_ACTIONABLE = "no actionable comments were generated"
 REVIEW_TRIGGERED = "review triggered"
 AUTO_DISABLED = "auto reviews are disabled"  # stacked PR -> CR-CLI target
@@ -101,6 +122,85 @@ AUTO_DISABLED = "auto reviews are disabled"  # stacked PR -> CR-CLI target
 # reviewed" signals so a reviewed-clean PR isn't mis-tagged NO_REVIEW_YET and
 # bumped forever (which only buries the verdict deeper).
 REVIEW_DONE_ACKS = ["review finished", "does not re-review already reviewed commits"]
+
+# Findings CodeRabbit could not place inline still count. A review whose body
+# says "Actionable comments posted: N" with N > 0 carries findings even when
+# no inline comment exists for them -- they sit in the body's "Outside diff
+# range" / "Duplicate comments" sections. Ignoring the body read such a PR as
+# reviewed-and-clean and shipped it as a merge-ready green with unaddressed
+# findings in it.
+BODY_ACTIONABLE_RE = re.compile(r"actionable comments posted:\s*(\d+)")
+# Review-body sections whose findings live ONLY in the body -- never as an
+# inline comment -- so no inline root can account for them.
+BODY_ONLY_SECTION_RE = re.compile(r"(?:outside diff range|duplicate) comments \((\d+)\)")
+# A root inline CR comment must carry the structural markers of a genuine
+# finding to count as actionable. Counting a root purely by PRESENCE + TIMING
+# (never reading its body) flagged HAS_ACTIONABLE on CodeRabbit's own
+# content-less status widgets. An allowlist, not a denylist of widget shapes:
+# measured over a few hundred real CR inline bodies, every genuine finding
+# carried the severity tag or the AI-prompt block, and every one that did not
+# was a reply/ack/withdrawal the root/withdrawn filters already drop. A
+# denylist breaks the moment CodeRabbit changes its output format.
+GENUINE_FINDING_RE = re.compile(
+    r"_(?:🔴\s*critical|🟠\s*major|🟡\s*minor|🔵\s*trivial|"
+    r"🛠️?\s*refactor suggestion|⚠️?\s*potential issue|"
+    r"💡\s*verification agent|🧹\s*nitpick)_"          # CR's severity/category tags
+    r"|prompt for (?:all review comments with )?ai agents?",  # the AI-prompt block
+    re.I)
+# CodeRabbit's in-thread SELF-WITHDRAWAL of one of its own findings. Two text
+# detectors, because the marker alone has already failed in the field: CR
+# has replied "**I withdraw this finding.**" with no marker anywhere, and
+# keying only on the marker left that root actionable until a push aged it
+# out -- on a settled PR, never. The prose match is ANCHORED to the whole
+# sentence: a loose /withdraw/ would also fire on "I am not withdrawing".
+WITHDRAW_MARKER = "review_comment_withdrawn"
+WITHDRAW_PROSE_RE = re.compile(r"\bi\s+withdraw\s+this\s+finding\b", re.I)
+
+# WHO may author cloud review state. Compared EXACTLY: a login merely
+# *containing* "coderabbit" used to be enough, so any GitHub account named
+# e.g. `coderabbit-fan` could post "No actionable comments were generated" and
+# manufacture a CLEAN verdict. `[bot]` logins cannot be registered by a
+# person, and `coderabbitai` is CodeRabbit's own account.
+CR_BOT_LOGINS = frozenset({"coderabbitai[bot]", "coderabbitai"})
+
+
+def _is_genuine_cr_finding(body):
+    """True when a root inline CR comment's body carries a real finding's
+    structural markers (severity tag, AI-prompt block, or an embedded
+    non-zero actionable count) rather than a content-less status widget."""
+    body = body or ""
+    if GENUINE_FINDING_RE.search(body):
+        return True
+    m = BODY_ACTIONABLE_RE.search(body.lower())
+    return bool(m and int(m.group(1)) > 0)
+
+
+def _body_has_unplaced_findings(review, body_lower, n, cr_inline):
+    """True when a review body's "Actionable comments posted: N" covers a
+    finding that no inline root comment attached to that review accounts for.
+
+    Measured over ~250 CodeRabbit reviews: N equals the review's inline ROOT
+    comments (`pull_request_review_id`) in the large majority, N exceeds them
+    in the rest, never N < roots; outside-diff and duplicate sections are not
+    counted in N. When every one of the N is placed inline, the inline loop
+    (with its withdrawal, genuine-marker and resolved-thread filters) is the
+    authority -- re-counting them from the header ignores all three and holds
+    a settled PR HAS_ACTIONABLE forever.
+
+    Every uncertain direction keeps the body actionable: a review with no id,
+    roots missing from the first-page inline fetch (N > placed), a root without
+    the genuine-finding markers (not counted as placed), or any body-only
+    section."""
+    rid = review.get("id")
+    placed = 0
+    if rid is not None:
+        placed = sum(1 for c in cr_inline
+                     if not c.get("in_reply_to_id")
+                     and c.get("pull_request_review_id") == rid
+                     and _is_genuine_cr_finding(c.get("body")))
+    if n > placed:
+        return True
+    return any(int(k) > 0 for k in BODY_ONLY_SECTION_RE.findall(body_lower))
 
 # ---- CR-CLI harvest comments (the local-review channel) --------------------
 # The header babysit writes when it posts a CR-CLI harvest. Authored by the
@@ -215,6 +315,45 @@ def _has_critical(body):
     return any(rx.search(body) for rx in CLI_CRITICAL_MARKERS)
 
 
+# A MAJOR, counted -- the RAISED count, mirroring `_has_critical`'s
+# precedence (a count is authoritative; markers vote only without one). Used
+# by the unauthorized-ruling floor in classify_pr, which mirrors
+# hooks/babysit-progress.sh `waive`'s own autonomous bar: that store write
+# refuses an unauthorized waive on critical OR major OR >5 findings raised, so
+# a PR-comment ruling must not be a cheaper route past the same bar.
+# Over-blocking (an already-applied major still holding the floor) costs a
+# glance; under-blocking lets an agent-authored ruling clear an open major.
+CLI_MAJOR_COUNTS = (
+    re.compile(r"(?<!_)major\s*=\s*(\d+)", re.I),       # severity: major=1
+    re.compile(r"(\d+)\s*\*{0,2}\s*major\b", re.I),     # "3 findings, 1 MAJOR"
+)
+CLI_MAJOR_MARKERS = (
+    re.compile(r"\*\*\s*(?:🟠\s*)?major\b", re.I),       # a **major** bullet
+)
+
+
+def _has_major(body):
+    """True only when the harvest actually reports a MAJOR (a positive count,
+    or an explicit marker when no count is present)."""
+    for rx in CLI_MAJOR_COUNTS:
+        m = rx.search(body)
+        if m:
+            return int(m.group(1)) > 0
+    return any(rx.search(body) for rx in CLI_MAJOR_MARKERS)
+
+
+def _total_raised(body):
+    """Total findings the harvest's severity histogram RAISED (critical +
+    major + minor + trivial), mirroring hooks/babysit-progress.sh's `.total`
+    for the autonomous-waive ">5" bar. None when the body carries no COMPLETE
+    `severity: ...` line -- all four keys must be present, same rule as
+    `_states_zero_findings`; a partial mention is prose, not a verdict."""
+    pairs = CLI_SEVERITY_PAIR_RE.findall(body)
+    if pairs and {name.lower() for name, _ in pairs} == CLI_SEVERITY_KEYS:
+        return sum(int(count) for _, count in pairs)
+    return None
+
+
 def _findings_left(body):
     """How many findings the harvest says REMAIN. None when unparseable.
 
@@ -319,11 +458,19 @@ def _ruling_authors():
     """The set of GitHub logins allowed to author a ruling comment, lowered.
 
     $BABYSIT_RULING_AUTHORS (comma-separated) wins over the
-    RULING_AUTHORS_DEFAULT team config. Empty -> empty set -> NO comment
-    parses, which is the fail-closed direction: an unconfigured install must
-    not let arbitrary commenters mint waivers.
+    RULING_AUTHORS_DEFAULT team config. UNSET falls through to the default --
+    "no override" means "use the login(s) this install trusts". But a variable
+    that IS SET, however it resolves (blank, comma-only, garbage) -- including
+    literally `BABYSIT_RULING_AUTHORS=""` -- must NEVER fall back to the
+    default: an operator who sets it to disable comment rulings must get the
+    empty set, not a silent trust of the default login. The earlier `or`
+    fallback treated "set but empty" exactly like "unset". `is None`, not
+    falsiness, is what makes the distinction. Empty set -> NO comment parses,
+    the fail-closed direction.
     """
-    raw = os.environ.get("BABYSIT_RULING_AUTHORS", "").strip() or RULING_AUTHORS_DEFAULT
+    raw = os.environ.get("BABYSIT_RULING_AUTHORS")
+    if raw is None:
+        raw = RULING_AUTHORS_DEFAULT
     return {a.strip().lower() for a in raw.split(",") if a.strip()}
 
 
@@ -347,12 +494,24 @@ def harvest_ruling_comments(issues):
     never-crash-the-sweep contract as the rest of this module.
 
     If more than one ruling exists for the same finding-key (a revised ruling
-    with an updated reason), the NEWEST wins by `created_at` -- resolved
-    explicitly here rather than assumed from list order, since the list's
-    sort order is a caller/API convention, not a guarantee this function
-    should depend on."""
+    with an updated reason), the winner is resolved explicitly here rather
+    than assumed from list order, since the list's sort order is a caller/API
+    convention, not a guarantee this function should depend on.
+
+    The rank is `(authorized_by_human, created_at)`, NOT `created_at` alone.
+    AN AUTHORIZATION IS NOT A REASON: recency is the right tiebreak WITHIN an
+    authorization tier and the wrong one ACROSS tiers. Measured: an authorized
+    WAIVE was followed a minute later by a second ruling comment for the same
+    key emitted without BABYSIT_WAIVE_AUTHORIZED_BY, so it rendered
+    `authorized-by-human: false`; under newest-wins the malformed twin
+    superseded the real ruling and the CRITICAL stayed pinned for nine
+    consecutive sweeps, each structurally unable to clear it. An authorized
+    ruling posted LATER still wins on both axes, so an explicit authorized
+    revision stays possible -- the only kind that should be. Same fail-closed
+    direction, pointed the other way: an UNAUTHORIZED record must not be able
+    to revoke authorization it never had the standing to grant."""
     authors = _ruling_authors()
-    best = {}  # finding-key -> (created_at, record)
+    best = {}  # finding-key -> ((authorized_by_human, created_at), record)
     for c in issues or []:
         login = (((c.get("user") or {}).get("login")) or "").lower()
         if login not in authors:
@@ -392,9 +551,13 @@ def harvest_ruling_comments(issues):
                                     and auths[0].strip() == "true"),
             "via": "pr_comment",
         }
-        at = c.get("created_at") or ""
-        if key not in best or at > best[key][0]:
-            best[key] = (at, rec)
+        # `bool` is an `int`, so the tuple compare puts every authorized
+        # ruling strictly above every unauthorized one and only then falls
+        # back to recency -- no separate branch, and no way for an
+        # unauthorized comment to outrank an authorized one for the same key.
+        rank = (rec["authorized_by_human"], c.get("created_at") or "")
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, rec)
     return {k: rec for k, (_, rec) in best.items()}
 
 
@@ -506,19 +669,127 @@ def gh_json(gh_bin, args, attempts=GH_ATTEMPTS):
 
 
 def is_cr(obj):
+    """Exact-login match against CR_BOT_LOGINS -- see there for why a
+    substring match let any account manufacture review state."""
     login = ((obj or {}).get("user") or {}).get("login", "") or ""
-    return bool(re.search("coderabbit", login, re.I))
+    return login.lower() in CR_BOT_LOGINS
 
 
 # ============================================================================
 # greens gate helpers
 # ============================================================================
+# `statusCheckRollup` carries the check runs of EVERY check suite on the head
+# commit, so a re-run that PASSED does not remove the earlier failed entry --
+# both survive side by side on the same sha. Ungrouped, the stale name matched
+# RED_RE and pinned the PR at red_ci forever, and because ci_triage only
+# selects mss UNSTABLE/BLOCKED, a red_ci PR whose mss is CLEAN earned no action
+# either: a pocket with no exit. Measured across ~70 open PRs: every red_ci PR
+# in the org was one of these, mergeable and mss=CLEAN.
+#
+# An unexpanded `${{ ... }}` is GitHub's LITERAL placeholder for a matrix job
+# cancelled before the matrix expanded. The run that replaced it names the same
+# jobs `pytest (shard 0..3)`, so the placeholder has no same-name twin and
+# grouping alone can never reach it.
+MATRIX_PLACEHOLDER_RE = re.compile(r"\$\{\{")
+# Conclusions that mean "this entry never ran to a verdict", i.e. the only ones
+# a placeholder name is allowed to be dropped on.
+_UNRUN_CONCL = {"CANCELLED", "SKIPPED"}
+UNKNOWN_CHECK_NAME = "?"
+
+
+def _rollup_name(c):
+    return c.get("name") or c.get("context") or UNKNOWN_CHECK_NAME
+
+
+def _rollup_concl(c):
+    return (c.get("conclusion") or c.get("state") or "").upper()
+
+
+def _rollup_key(c):
+    """Group key for supersession: (check name, workflow).
+
+    Keyed on the WORKFLOW too, never the bare name. Two different workflows may
+    each define a check called `lint`; on the bare name one workflow's newer
+    SUCCESS would launder the other's FAILURE. `gh pr view --json
+    statusCheckRollup` returns `workflowName` (absent on app checks such as
+    CodeRabbit and Vercel; failing_check_names never applies supersession to
+    those, see there).
+    """
+    return (_rollup_name(c), c.get("workflowName") or "")
+
+
+def _rollup_group_key(c, i):
+    """`_rollup_key`, except an entry with NO resolvable name never groups.
+
+    Two entries that both fall back to "?" are not evidence of the same check,
+    so grouping them would let a newer unnamed SUCCESS supersede an older
+    unnamed FAILURE belonging to something else entirely. The index keeps each
+    one in its own group, which costs nothing and fails closed.
+    """
+    if _rollup_name(c) == UNKNOWN_CHECK_NAME:
+        return (UNKNOWN_CHECK_NAME, i)
+    return _rollup_key(c)
+
+
+def _rollup_ts(c):
+    """Sortable instant for a rollup entry, or "" when it has none.
+
+    ISO-8601 Z strings sort lexicographically in chronological order, so no
+    parsing is needed. `completedAt` first because that is when the verdict was
+    reached; `startedAt` is the fallback for entries GitHub reports without one.
+    """
+    return c.get("completedAt") or c.get("startedAt") or ""
+
+
 def failing_check_names(scr):
+    """Names of checks whose CURRENT verdict is a failure, one entry per check.
+
+    This is a merge gate, so every rule here fails CLOSED -- an entry is only
+    dropped when it is provably superseded:
+
+      * Only CONCLUDED entries participate. A queued re-run reports conclusion
+        "" (an empty string, not null -- measured), so letting it count as the
+        newest would bury a real failure the instant it was queued. Red survives
+        until the re-run actually concludes green.
+      * A group with two or more concluded entries where any lacks BOTH
+        timestamps has no defensible ordering, so it keeps the old
+        any-failure-is-failing reading.
+      * An exact timestamp tie is not evidence of supersession: the failing
+        entry wins.
+    """
+    groups = {}                       # insertion-ordered: output stays stable
+    for i, c in enumerate(scr or []):
+        groups.setdefault(_rollup_group_key(c, i), []).append(c)
+
     out = []
-    for c in scr or []:
-        concl = (c.get("conclusion") or c.get("state") or "").upper()
-        if concl in FAIL_CONCL:
-            out.append(c.get("name") or c.get("context") or "?")
+    for (name, _wf), entries in groups.items():
+        concluded = [c for c in entries if _rollup_concl(c)]
+        if not concluded:
+            continue                  # nothing has a verdict yet -> not failing
+        if not _wf or (len(concluded) > 1 and any(not _rollup_ts(c) for c in concluded)):
+            # No workflow name means an app check or a status context, and
+            # nothing in the rollup tells two different apps' same-named
+            # checks apart -- so one app's newer SUCCESS must not hide
+            # another's FAILURE. Supersession is only trusted inside one
+            # Actions workflow.
+            failing = any(_rollup_concl(c) in FAIL_CONCL for c in concluded)
+        else:
+            # max() keeps the FIRST maximal element, so order the tie-break
+            # explicitly: on equal timestamps the failing entry wins.
+            newest = max(concluded,
+                         key=lambda c: (_rollup_ts(c),
+                                        _rollup_concl(c) in FAIL_CONCL))
+            failing = _rollup_concl(newest) in FAIL_CONCL
+        if not failing:
+            continue
+        if (MATRIX_PLACEHOLDER_RE.search(name)
+                and all(_rollup_concl(c) in _UNRUN_CONCL for c in concluded)):
+            # Cancelled before the matrix expanded -> a phantom, not a gate.
+            # Guarded to CANCELLED/SKIPPED so a job that genuinely ran and
+            # FAILED under a broken interpolation still counts red.
+            continue
+        if name not in out:
+            out.append(name)
     return out
 
 
@@ -577,7 +848,43 @@ def _fetch_fail(repo, pr):
         # prs[] row, and a renderer must never KeyError on a transient
         # FETCH_FAIL.
         "cli_findings_open": None, "ruled_via_pr_comment": [], "green_via": "",
+        "head_oid": "",
     }
+
+
+def fetch_resolved_roots(gh_bin, owner, repo, num):
+    """databaseIds of the ROOT comment of every review thread GitHub itself
+    marks RESOLVED.
+
+    The ROBUST half of the withdrawal detector: it reads GitHub's own settled
+    bit instead of CodeRabbit's prose, so CR rewording its withdrawal cannot
+    break it. It needs its own call because REST's `pulls/{n}/comments`
+    carries no resolution state -- `isResolved` exists only on the GraphQL
+    `reviewThreads` connection.
+
+    Returns a SET, and an EMPTY one on any failure -- never None. Empty means
+    "nothing is known to be settled", which leaves every finding actionable:
+    the fail-safe direction for a merge gate. A failure here must not escalate
+    to FETCH_FAIL, because the classification is strictly better with this
+    signal and no worse without it. `first:100` is unpaged for the same
+    reason: a 101st thread is simply not seen, which leaves its finding
+    actionable -- under-clearing, the safe direction."""
+    q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){"
+         "pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved "
+         "comments(first:1){nodes{databaseId}}}}}}}")
+    d = gh_json(gh_bin, ["api", "graphql", "-f", "query=" + q,
+                         "-F", f"o={owner}", "-F", f"r={repo}", "-F", f"n={num}"])
+    node = (d or {}).get("data") or {}
+    for k in ("repository", "pullRequest", "reviewThreads"):
+        node = (node or {}).get(k) or {}
+    roots = set()
+    for t in (node.get("nodes") or []):
+        if not (t or {}).get("isResolved"):
+            continue
+        for c in (((t.get("comments") or {}).get("nodes")) or []):
+            if (c or {}).get("databaseId"):
+                roots.add(c["databaseId"])
+    return roots
 
 
 def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
@@ -643,12 +950,15 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     # conversation — "Skipped: comment is from another GitHub bot" acks, or
     # withdrawal replies — and CR posts them whenever anyone answers in a
     # thread, so counting them re-flags an already-settled PR on every sweep
-    # until the head happens to move. A root CR explicitly withdrew (reply
-    # carrying <review_comment_withdrawn>) is dead regardless of age.
+    # until the head happens to move. A root CR explicitly withdrew is dead
+    # regardless of age -- by the marker, by the prose sentence, or by the
+    # thread being resolved (the three detectors below).
     withdrawn_roots = {
         c.get("in_reply_to_id")
         for c in cr_inline
-        if c.get("in_reply_to_id") and "review_comment_withdrawn" in (c.get("body") or "")
+        if c.get("in_reply_to_id")
+        and (WITHDRAW_MARKER in (c.get("body") or "")
+             or WITHDRAW_PROSE_RE.search(c.get("body") or ""))
     }
     actionable = []
     if cr_inline and last_push:
@@ -657,9 +967,36 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
                 continue  # reply, not a finding
             if c.get("id") in withdrawn_roots:
                 continue  # CR withdrew this finding in-thread
+            if not _is_genuine_cr_finding(c.get("body")):
+                continue  # presence + timing alone is not a finding
             t = parse_iso(cts(c))
             if t and t > last_push:
                 actionable.append(c)
+    # ...and a thread GITHUB marks resolved is settled by definition, whoever
+    # settled it. Fetched ONLY when something would otherwise be actionable,
+    # so the extra GraphQL call is spent exactly on the PRs whose verdict it
+    # can change.
+    if actionable:
+        resolved_roots = fetch_resolved_roots(gh_bin, owner, repo, num)
+        if resolved_roots:
+            actionable = [c for c in actionable
+                          if c.get("id") not in resolved_roots]
+
+    # Findings CR could not place inline still count (BODY_ACTIONABLE_RE). Aged
+    # the same way as inline ones: a review OLDER than the last push was
+    # already addressed by that push. And only the findings no inline root
+    # accounts for -- see _body_has_unplaced_findings.
+    body_actionable = []
+    if last_push:
+        for r in cr_reviews:
+            t = parse_iso(r.get("submitted_at"))
+            if not (t and t > last_push):
+                continue
+            rbody = (r.get("body") or "").lower()
+            m = BODY_ACTIONABLE_RE.search(rbody)
+            if m and int(m.group(1)) > 0 and _body_has_unplaced_findings(
+                    r, rbody, int(m.group(1)), cr_inline):
+                body_actionable.append(r)
 
     # last CR activity timestamp (bump rotation + fingerprint).
     times = []
@@ -680,9 +1017,6 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     li = latest(cr_issues, "created_at")
     li_body = ((li or {}).get("body") or "").lower()
 
-    def has_rate(t):
-        return any(p in t for p in RATE_PHRASES)
-
     # A completed "0 actionable" verdict can sit ANYWHERE in the comment history —
     # a later bump-ack often becomes the newest comment and buries it. So scan ALL
     # CR comments/reviews for it, not just the latest (li_body).
@@ -695,11 +1029,42 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     # "Review finished"/incremental-skip acks prove CR reviewed even when the
     # original summary is buried under bump-acks.
     review_done_ack = any(any(a in _body(c) for a in REVIEW_DONE_ACKS) for c in cr_issues)
+    # A stacked PR's "auto reviews are disabled" notice can sit ANYWHERE in the
+    # history: a `@coderabbitai review` bump answers with a "Review finished"
+    # ack that becomes the NEWEST comment and buries it -- which dropped the PR
+    # out of the cli_launch net into CLEAN, i.e. the sweep bumped a PR out of
+    # its own safety net. Scan ALL comments, exactly like any_no_actionable.
+    any_auto_disabled = any(AUTO_DISABLED in _body(c) for c in cr_issues)
+    # A bounce NEWER than the newest "0 actionable" summary means the latest
+    # thing CodeRabbit said about this PR is "I did not review it", whatever
+    # was said before. Checking only the newest issue comment missed the
+    # common shape: the sweep's own bump of a RATE_LIMITED PR is answered
+    # with a "Review triggered" ack that becomes the newest comment, buries
+    # the bounce, and let the whole-history any_no_actionable scan below
+    # resurrect an OLDER clean summary into CLEAN/strict. Narrowing only: it
+    # can turn CLEAN into RATE_LIMITED, never the reverse.
+
+    def _newest(items, key, pred):
+        ts = [parse_iso(x.get(key)) for x in items if pred(_body(x))]
+        ts = [t for t in ts if t]
+        return max(ts) if ts else None
+
+    newest_bounce = max(
+        [t for t in (_newest(cr_issues, "created_at", is_rate_bounce),
+                     _newest(cr_reviews, "submitted_at", is_rate_bounce)) if t],
+        default=None)
+    newest_clean = max(
+        [t for t in (_newest(cr_issues, "created_at", lambda b: NO_ACTIONABLE in b),
+                     _newest(cr_reviews, "submitted_at", lambda b: NO_ACTIONABLE in b)) if t],
+        default=None)
+    bounce_is_latest_verdict = bool(
+        newest_bounce and (newest_clean is None or newest_bounce > newest_clean))
 
     # --- classify into ONE CR state (order = precedence) ---
-    if actionable:
+    if actionable or body_actionable:
         state = "HAS_ACTIONABLE"
-    elif has_rate(li_body) or any(has_rate(_body(r)) for r in cr_reviews):
+    elif (is_rate_bounce(li_body) or any(is_rate_bounce(_body(r)) for r in cr_reviews)
+          or bounce_is_latest_verdict):
         # Rate-limit/credit text can land as a submitted REVIEW body, not
         # only an issue comment — scanning the latest issue comment alone
         # let such a PR fall through to `cr_reviews non-empty -> CLEAN` and
@@ -708,7 +1073,7 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
         state = "RATE_LIMITED"          # credit-exhausted == rate-limited (ONE state)
     elif any_no_actionable:
         state = "CLEAN"                 # CR posted a "0 actionable" summary (scan ALL, not just newest)
-    elif AUTO_DISABLED in li_body:
+    elif any_auto_disabled:
         state = "STACKED_BLOCKED"       # cloud rejects stacked base -> CR-CLI target
     elif REVIEW_TRIGGERED in li_body:
         state = "TRIGGERED_WAITING"
@@ -750,6 +1115,12 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
                     "at": iso(at),
                     "findings": left,
                     "critical": _has_critical(hbody),
+                    # The rest of hooks/babysit-progress.sh `waive`'s own
+                    # autonomous bar (critical OR major OR >5 raised), so the
+                    # unauthorized-ruling floor below holds on exactly the
+                    # cases the store already refuses to let an agent clear.
+                    "major": _has_major(hbody),
+                    "findings_raised": _total_raised(hbody),
                     "excerpt": (newest_harvest.get("body") or "")[:400],
                 }
 
@@ -782,7 +1153,26 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
 
     if cli_open is not None and cli_open["findings"] is not None:
         _effective_waived = dict((waived_findings or {}).get(_wkey) or {})
-        _effective_waived.update(_harvested_rulings)
+        # The harvested view normally supersedes the store for a shared key
+        # (it is the fresher of the two halves one ruling action writes), with
+        # ONE exception -- it may not DOWNGRADE an authorization. When the
+        # store records `authorized_by_human: True` and the comment-derived
+        # record does not, the STORE wins and the disagreement is logged. The
+        # store is not writable from a PR comment, so a comment disagreeing
+        # with it about authorization is evidence the two halves DRIFTED,
+        # never that the authorization was revoked. Strictly narrowing: it can
+        # only PRESERVE an authorization the authorized store path granted.
+        for _fk, _ruling in _harvested_rulings.items():
+            _stored = _effective_waived.get(_fk)
+            if (isinstance(_stored, dict)
+                    and _stored.get("authorized_by_human") is True
+                    and _ruling.get("authorized_by_human") is not True):
+                sys.stderr.write(
+                    "babysit_classify: %s %s -- store says "
+                    "authorized_by_human, PR comment says it does not; "
+                    "keeping the store's authorization\n" % (_wkey, _fk))
+                continue
+            _effective_waived[_fk] = _ruling
         _waived_n = len(_effective_waived)
         if _waived_n:
             # A WAIVER NEVER ZEROES A CRITICAL UNLESS A HUMAN AUTHORIZED IT.
@@ -805,7 +1195,19 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
                 isinstance(w, dict) and w.get("authorized_by_human") is True
                 for w in _effective_waived.values()
             )
-            _floor = 0 if (_human_ok or not cli_open.get("critical")) else 1
+            #
+            # The floor mirrors hooks/babysit-progress.sh `waive`'s autonomous
+            # bar IN FULL, not just its critical half: that store write refuses
+            # an unauthorized waive on critical OR major OR >5 findings raised,
+            # so an unauthorized PR-comment ruling used to clear majors and
+            # >5-finding piles straight to `cli_open = None` while the store
+            # refused the exact same write.
+            _risky = bool(
+                cli_open.get("critical") or cli_open.get("major")
+                or (cli_open.get("findings_raised") or 0) > 5
+            )
+            _floor_held = _risky and not _human_ok
+            _floor = 1 if _floor_held else 0
             _eff_n = max(_floor, cli_open["findings"] - _waived_n)
             if _eff_n == 0:
                 cli_open = None
@@ -817,7 +1219,15 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
                 # cannot answer this on its own.
                 _cli_open_cleared_by_waiver = True
             else:
-                cli_open = dict(cli_open, findings=_eff_n)
+                # `floor_held` is read by the green gate below -- NOT
+                # `critical`/`major` directly, which stay descriptive. A PLAIN
+                # unruled major must keep greening exactly as before; this flag
+                # fires only when an ACTUAL ruling attempt landed on a risky
+                # residual and was not authorized enough to clear it. Without
+                # it the floor kept a major VISIBLE as open while the green
+                # gate (which read `critical` alone) still carried the same PR
+                # into `strict` -- needs-a-human and merge-ready at once.
+                cli_open = dict(cli_open, findings=_eff_n, floor_held=_floor_held)
 
     # "AT HEAD" IS AN IDENTITY QUESTION, NOT A RACE BETWEEN TWO CLOCKS. The
     # harvest flow is review -> apply fixes -> commit -> push -> POST THE
@@ -843,7 +1253,12 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     # must report 0 open findings, and it never overrules an outstanding
     # cloud finding (HAS_ACTIONABLE always wins) or a red check.
     cli_clean_at_head = False
-    if newest_harvest is not None and cli_open is None and state != "HAS_ACTIONABLE":
+    # TRIGGERED_WAITING is CodeRabbit's own "reviewing now" placeholder --
+    # same shape as HAS_ACTIONABLE for this purpose, a cloud channel that may
+    # still have more to say. A clean CLI harvest must not wave the PR through
+    # while the cloud review it is waiting on has not reported.
+    if (newest_harvest is not None and cli_open is None
+            and state not in ("HAS_ACTIONABLE", "TRIGGERED_WAITING")):
         at_h = parse_iso(newest_harvest.get("created_at") or "")
         if at_h and last_push and at_h >= last_push and cli_covers_head:
             # AN ADJUDICATED FINDING IS CLEAN AT HEAD. The waiver machinery
@@ -880,14 +1295,18 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     # said "0 actionable" while the local harvest reported critical=1. Only
     # criticals block: a non-critical unapplied finding still greens.
     # red_ci is assigned FIRST so the PR keeps earning a ci_triage action.
-    cli_critical_open = bool((cli_open or {}).get("critical"))
+    # Joined by `floor_held`: an unauthorized ruling on a risky residual that
+    # the floor above held back (see there). Never a blanket major check.
+    cli_open_blocks_green = bool(
+        (cli_open or {}).get("critical") or (cli_open or {}).get("floor_held")
+    )
 
     tier = ""
     if state == "CLEAN" or cli_clean_at_head:
         if red_failing:
             tier = "red_ci"             # RED check -> NEVER a green of any tier
-        elif cli_critical_open:
-            tier = ""                   # unapplied CRITICAL -> not green, any tier
+        elif cli_open_blocks_green:
+            tier = ""                   # unapplied CRITICAL / held floor -> not green
         elif mergeable == "MERGEABLE" and mss == "CLEAN" and not failing:
             tier = "strict"
         elif mergeable == "MERGEABLE" and mss == "UNSTABLE" and failing and not red_failing:
@@ -912,6 +1331,8 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
         "created_at": pr.get("createdAt", ""),
         "cr_inline_count": len(cr_inline),
         "blurb": pr.get("title", ""),
+        # The live head, so the attempt-cap gates can re-arm on a real push.
+        "head_oid": head_oid,
     }
 
 
@@ -1134,6 +1555,155 @@ def load_waived_findings(path=None):
 
 
 # ============================================================================
+# attempt cap — ONE "automation has tried enough, a human must look" bucket
+# ============================================================================
+# hooks/babysit-progress.sh `add-attempt` records a failed fix/rebase attempt;
+# `clear-attempts` deletes the record on a successful push; `reset-pr` is the
+# human ruling that lifts it. Each sweep is a fresh process, so without this
+# read a fix that fails validation every time looks like a first attempt
+# forever, and the planner re-plans it every sweep.
+_FIX_ATTEMPT_CAP_DEFAULT = 2
+
+
+def _load_fix_attempt_cap():
+    """BABYSIT_FIX_ATTEMPT_CAP, parsed defensively: a non-numeric override
+    would crash the sweep at import, and -- worse, silently -- a cap < 1 would
+    exclude EVERY candidate (a never-attempted PR's count is 0, and `0 < 0` is
+    False)."""
+    try:
+        cap = int(os.environ.get("BABYSIT_FIX_ATTEMPT_CAP", _FIX_ATTEMPT_CAP_DEFAULT))
+    except (TypeError, ValueError):
+        return _FIX_ATTEMPT_CAP_DEFAULT
+    return cap if cap > 0 else _FIX_ATTEMPT_CAP_DEFAULT
+
+
+FIX_ATTEMPT_CAP = _load_fix_attempt_cap()
+
+
+def load_fix_attempts(path=None):
+    """{"repo#pr": {count, last, at, head, guard_exit}} for every PR carrying a
+    failed-attempt record. Read side of babysit-progress.sh's `attempts` /
+    `add-attempt` / `clear-attempts` / `reset-pr`. A WHITELIST reconstruction:
+    every field is type-checked, because a non-string head (a JSON number, a
+    surviving null) would otherwise reach _looks_like_sha and raise on len(),
+    taking the WHOLE sweep down over one malformed record. Missing/corrupt
+    store -> {} -- a planning hint must never crash the sweep."""
+    p = path or os.environ.get(
+        "BABYSIT_PROGRESS", os.path.expanduser("~/.claude/babysit-progress.json"))
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    records = data.get("fix_attempts")
+    if not isinstance(records, dict):
+        return {}
+    out = {}
+    for k, v in records.items():
+        if not isinstance(v, dict):
+            continue
+        try:
+            count = int(v.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+        out[k] = {
+            "count": count, "last": v.get("last") or "", "at": v.get("at") or "",
+            # The head the failure was recorded AGAINST, so the gates below can
+            # tell "still the same code" from "someone pushed, try again".
+            "head": v.get("head") if isinstance(v.get("head"), str) else "",
+            # babysit_merge_guard.py's own exit code for a rebase attempt
+            # ("2" = REFUSED, a judgment call, not a mechanical retry). A
+            # structured field so no reader pattern-matches the free-text
+            # `last` note.
+            "guard_exit": v.get("guard_exit") if isinstance(v.get("guard_exit"), str) else "",
+        }
+    return out
+
+
+# The same 7-char floor `_sha_eq` uses -- below it a prefix match is not
+# evidence, so neither is a prefix MISmatch.
+_SHA_MIN = 7
+
+
+def _looks_like_sha(x):
+    """Is `x` usable as a git object name at all? Hex, at least _SHA_MIN long.
+    Deliberately stricter than "non-empty": the gates re-arm only on positive
+    evidence that a branch moved, and `add-attempt`'s head argument is supplied
+    by prose -- a branch name or truncated sha reaching the store must never
+    read as "the head moved"."""
+    return len(x) >= _SHA_MIN and all(c in "0123456789abcdefABCDEF" for c in x)
+
+
+def _head_advanced(recorded_head, current_head):
+    """Positive-evidence-only "did the branch move past what was recorded?".
+    Both sides must look like usable SHAs AND disagree. Anything else --
+    absent, truncated, a branch name where a sha belongs -- reads as "cannot
+    tell", never as "moved", or every exhaustion loop this guards silently
+    reopens."""
+    return (_looks_like_sha(recorded_head) and _looks_like_sha(current_head)
+            and not _sha_eq(recorded_head, current_head))
+
+
+def _under_fix_attempt_cap(e, fix_attempts):
+    """True while `e` has attempt budget left, OR the capped budget was spent
+    against code no longer on the branch.
+
+    An absent record means "never attempted / cleared by a successful push /
+    reset by a human", so it reads as 0 and passes. HEAD-MOVE RE-ARM: a PR
+    capped by a failure stays excluded until a real push makes that failure
+    stale -- `add-attempt` writes `head` on every recorded attempt, so a retry
+    that fails again at the new head re-caps it on its own, with no one-shot
+    marker needed."""
+    fa = (fix_attempts or {}).get("%s#%s" % (e["repo"], e["number"])) or {}
+    if fa.get("count", 0) < FIX_ATTEMPT_CAP:
+        return True
+    return _head_advanced(fa.get("head") or "", e.get("head_oid") or "")
+
+
+# Mergeability states whose `rebase` reaches the EXPENSIVE path (a worktree
+# merge). BEHIND is deliberately absent: it is served by `gh pr update-branch`,
+# one API call that cannot ship wrong code, and must never be stranded by
+# exhaustion that has nothing to do with merging.
+REBASE_CONFLICT_MSS = ("DIRTY", "CONFLICTING")
+
+
+def rebase_attempts_exhausted(e, fix_attempts):
+    """The fix_attempts record blocking a `rebase` for entry `e`, else None.
+
+    The attempt cap used to gate `fix` only; the rebase planner selected
+    purely on `mss`, so a SEMANTIC conflict (two branches that rewrote the
+    same function to contradictory contracts) was re-planned every sweep
+    forever -- each cycle added a worktree, fetched, merged, re-derived the
+    identical verdict and aborted. Measured on one PR at 78 recorded attempts.
+    The counter was already incremented by rebase failures; only this read was
+    missing. Shares fix_attempts (one bucket; `reset-pr` lifts it wholesale)
+    and is narrowed to REBASE_CONFLICT_MSS so it can never strand a merely
+    BEHIND branch.
+
+    RE-ARM IS HEAD-ONLY; BASE IS EXCLUDED ON PURPOSE. A busy default branch
+    moves between essentially every pair of sweeps, so a base re-arm would
+    lift this gate almost every sweep and reproduce the burn. A semantic
+    conflict is a property of the two sides' intent, not of the base tip. An
+    absent `head` FAILS SAFE to gated -- "cannot prove the head moved" is not
+    "the head moved".
+    """
+    # Mirror the planner's OWN selection, lane included, so a PR in a lane
+    # the sweep never rebases can't be reported "rebase-gated".
+    if e.get("lane") != "owner":
+        return None
+    if e.get("mss") not in REBASE_CONFLICT_MSS:
+        return None
+    fa = (fix_attempts or {}).get("%s#%s" % (e["repo"], e["number"]))
+    if not fa or fa.get("count", 0) < FIX_ATTEMPT_CAP:
+        return None
+    if _head_advanced(fa.get("head") or "", e.get("head_oid") or ""):
+        return None
+    return fa
+
+
+# ============================================================================
 # apply-queue ranking (fed by classify_pr's `cli_findings_open` field)
 # ============================================================================
 # Lanes that can never be merged BY THIS AUTOMATION (a different team holds
@@ -1203,6 +1773,7 @@ def plan_applies(entries, known_fp=None):
 def build_actions(entries, now, quiet):
     actions = []
     known_fp = load_known_fp()
+    fix_attempts = load_fix_attempts()
 
     # HAS_ACTIONABLE -> fix (skill applies mechanical CR fixes verbatim)
     # known_fp EXCLUSION: plan_applies already excludes a whole-PR known_fp
@@ -1215,9 +1786,15 @@ def build_actions(entries, now, quiet):
     # known_fp means "the review's findings were a false positive", not
     # "the branch is current" or "CI is green"; adding it there would strand
     # a legitimately-behind or red-CI PR forever.
+    # ATTEMPT CAP: a PR whose fixes already failed FIX_ATTEMPT_CAP times at
+    # the current head is a human's now -- re-planning it every sweep only
+    # re-derives the same failure. It is surfaced in `attempt_capped[]`, never
+    # silently dropped.
     for e in entries:
         if e["state"] == "HAS_ACTIONABLE":
             if "%s#%s" % (e["repo"], e["number"]) in known_fp:
+                continue
+            if not _under_fix_attempt_cap(e, fix_attempts):
                 continue
             actions.append({
                 "type": "fix", "repo": e["repo"], "pr": e["number"],
@@ -1226,7 +1803,7 @@ def build_actions(entries, now, quiet):
             })
 
     # bumps (Step 3/4) — oldest-first, cap 3
-    bumps = plan_bumps(entries, now)
+    bumps = plan_bumps([e for e in entries if e.get("tier") not in GREEN_TIERS], now)
     for e in bumps:
         actions.append({
             "type": "bump", "repo": e["repo"], "pr": e["number"],
@@ -1238,10 +1815,32 @@ def build_actions(entries, now, quiet):
     # rebase (Step 4.7) — BEHIND/DIRTY in-lane, cap 3, update-branch first
     rebase = [e for e in entries if e["lane"] == "owner"
               and e["state"] != "FETCH_FAIL"
-              and e["mss"] in ("BEHIND", "DIRTY", "CONFLICTING")]
+              and e["mss"] in ("BEHIND", "DIRTY", "CONFLICTING")
+              and not rebase_attempts_exhausted(e, fix_attempts)]
     rebase = rebase[:REBASE_CAP]
     rebase_ids = {(e["repo"], e["number"]) for e in rebase}
     for e in rebase:
+        # A parent CONFIRMED merged gets the RETARGET rung instead: same list,
+        # same cap, same attempt gate -- only the label changes, so the skill
+        # first proves (retarget-plan) that pointing the child at the default
+        # branch is safe before touching any conflict, and a retarget is never
+        # reported as a resolved rebase.
+        # Only while the child still TARGETS something other than a default
+        # branch: once GitHub (or a stack-guard workflow) has already moved
+        # its base, the title marker still names the merged parent, but a
+        # retarget is a no-op and its conflict is an ordinary one -- planning
+        # `retarget` there would loop every sweep without ever reaching the
+        # guarded merge or the attempt cap.
+        if (e.get("parent_state") == "MERGED"
+                and (e.get("base") or "") not in DEFAULT_BRANCHES):
+            actions.append({
+                "type": "retarget", "repo": e["repo"], "pr": e["number"],
+                "why": f"parent PR #{e.get('parent_pr')} merged — retarget to the "
+                       f"default branch if the files do not overlap",
+                "verify_open": True, "mode": "retarget",
+                "parent_pr": e.get("parent_pr"),
+            })
+            continue
         actions.append({
             "type": "rebase", "repo": e["repo"], "pr": e["number"],
             "why": f"{e['mss']} — bring branch current with {e['base'] or 'base'} "
@@ -1381,6 +1980,146 @@ def decide(entries, prev, bumped, fingerprint, now):
 
 
 # ============================================================================
+# stacked-PR parent resolution (feeds the `retarget` rung)
+# ============================================================================
+DEFAULT_BRANCHES = ("main", "master", "develop")
+# "(stacked on #123)" -- the PR-number form only. A ticket id or branch name in
+# the same position simply resolves to None rather than being misread.
+_STACKED_ON_PR_RE = re.compile(r"stacked on\s*#(\d+)", re.I)
+
+
+def parse_stacked_on_pr(title):
+    """PR number named by a '(stacked on #123)'-style title marker, else None.
+    Never raises."""
+    if not title:
+        return None
+    m = _STACKED_ON_PR_RE.search(title)
+    return int(m.group(1)) if m else None
+
+
+def resolve_parent_pr(e, entries_by_branch):
+    """The parent PR NUMBER for entry `e`, else None. Union of two signals,
+    title first because it is the one that SURVIVES GitHub's post-merge base
+    retarget:
+
+      1. title:    a '(stacked on #123)' marker in the PR title (`blurb`).
+      2. base-ref: the base is not a default branch and another entry in this
+                   sweep (same repo) has that branch as its own head.
+
+    Never keys on the base ALONE: once a parent merges and GitHub (or a
+    stack-guard workflow) retargets the child to the default branch, a
+    base-keyed rule finds nothing -- the title marker is what survives."""
+    from_title = parse_stacked_on_pr(e.get("blurb") or "")
+    if from_title is not None:
+        return from_title
+    base = e.get("base") or ""
+    if base and base not in DEFAULT_BRANCHES:
+        return entries_by_branch.get((e.get("repo"), base))
+    return None
+
+
+def resolve_parent_state(gh_bin, owner, repo, parent_pr, entries_by_number):
+    """(state, merged_at) for `parent_pr` in `repo`; (None, None) on any error.
+
+    Tier 1 (free): the parent is itself one of this sweep's open entries ->
+    OPEN, no gh call. Tier 2 (one call): `pr view --json state,mergedAt`. A
+    failed read returns (None, None) -- "cannot prove the parent merged" is
+    not "the parent merged", so the PR keeps the ordinary `rebase` path."""
+    if parent_pr in entries_by_number.get(repo, ()):
+        return "OPEN", None
+    v = gh_json(gh_bin, ["-R", f"{owner}/{repo}", "pr", "view", str(parent_pr),
+                         "--json", "state,mergedAt"])
+    if v is None:
+        return None, None
+    return v.get("state"), v.get("mergedAt")
+
+
+# ============================================================================
+# parent-merged RETARGET rung -- the safety proof
+# ============================================================================
+# The planner only decides ELIGIBILITY: a rebase-eligible entry whose parent
+# PR is confirmed MERGED gets `type: "retarget"` instead of `rebase`. Whether
+# it is actually SAFE to point the child straight at the default branch --
+# the parent's merge is in the base AND the child touches none of the files
+# that merge brought in -- needs a live worktree, so it is a separate,
+# git-only decision exposed as `babysit_classify.py retarget-plan`. Pure
+# functions, no `gh`, no network, no git writes.
+RETARGET_FALLTHROUGH_NOT_ANCESTOR = "parent_not_ancestor"
+RETARGET_FALLTHROUGH_OVERLAP = "file_overlap"
+RETARGET_FALLTHROUGH_CANNOT_DETERMINE = "cannot_determine_file_sets"
+RETARGET_OK = "retarget"
+
+
+def _run_git(repo, *args, timeout=15):
+    """Never raises on a non-zero exit; every caller inspects returncode."""
+    return subprocess.run(["git", "-C", repo, *args],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def is_ancestor(repo, sha, ref):
+    """True iff `sha` is an ancestor of `ref`: does the parent's merge commit
+    actually appear in the base?"""
+    return _run_git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0
+
+
+def three_dot_changed_files(repo, base_ref, head_ref):
+    """Files `head_ref` touched since it diverged from `base_ref` -- THREE-dot,
+    anchored at the merge-base, so a base that moved since the branch was cut
+    still yields the branch's OWN file set. Never two-dot: a tip-to-tip diff
+    reports every file the base changed independently as if the branch had
+    touched it, corrupting the very set the overlap check decides on.
+
+    None, never an empty set, when the diff could not run (`git diff` exits 0
+    on a REAL empty diff and 128 on an unresolvable ref): conflating the two
+    would read a failed diff as "the child touched nothing" and default to
+    retargeting -- the mistake this rung exists to prevent."""
+    r = _run_git(repo, "diff", "--name-only", f"{base_ref}...{head_ref}")
+    if r.returncode != 0:
+        return None
+    return {p for p in r.stdout.splitlines() if p}
+
+
+def files_brought_in_by_commit(repo, sha):
+    """Files `sha` changed relative to its FIRST parent -- identical for a
+    two-parent merge commit (where `git show --name-only` alone shows nothing
+    for a clean merge) and a squash commit. None on failure (e.g. a root
+    commit has no ^1): an empty PARENT set would make every child set look
+    non-overlapping by construction."""
+    r = _run_git(repo, "diff", "--name-only", f"{sha}^1", sha)
+    if r.returncode != 0:
+        return None
+    return {p for p in r.stdout.splitlines() if p}
+
+
+def plan_parent_merged_retarget(repo, default_ref, head_ref, parent_merge_sha):
+    """{"action": "retarget"} when it is safe to `gh pr edit <pr> --base
+    <default>` a child whose parent merged, else {"action": "fallthrough",
+    "reason": ...} -- hand the PR to the ordinary worktree-merge step
+    unchanged. Never resolves a conflict itself.
+
+    1. ANCESTOR -- the parent's merge sha must be in `default_ref`.
+    2. THREE-dot file set of the child against `default_ref`.
+    3. Intersect with the files the parent's merge brought in. ANY overlap ->
+       fall through; retargeting there would silently drop the parent's
+       changes from the child's rendered diff.
+    4. Empty overlap -> safe.
+    """
+    if not is_ancestor(repo, parent_merge_sha, default_ref):
+        return {"action": "fallthrough", "reason": RETARGET_FALLTHROUGH_NOT_ANCESTOR}
+    child_files = three_dot_changed_files(repo, default_ref, head_ref)
+    parent_files = files_brought_in_by_commit(repo, parent_merge_sha)
+    # FAIL SAFE, not fail empty: a git failure on EITHER side must never read
+    # as "nothing to overlap".
+    if child_files is None or parent_files is None:
+        return {"action": "fallthrough", "reason": RETARGET_FALLTHROUGH_CANNOT_DETERMINE}
+    overlap = sorted(child_files & parent_files)
+    if overlap:
+        return {"action": "fallthrough", "reason": RETARGET_FALLTHROUGH_OVERLAP,
+                "overlap_files": overlap}
+    return {"action": RETARGET_OK, "reason": "no_file_overlap"}
+
+
+# ============================================================================
 # discovery filter
 # ============================================================================
 def should_skip(pr):
@@ -1417,6 +2156,7 @@ def sweep(repos_filter, state_path, gh_bin, owner=OWNER_DEFAULT):
             "pending": int((prev or {}).get("pending_count", 0) or 0),
             "fingerprint": (prev or {}).get("pending_fingerprint", "") or "",
             "streak": streak, "error": "search_fetch_fail",
+            "ruled_via_pr_comment": [], "attempt_capped": [],
         }
 
     if repos_filter:
@@ -1454,6 +2194,25 @@ def sweep(repos_filter, state_path, gh_bin, owner=OWNER_DEFAULT):
                 entries.append(f.result())
     entries.sort(key=lambda e: (e["repo"], e["number"]))
 
+    # Resolve each entry's parent PR BEFORE planning -- build_actions reads
+    # parent_state off the entry. Most PRs have neither a non-default base nor
+    # a "stacked on" title, so this costs nothing beyond dict lookups for them.
+    entries_by_branch = {}
+    entries_by_number = {}
+    for e in entries:
+        if e.get("branch"):
+            entries_by_branch[(e["repo"], e["branch"])] = e["number"]
+        entries_by_number.setdefault(e["repo"], set()).add(e["number"])
+    owner_by_repo = {p["_repo"]: p["_owner"] for p in survivors}
+    for e in entries:
+        parent_pr = resolve_parent_pr(e, entries_by_branch)
+        e["parent_pr"] = parent_pr
+        e["parent_state"] = None
+        if parent_pr is not None:
+            e["parent_state"], _merged_at = resolve_parent_state(
+                gh_bin, owner_by_repo.get(e["repo"], owner), e["repo"],
+                parent_pr, entries_by_number)
+
     quiet = is_owner_quiet(now)
     actions, bumped = build_actions(entries, now, quiet)
     greens = build_greens(entries)
@@ -1465,12 +2224,45 @@ def sweep(repos_filter, state_path, gh_bin, owner=OWNER_DEFAULT):
     prev = load_state(state_path)
     decision, streak, pending_count = decide(entries, prev, bumped, fingerprint, now)
 
+    # TELEMETRY DEDUP for `ruled_via_pr_comment`. It is recomputed from the
+    # FULL comment history every sweep, so every historical ruling was
+    # re-reported forever on the "Ruled this sweep" line. The classifier's
+    # OWN state file remembers what it already announced, keyed
+    # `repo#pr:finding-key`. PURELY a render-time filter: nothing upstream
+    # (the harvest, the effective waived set, the floor) reads it, so the
+    # suppression/green effect stays permanent and re-derived from GitHub.
+    _prev_reported = set((prev or {}).get("reported_rulings") or [])
+    _all_ruling_keys = {
+        "%s#%s:%s" % (e["repo"], e["number"], fk)
+        for e in entries for fk in (e.get("ruled_via_pr_comment") or [])
+    }
+
     write_state(state_path, {
         "pending_fingerprint": fingerprint,
         "no_progress_streak": streak,
         "pending_count": pending_count,
         "last_iter_at": iso(now),
+        "reported_rulings": sorted(_prev_reported | _all_ruling_keys),
     })
+
+    # PRs the attempt cap took out of `fix`/`rebase` this sweep. Without this
+    # list they would simply vanish from the plan -- excluded by the planner
+    # and named nowhere -- which reads exactly like "nothing to do".
+    fix_attempts = load_fix_attempts()
+    attempt_capped = []
+    for e in entries:
+        fa = (fix_attempts.get("%s#%s" % (e["repo"], e["number"])) or {})
+        if e["state"] == "HAS_ACTIONABLE" and not _under_fix_attempt_cap(e, fix_attempts):
+            path = "fix"
+        elif rebase_attempts_exhausted(e, fix_attempts):
+            path = "rebase"
+        else:
+            continue
+        attempt_capped.append({
+            "repo": e["repo"], "pr": e["number"], "lane": e["lane"],
+            "blurb": e["blurb"], "path": path, "attempts": fa.get("count", 0),
+            "last": fa.get("last", ""), "guard_exit": fa.get("guard_exit", ""),
+        })
 
     return {
         "prs": entries,
@@ -1482,12 +2274,24 @@ def sweep(repos_filter, state_path, gh_bin, owner=OWNER_DEFAULT):
         # as distinct from what is still genuinely AWAITING a human. Present
         # regardless of whether the local waived_findings store also has the
         # entry, so human-queue depth reflects only real, unresolved debt.
+        # Filtered to findings NOT already announced by a previous sweep: a
+        # PR whose every ruled finding was reported before is dropped rather
+        # than rendered with an empty `findings` list.
         "ruled_via_pr_comment": sorted(
-            [{"repo": e["repo"], "pr": e["number"], "lane": e["lane"],
-              "blurb": e["blurb"], "findings": e["ruled_via_pr_comment"]}
-             for e in entries if e.get("ruled_via_pr_comment")],
+            (row for row in (
+                {"repo": e["repo"], "pr": e["number"], "lane": e["lane"],
+                 "blurb": e["blurb"],
+                 "findings": [
+                     fk for fk in e["ruled_via_pr_comment"]
+                     if ("%s#%s:%s" % (e["repo"], e["number"], fk))
+                     not in _prev_reported
+                 ]}
+                for e in entries if e.get("ruled_via_pr_comment")
+            ) if row["findings"]),
             key=lambda d: (d["repo"], d["pr"]),
         ),
+        # NEEDS_HUMAN rows the attempt cap produced (see above).
+        "attempt_capped": attempt_capped,
         "quiet": quiet,
         "decision": decision,
         "pending": pending_count,
@@ -1524,8 +2328,21 @@ def main(argv=None):
     # not a cheaper way to clear a critical than setting the variable the
     # hook already demands. `by` stays argv because it is a label, not a
     # claim.
+    tp = sub.add_parser(
+        "retarget-plan",
+        help="prove it is safe to retarget a parent-merged stacked PR (read-only git)")
+    tp.add_argument("--worktree", required=True, help="a checkout of the child PR")
+    tp.add_argument("--default-ref", required=True, help="e.g. origin/main")
+    tp.add_argument("--head-ref", default="HEAD", help="the child's head (default HEAD)")
+    tp.add_argument("--parent-merge-sha", required=True,
+                    help="gh pr view <parent> --json mergeCommit -q .mergeCommit.oid")
     args = ap.parse_args(argv)
 
+    if args.cmd == "retarget-plan":
+        sys.stdout.write(json.dumps(plan_parent_merged_retarget(
+            args.worktree, args.default_ref, args.head_ref,
+            args.parent_merge_sha)) + "\n")
+        return 0
     if args.cmd == "sweep":
         out = sweep(args.repos, args.state, args.gh_bin, args.owner)
         sys.stdout.write(json.dumps(out))
