@@ -100,7 +100,7 @@ def fetch_jobs(repo, run, attempt):
 def fetch_pr_labels(repo, pr):
     try:
         return json.loads(_gh("pr", "view", str(pr), "-R", repo, "--json", "labels", "-q", "[.labels[].name]"))
-    except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
         return None
 
 
@@ -117,7 +117,10 @@ def main(argv=None):
         if attempt is None:
             attempt = int(_gh("api", f"repos/{a.repo}/actions/runs/{a.run}", "--jq", ".run_attempt").strip())
         jobs = fetch_jobs(a.repo, a.run, attempt)
-    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+    # OSError: `gh` missing or not executable raises FileNotFoundError /
+    # PermissionError from subprocess, not a RuntimeError -- it is a read
+    # error like any other and must still print the fail-safe JSON.
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
         mode, reason = "failed", f"jobs unreadable, keeping --failed: {e}"
     else:
         mode, reason, hosted = decide(jobs, fetch_pr_labels(a.repo, a.pr))

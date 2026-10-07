@@ -13,6 +13,7 @@ and launchd/babysit-hourly-gate.sh.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -77,6 +78,7 @@ FIRE = "fire: /babysit-prs no-loop"
 class TmpDirCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="babysit-digest-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         self.ledger = os.path.join(self.tmp, "automation-ledger.jsonl")
         self.log = os.path.join(self.tmp, "headless-babysit.log")
         self.lastdigest_dir = os.path.join(self.tmp, "lastdigest")
@@ -161,6 +163,18 @@ class CadenceHoleTests(TmpDirCase):
     def test_non_numeric_override_falls_back_to_default(self):
         os.environ["BABYSIT_CADENCE_HOLE_MIN"] = "two hours"
         self.assertEqual(bd._cadence_hole_min(), 120.0)
+
+    def test_non_finite_or_non_positive_override_falls_back_to_default(self):
+        """float() accepts nan/inf/negatives; nan compares False against every
+        gap and silently disables hole detection."""
+        for raw in ("nan", "inf", "-inf", "-5", "0", "abc"):
+            with self.subTest(raw=raw):
+                os.environ["BABYSIT_CADENCE_HOLE_MIN"] = raw
+                self.assertEqual(bd._cadence_hole_min(), 120.0)
+        os.environ["BABYSIT_CADENCE_HOLE_MIN"] = "nan"
+        w(self.ledger, "\n".join([sweep_row(220), sweep_row(30)]) + "\n")
+        self.assertEqual(len(self._fold(since_dt=ago(250))["gap"]["cadence_holes"]), 1,
+                         "nan must not disable cadence-hole detection")
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +574,29 @@ class QueueTests(TmpDirCase):
         self.assertEqual((q["pending_first"], q["pending_last"], q["pending_delta"]), (12, 7, -5))
         self.assertEqual((q["bumps"], q["fixes"]), (4, 3))
         self.assertEqual((q["decision"], q["decision_streak"]), ("PROGRESSING", 3))
+
+    def test_malformed_bump_and_fix_counts_are_skipped_not_fatal(self):
+        """A hand-edited or foreign ledger row can carry a non-numeric count;
+        it must be skipped, not crash the whole digest."""
+        w(self.ledger, "\n".join([
+            sweep_row(50, bumps=2, fixes=1),
+            ledger_line(skill="babysit", event="sweep", pending=9, bumps="x",
+                        fixes={"a": 1}, ts=iso(ago(40))),
+            ledger_line(skill="babysit", event="sweep", pending=9, bumps="1.5",
+                        fixes=True, ts=iso(ago(30))),
+            ledger_line(skill="babysit", event="sweep", pending=9, bumps=[1],
+                        fixes=float("nan"), ts=iso(ago(20))),
+            sweep_row(5, bumps=1, fixes=1),
+        ]) + "\n")
+        q = self._fold(since_dt=ago(60))["queue"]
+        self.assertEqual((q["sweeps"], q["bumps"], q["fixes"]), (5, 3, 2))
+        env = dict(os.environ, BABYSIT_NOW=iso(NOW), BABYSIT_LEDGER=self.ledger,
+                   BABYSIT_LOG=self.log, BABYSIT_LASTDIGEST_DIR=self.lastdigest_dir)
+        p = subprocess.run([sys.executable, DIGEST_SCRIPT, "--session-id", "malformed-counts",
+                            "--since", iso(ago(60))],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["queue"]["bumps"], 3)
 
     def test_non_numeric_pending_leaves_delta_none(self):
         w(self.ledger, "\n".join([

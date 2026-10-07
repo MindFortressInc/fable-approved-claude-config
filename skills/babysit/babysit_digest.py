@@ -32,6 +32,7 @@ Env overrides (unset in production), mirroring babysit_classify.py:
 import argparse
 import bisect
 import json
+import math
 import os
 import re
 import sys
@@ -54,11 +55,14 @@ def _cadence_hole_min():
     healthy sweep; a gap of more than two hourly cycles (120 min) between
     consecutive `sweep` rows is the earliest point a missed sweep is
     distinguishable from jitter. Override with BABYSIT_CADENCE_HOLE_MIN when
-    running a different cadence; a non-numeric value falls back to 120."""
+    running a different cadence; anything but a finite positive number falls
+    back to 120 (float() happily parses "nan", and a nan threshold compares
+    False against every gap, silently disabling hole detection)."""
     try:
-        return float(os.environ.get("BABYSIT_CADENCE_HOLE_MIN", "120"))
+        v = float(os.environ.get("BABYSIT_CADENCE_HOLE_MIN", "120"))
     except ValueError:
         return 120.0
+    return v if math.isfinite(v) and v > 0 else 120.0
 
 
 # How long since this session's last render (resolve_since below) before the
@@ -360,6 +364,15 @@ def build_shipped(ledger_rows_in_window):
     }
 
 
+def _count(v):
+    """A ledger count as an int, or 0 when it isn't a real finite number. Rows
+    are hand-editable and written by several tools; one malformed value ("x",
+    {"a": 1}, "1.5", true) must be skipped, not crash the whole digest."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    return int(v) if math.isfinite(v) else 0
+
+
 def build_queue(ledger_rows_in_window):
     """Pending trajectory (first sweep's `pending` -> last sweep's), decision
     streak (how many trailing sweeps in-window share the latest `decision`),
@@ -385,8 +398,8 @@ def build_queue(ledger_rows_in_window):
         "sweeps": len(sweeps),
         "pending_first": pending_first, "pending_last": pending_last,
         "pending_delta": delta,
-        "bumps": sum(int(s.get("bumps") or 0) for s in sweeps),
-        "fixes": sum(int(s.get("fixes") or 0) for s in sweeps),
+        "bumps": sum(_count(s.get("bumps")) for s in sweeps),
+        "fixes": sum(_count(s.get("fixes")) for s in sweeps),
         "decision": last_decision, "decision_streak": streak,
     }
 

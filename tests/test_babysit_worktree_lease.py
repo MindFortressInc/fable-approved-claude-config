@@ -24,14 +24,17 @@ test_dead_holder_is_reaped_and_pr_becomes_selectable
     (holder confirmed dead) without waiting out the TTL, and the PR must
     become selectable again in the SAME call that discovers it.
 """
+import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TESTS_DIR)
@@ -39,10 +42,12 @@ SKILL_DIR = os.path.join(REPO_ROOT, "skills", "babysit")
 LEASE_PY = os.path.join(SKILL_DIR, "worktree_lease.py")
 
 sys.path.insert(0, SKILL_DIR)
+import worktree_lease  # noqa: E402
 from worktree_lease import (  # noqa: E402
     WorktreeLease,
     is_leased,
     filter_leased,
+    reap_stale,
 )
 
 
@@ -207,6 +212,149 @@ class WorktreeLeaseInterleavingTests(unittest.TestCase):
             self.assertTrue(leased)
         finally:
             lease.release()
+
+
+class StaleReapRaceTests(unittest.TestCase):
+    """Two reapers can read the SAME stale record. The first unlinks it and
+    takes a fresh lease; the second, still acting on its stale read, used to
+    unlink by path -- deleting the first's LIVE lease -- and take its own, so
+    both returned True. The interleaving is made deterministic by having
+    `_read` hand the second reaper the stale record while the file on disk
+    already holds the winner's fresh one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="babysit-lease-race-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.key = "acme-api-7070"
+        self.path = os.path.join(self.tmp, "babysit-worktree-lease.%s.json" % self.key)
+        # Ancient started/heartbeat on another host: stale by TTL and max-age.
+        self.stale = {"owner": "dead-worker", "host": "elsewhere", "pid": 1,
+                      "key": self.key, "started": 1.0, "heartbeat": 1.0}
+        # No daemon is wanted here: a winning acquire would otherwise spawn one.
+        patcher = mock.patch.object(worktree_lease, "_spawn_heartbeat_daemon",
+                                    return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_live(self, owner="winner"):
+        now = time.time()
+        rec = {"owner": owner, "host": socket.gethostname(), "pid": os.getpid(),
+               "key": self.key, "started": now, "heartbeat": now}
+        with open(self.path, "w") as f:
+            json.dump(rec, f)
+        return rec
+
+    def _stale_first_read(self):
+        """Return the stale record on the first _read, the real file after."""
+        real = worktree_lease._read
+        calls = []
+
+        def fake(path):
+            calls.append(path)
+            return dict(self.stale) if len(calls) == 1 else real(path)
+        return mock.patch.object(worktree_lease, "_read", side_effect=fake)
+
+    def _owner_on_disk(self):
+        with open(self.path) as f:
+            return json.load(f)["owner"]
+
+    def test_second_reaper_acting_on_a_stale_read_cannot_delete_a_fresh_lease(self):
+        self._write_live("winner")
+        loser = WorktreeLease(self.key, lease_dir=self.tmp, owner="loser", ttl=300)
+        with self._stale_first_read():
+            won = loser.acquire()
+        self.assertFalse(won, "both reapers won: the stale read deleted a live lease")
+        self.assertEqual(self._owner_on_disk(), "winner")
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".")], [],
+                         "the reap must leave no private tmp file behind")
+
+    def test_is_leased_on_a_stale_read_does_not_delete_a_fresh_lease(self):
+        self._write_live("winner")
+        with self._stale_first_read():
+            leased, record = is_leased(self.key, lease_dir=self.tmp, ttl=300)
+        self.assertTrue(leased, "a fresh lease was reported free on a stale read")
+        self.assertEqual(record["owner"], "winner")
+        self.assertEqual(self._owner_on_disk(), "winner")
+
+    def test_reap_stale_on_a_stale_read_does_not_delete_a_fresh_lease(self):
+        self._write_live("winner")
+        with self._stale_first_read():
+            reaped = reap_stale(lease_dir=self.tmp, ttl=300)
+        self.assertEqual(reaped, [])
+        self.assertEqual(self._owner_on_disk(), "winner")
+
+    def test_a_genuinely_stale_lease_is_still_reaped_and_taken(self):
+        with open(self.path, "w") as f:
+            json.dump(self.stale, f)
+        taker = WorktreeLease(self.key, lease_dir=self.tmp, owner="taker", ttl=300)
+        self.assertTrue(taker.acquire())
+        self.assertEqual(self._owner_on_disk(), "taker")
+
+
+class HeartbeatDaemonReleaseTests(unittest.TestCase):
+    """A CLI `release` that lands between the heartbeat daemon's _read and its
+    _write_atomic used to be undone: os.replace recreated the file and the
+    lease was held until MAX_AGE. `release` must stop the daemon (verified by
+    its command line) BEFORE unlinking."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="babysit-lease-daemon-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.watch = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(self._stop, self.watch)
+
+    @staticmethod
+    def _stop(proc):
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+    def _cli(self, *argv, env=None):
+        return subprocess.run([sys.executable, LEASE_PY] + list(argv),
+                              capture_output=True, text=True, env=env, timeout=30)
+
+    def test_cli_release_stops_the_daemon_and_the_lease_stays_gone(self):
+        key = "acme-api-8080"
+        path = os.path.join(self.tmp, "babysit-worktree-lease.%s.json" % key)
+        env = dict(os.environ, BABYSIT_LEASE_HEARTBEAT_INTERVAL="1")
+        p = self._cli("acquire", key, "--lease-dir", self.tmp, "--owner", "w8080",
+                      "--watch-pid", str(self.watch.pid), env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        daemon = int(p.stdout.split("daemon_pid=")[1].split()[0])
+        self.addCleanup(_kill_if_heartbeat_daemon, daemon, key)
+        time.sleep(1.5)  # at least one heartbeat write has landed
+
+        p = self._cli("release", key, "--lease-dir", self.tmp, "--owner", "w8080")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(worktree_lease._pid_alive(daemon),
+                         "heartbeat daemon still running after release")
+        time.sleep(1.5)  # > one heartbeat interval
+        self.assertFalse(os.path.exists(path), "lease resurrected after release")
+
+    def test_release_never_signals_a_pid_that_is_not_a_heartbeat_daemon(self):
+        key = "acme-api-8081"
+        path = os.path.join(self.tmp, "babysit-worktree-lease.%s.json" % key)
+        bystander = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(self._stop, bystander)
+        now = time.time()
+        with open(path, "w") as f:
+            json.dump({"owner": "w8081", "host": socket.gethostname(),
+                       "pid": self.watch.pid, "key": key, "started": now,
+                       "heartbeat": now, "daemon_pid": bystander.pid}, f)
+        p = self._cli("release", key, "--lease-dir", self.tmp, "--force")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(path))
+        self.assertIsNone(bystander.poll(), "release killed a non-daemon pid")
+
+
+def _kill_if_heartbeat_daemon(pid, key):
+    """Test cleanup: stop a daemon this test spawned, only if it still is one."""
+    argv = worktree_lease._ps(pid, "command").split()
+    if "_heartbeat-daemon" in argv and key in argv:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
 
 
 class CliReleaseOwnerDerivationTests(unittest.TestCase):

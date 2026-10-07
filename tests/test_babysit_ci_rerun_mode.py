@@ -201,6 +201,25 @@ class CliTests(unittest.TestCase):
     def test_unreadable_labels_fall_back_to_failed(self):
         self.assertEqual(self.run_cli({"attempt": 1, "jobs": HOSTED_RED_RUN, "labels": None})["mode"], "failed")
 
+    def test_missing_gh_binary_falls_back_to_failed_json(self):
+        """No `gh` on PATH raises FileNotFoundError (an OSError), not a
+        RuntimeError: it must still resolve to the fail-safe `--failed` JSON,
+        never a traceback with no JSON."""
+        with tempfile.TemporaryDirectory() as empty:
+            env = dict(os.environ, PATH=empty)
+            p = subprocess.run([sys.executable, SCRIPT, "--repo", REPO,
+                                "--run", RUN, "--pr", "42"],
+                               capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertEqual(out["mode"], "failed")
+        self.assertTrue(out["cmd"].endswith(" --failed"), out)
+        self.assertIn("unreadable", out["reason"])
+
+    def test_unexecutable_gh_for_labels_reads_as_unreadable(self):
+        with mock.patch.object(ci_rerun_mode, "_gh", side_effect=PermissionError("gh")):
+            self.assertIsNone(ci_rerun_mode.fetch_pr_labels(REPO, 42))
+
     def test_explicit_attempt_is_honoured(self):
         self.assertEqual(self.run_cli({"attempt": 6, "jobs": HOSTED_RED_RUN, "labels": []}, "--attempt", "1")["attempt"], 1)
 

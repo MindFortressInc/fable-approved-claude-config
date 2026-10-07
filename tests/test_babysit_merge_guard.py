@@ -13,6 +13,7 @@ the rest of the babysit suite.
 """
 import ast
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,8 +37,13 @@ from babysit_merge_guard import (  # noqa: E402
 )
 
 
+# Fixture git never reads the runner's global/system config: a developer's
+# hooksPath, commit.gpgsign, init.defaultBranch or merge.conflictStyle would
+# otherwise leak into every repo built here. user.name/email are set per repo.
 def git(repo, *args):
-    p = subprocess.run(["git"] + list(args), cwd=repo, capture_output=True, text=True)
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    p = subprocess.run(["git"] + list(args), cwd=repo, capture_output=True, text=True,
+                       env=env)
     return p
 
 
@@ -61,10 +67,6 @@ class ConflictRepo:
         # diff3 shape gets its own explicit fixture below rather than arriving
         # by accident on one developer's machine.
         git(self.repo, "config", "merge.conflictStyle", conflict_style)
-        # hooks/branch-name-gate.sh (if installed) requires a ticket token in
-        # new branch names; it must not apply to a throwaway fixture whose
-        # branches are never pushed. LINEAR_SKIP=1 is its documented bypass.
-        os.environ.setdefault("LINEAR_SKIP", "1")
         self._write(base)
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-qm", "base")
@@ -91,6 +93,7 @@ class ConflictRepo:
 class PreconditionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mergeguard-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
 
     # -- the case the rule EXISTS for; the fix must not disarm it -----------
     def test_add_add_router_includes_still_union_strips_and_merges(self):
@@ -291,6 +294,7 @@ class MarkerAndPathTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mergeguard-mp-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def test_a_markdown_underline_is_not_treated_as_a_conflict_marker(self):
         """`=======` is git's separator AND an rst/markdown section underline
@@ -474,6 +478,7 @@ class RegionScopedPreconditionTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mergeguard-region-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
 
     # -- fixture 1: the measured clean-replace shape ------------------------
     def test_a_replace_in_a_cleanly_merged_region_no_longer_refuses_the_add_add(self):
@@ -832,7 +837,7 @@ class GeneratedFileTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mergeguard-gen-")
-        os.environ.setdefault("LINEAR_SKIP", "1")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         os.environ.pop("GEN_FAIL", None)
         patcher = mock.patch.dict(g.GENERATED_FILES,
                                   {DOC: ["{python}", GEN_SCRIPT]})

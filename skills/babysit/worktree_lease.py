@@ -91,6 +91,7 @@ CLI (for bash callers, e.g. a detached CR-CLI launcher script):
 import argparse
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -174,6 +175,87 @@ def is_stale(record, ttl=None, now=None, max_age=None):
     return (now - hb) >= ttl
 
 
+def _same_lease(a, b):
+    return bool(a and b) and (a.get("owner"), a.get("started")) == (b.get("owner"), b.get("started"))
+
+
+def _reap_stale_record(path, seen, ttl=None, max_age=None):
+    """Remove the lease at `path` only if it is STILL the stale record `seen`.
+    Returns "reaped" (we discarded it), "gone" (nothing was there), or "live"
+    (what was there is someone's live lease, left in place).
+
+    Never unlink by path on a stale read. Two reapers can read the same stale
+    record; the first unlinks it and creates its own fresh lease, and the
+    second -- still acting on its stale read -- unlinked the first's LIVE lease
+    and created its own, so both "held" it. Instead the file is renamed to a
+    private name in the same dir (atomic: exactly one racer moves any given
+    file), the moved file is re-read, and it is discarded only if it is
+    unreadable or still the same record (owner + started) and still stale.
+    Anything else is someone's live lease: it is linked back (link() is
+    exclusive, so it never clobbers) and reported "live".
+
+    Residual window: between the rename and the link-back the path is absent.
+    A reader there sees "not leased", and a THIRD party that create-exclusives
+    a lease in exactly that window displaces the moved live lease -- the
+    link-back then finds the path taken and leaves the newcomer in place
+    rather than clobbering it, so two workers can believe they hold the key.
+    That needs a stale read, a fresh acquire, and a second acquire on one key
+    within microseconds. Closing it fully needs a lock that every acquirer
+    takes; the heartbeat daemon tolerates the window itself (see
+    _heartbeat_daemon_loop)."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".lease-reap-")
+    os.close(fd)
+    try:
+        try:
+            os.rename(path, tmp)
+        except FileNotFoundError:
+            return "gone"
+        moved = _read(tmp)
+        if moved is None or (_same_lease(moved, seen) and is_stale(moved, ttl, max_age=max_age)):
+            return "reaped"
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            # Either the live owner's daemon re-wrote it (os.replace) during
+            # the window -- the same lease, nothing lost -- or a third party
+            # took the path (the residual window above). Never clobber either.
+            pass
+        return "live"
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _stop_heartbeat_daemon(pid, key, wait=2.0):
+    """SIGTERM the heartbeat daemon `pid` and wait (<= `wait` s) for it to
+    exit, so a release can unlink the lease only after the daemon is gone.
+    Otherwise a release landing between the daemon's _read and _write_atomic
+    is undone: os.replace recreates the file and the lease is held until
+    MAX_AGE. Signals only a pid whose command line is this module's
+    `_heartbeat-daemon` for `key` -- never a reused or unrelated pid."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return
+    argv = _ps(pid, "command").split()
+    if "_heartbeat-daemon" not in argv or key not in argv:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = _now() + wait
+    while _now() < deadline:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                return  # our own child, now reaped
+        except ChildProcessError:
+            if not _pid_alive(pid):
+                return
+        time.sleep(0.05)
+
+
 # Process names that mark a coding-agent process: comma-separated
 # BABYSIT_LEASE_AGENT_NAMES, default "claude" (Claude Code). Add the name of
 # any other agent CLI you run babysit workers under. A node/bun process counts
@@ -241,9 +323,19 @@ def _heartbeat_daemon_loop(key, owner, lease_dir, ttl, heartbeat_interval, watch
     path = _lease_path(key, lease_dir)
     while _pid_alive(watch_pid):
         record = _read(path)
+        if not record:
+            # A reaper acting on a stale read moves a LIVE lease aside for an
+            # instant before linking it back (_reap_stale_record). One re-read
+            # tells that window apart from a real release/reap; stopping on
+            # it would strand a live holder's heartbeat.
+            time.sleep(0.1)
+            record = _read(path)
         if not record or record.get("owner") != owner:
             return  # released, stolen, or reaped out from under us -- stop
         record["heartbeat"] = _now()
+        # Recorded so a separate `release` process can stop THIS daemon
+        # before it unlinks (see _stop_heartbeat_daemon).
+        record["daemon_pid"] = os.getpid()
         _write_atomic(path, record)
         time.sleep(heartbeat_interval)
     # watch_pid confirmed dead: stop WITHOUT writing again. A stray write
@@ -332,10 +424,11 @@ class WorktreeLease:
         # stale (dead holder, expired TTL, or unreadable) -- reap and retry
         # the exclusive create ONCE. If a concurrent acquirer wins that
         # retry, we correctly lose too rather than both claiming success.
-        try:
-            os.unlink(self.path)
-        except FileNotFoundError:
-            pass
+        # The reap re-verifies what it removes: `existing` may already be
+        # out of date, and the file may by now be another reaper's fresh
+        # lease (see _reap_stale_record).
+        if _reap_stale_record(self.path, existing, self.ttl, self.max_age) == "live":
+            return False
         if self._create_exclusive(record):
             return self._finish_acquire(watch_pid)
         return False
@@ -379,6 +472,13 @@ class WorktreeLease:
             self.key, self.owner, self.lease_dir, self.ttl,
             self.heartbeat_interval, watch_pid,
         )
+        # Stamp the daemon pid now rather than waiting for its first
+        # heartbeat, so a `release` that lands before that write can still
+        # stop it first.
+        record = _read(self.path)
+        if self._daemon_pid and record and record.get("owner") == self.owner:
+            record["daemon_pid"] = self._daemon_pid
+            _write_atomic(self.path, record)
         return True
 
     def refresh(self):
@@ -393,14 +493,17 @@ class WorktreeLease:
         return True
 
     def release(self):
-        if self._daemon_pid:
-            try:
-                os.kill(self._daemon_pid, 15)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            self._daemon_pid = None
         record = _read(self.path)
-        if record and record.get("owner") == self.owner:
+        mine = bool(record) and record.get("owner") == self.owner
+        # Stop the heartbeat daemon(s) BEFORE unlinking, or one mid-write
+        # resurrects the lease (see _stop_heartbeat_daemon).
+        pids = {self._daemon_pid}
+        if mine and record.get("host") == socket.gethostname():
+            pids.add(record.get("daemon_pid"))
+        for pid in pids - {None}:
+            _stop_heartbeat_daemon(pid, self.key)
+        self._daemon_pid = None
+        if mine:
             try:
                 os.unlink(self.path)
             except FileNotFoundError:
@@ -426,11 +529,10 @@ def is_leased(key, lease_dir=None, ttl=None, max_age=None):
     if not record:
         return False, None
     if is_stale(record, ttl, max_age=max_age):
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        return False, None
+        if _reap_stale_record(path, record, ttl, max_age) != "live":
+            return False, None
+        record = _read(path)  # the stale read was out of date: report the live one
+        return (True, record) if record else (False, None)
     return True, record
 
 
@@ -484,11 +586,8 @@ def reap_stale(lease_dir=None, ttl=None, max_age=None):
     for record in list_leases(lease_dir, ttl, max_age):
         if record.get("_stale") and record.get("key"):
             path = _lease_path(record["key"], lease_dir)
-            try:
-                os.unlink(path)
+            if _reap_stale_record(path, record, ttl, max_age) == "reaped":
                 reaped.append(record)
-            except FileNotFoundError:
-                pass
     return reaped
 
 
@@ -596,10 +695,14 @@ def main(argv=None):
                 print("NOT-OWNER key=%s owner=%s (left intact)"
                       % (args.key, record.get("owner")))
                 return 3
-        # No daemon pid to signal here (a CLI `release` call is a separate,
-        # short-lived process from whatever called `acquire`) -- deleting the
-        # record is enough: the daemon checks record.owner before every write
-        # and self-terminates on the next check once it finds this gone.
+        # A CLI `release` is a separate, short-lived process from whatever
+        # called `acquire`, so the daemon pid comes from the record (every
+        # heartbeat writes it). Unlinking alone is not enough: a release that
+        # lands between the daemon's _read and _write_atomic is undone by
+        # os.replace, and the lease is held until MAX_AGE. Stop the daemon
+        # first (verified by command line, never a bare pid), then unlink.
+        if record.get("host") == socket.gethostname():
+            _stop_heartbeat_daemon(record.get("daemon_pid"), args.key)
         try:
             os.unlink(path)
         except FileNotFoundError:
