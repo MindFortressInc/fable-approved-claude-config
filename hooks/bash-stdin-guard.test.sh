@@ -27,6 +27,8 @@ check "backslash heredoc <<\\EOF" "$(j Bash '{"command":"cat <<\\EOF\nhi\nEOF"}'
 check "plain command untouched"   "$(j Bash '{"command":"ls -la /tmp"}')"                             EMPTY
 check "herestring <<< untouched"  "$(j Bash '{"command":"jq . <<< \"{}\""}')"                         EMPTY
 check "bit shift not a heredoc"   "$(j Bash '{"command":"echo $((1 << 3))"}')"                        EMPTY
+# The CLI's xSt() also returns false here, so the CLI appends `< /dev/null` itself.
+check "bit shift + heredoc: CLI guards" "$(j Bash '{"command":"echo $((1 << 3))\ncat <<EOF\nhi\nEOF"}')" EMPTY
 check "already guarded is no-op"  "$(j Bash '{"command":"exec < /dev/null\ncat <<EOF\nhi\nEOF"}')"    EMPTY
 check "non-Bash tool ignored"     "$(j Read '{"command":"cat <<EOF\nhi\nEOF"}')"                      EMPTY
 
