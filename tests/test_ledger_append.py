@@ -27,10 +27,18 @@ class LedgerAppendHookTest(unittest.TestCase):
     def tearDown(self):
         self.sbx.close()
 
-    def _run(self, *args):
+    def _run(self, *args, **kw):
+        # env() starts from os.environ, so the two vars the hook stamps from are
+        # cleared unless a test sets them -- otherwise a developer (or a live
+        # sweep shell) with BABYSIT_LAUNCH_ID exported would silently add a key
+        # to every row these tests assert on.
+        env = self.sbx.env()
+        env.pop("BABYSIT_LAUNCH_ID", None)
+        env.pop("LEDGER_SKILL", None)
+        env.update(kw.get("extra_env") or {})
         return subprocess.run(
             ["bash", LEDGER_HOOK, *args],
-            capture_output=True, text=True, env=self.sbx.env(),
+            capture_output=True, text=True, env=env,
         )
 
     def _lines(self):
@@ -83,6 +91,64 @@ class LedgerAppendHookTest(unittest.TestCase):
         before = self._lines()
         self.assertNotEqual(self._run("not json").returncode, 0)
         self.assertEqual(self._lines(), before, "a rejected append must not alter the file")
+
+    # -- joinable by id: launch_id ------------------------------------------
+    # A ledger row and the log of the unattended run that wrote it cover the
+    # same period with no shared key unless both stamp $BABYSIT_LAUNCH_ID.
+
+    def test_launch_id_stamped_from_env_when_absent(self):
+        p = self._run('{"skill":"babysit","event":"sweep"}',
+                      extra_env={"BABYSIT_LAUNCH_ID": "watch-4242-1756600000"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = json.loads(self._lines()[0])
+        self.assertEqual(rec["launch_id"], "watch-4242-1756600000")
+
+    def test_launch_id_is_sanitised_to_the_shared_class(self):
+        p = self._run('{"a":1}', extra_env={"BABYSIT_LAUNCH_ID": "w/1 2;x"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(self._lines()[0])["launch_id"], "w12x")
+
+    def test_explicit_launch_id_in_payload_wins_over_env(self):
+        """Same precedence as `ts`: the hook fills a gap, it never overwrites what
+        the caller stated."""
+        p = self._run('{"a":1,"launch_id":"explicit"}',
+                      extra_env={"BABYSIT_LAUNCH_ID": "from-env"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(self._lines()[0])["launch_id"], "explicit")
+
+    def test_no_launch_id_env_leaves_the_key_off_entirely(self):
+        """A hand-run invocation has no launcher. The row must not gain a
+        `launch_id: null`."""
+        self.assertEqual(self._run('{"a":1}').returncode, 0)
+        self.assertNotIn("launch_id", json.loads(self._lines()[0]))
+
+    # -- every row says which arm wrote it: skill ---------------------------
+
+    def test_skill_stamped_from_env_when_absent(self):
+        """A worker result appended verbatim has no `skill` field; stamping at
+        the single choke point fixes every call site at once."""
+        p = self._run('{"status":"shipped","ticket":"ENG-1"}',
+                      extra_env={"LEDGER_SKILL": "bulldozer"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(self._lines()[0])["skill"], "bulldozer")
+
+    def test_explicit_skill_in_payload_wins_over_env(self):
+        p = self._run('{"skill":"prlaunch","event":"unit"}',
+                      extra_env={"LEDGER_SKILL": "bulldozer"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(self._lines()[0])["skill"], "prlaunch")
+
+    def test_no_skill_env_leaves_the_key_off_entirely(self):
+        self.assertEqual(self._run('{"a":1}').returncode, 0)
+        self.assertNotIn("skill", json.loads(self._lines()[0]))
+
+    def test_stamping_does_not_weaken_the_fail_loud_contract(self):
+        """The stamps are additive; a bad payload must still be rejected outright
+        rather than "fixed up" into a row."""
+        p = self._run("not json", extra_env={"LEDGER_SKILL": "bulldozer",
+                                             "BABYSIT_LAUNCH_ID": "watch-1"})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse(os.path.exists(self.ledger))
 
 
 if __name__ == "__main__":
