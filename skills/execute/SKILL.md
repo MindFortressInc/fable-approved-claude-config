@@ -90,6 +90,7 @@ Build ON what exists. The phase-2 discovery already found the relevant substrate
 
 ### 7. Build
 - Create the **isolated worktree + feature branch** (`superpowers:using-git-worktrees`); branch name `me/dev-NNNN-slug` so the `linear-startwork` hook flips the ticket to In Progress.
+- **Run `~/.claude/hooks/collision-check.sh <TICKET>` immediately before creating the worktree** (`--repo <name>` for one half of a paired-PR ticket). Exit 1 = another agent is building it: STOP and report. Exit 3 = a probe could not run, so the answer is UNKNOWN: report it, do not build. Hits that resolve to your own worktree print as `· self` and do not count. Phases 2–6 take real time, so an earlier check can be stale by now; this re-check closes that window.
 - **If `git worktree add` fails with "branch already exists", or the path is taken — STOP.** That is another agent's live workspace. Report it. Clearing the way by force is how a sibling agent's unpushed commit once ended up as an unreferenced object; there is no version of "it's only a local branch" that makes deletion safe.
 - Implement with `superpowers:test-driven-development` (test → red → minimal code → green → refactor).
 - For a plan with independent tasks, use `superpowers:subagent-driven-development` / `superpowers:executing-plans`.
