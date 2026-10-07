@@ -26,6 +26,7 @@ A follow-on wave closed what that pass left half-wired. A canonical **work taxon
 skills/execute/                  # 0. ORCHESTRATE — one command, whole lifecycle: read→validate→scope→plan→build→test→ship
 skills/orchestrate/              #    …or point it at a PROJECT and let it pick the next group itself
 skills/epicbuilder/              #    …or, if that project's backlog is a loose pile, structure it into epics first
+skills/sequencing-for-launch/    #    …and ORDER it: depth over breadth, no shims, dependency-sequenced go-live chunks
 skills/brainstorming/            # 1. BRAINSTORM — design before code           (obra/superpowers, MIT)
 skills/writing-plans/            #    …then write the implementation plan        (obra/superpowers, MIT)
 skills/executing-plans/          #    …then execute it with review checkpoints   (obra/superpowers, MIT)
@@ -38,8 +39,11 @@ commands/wrapup.md               # 4. WRAP UP — tracker sync, GitHub sync, bra
 commands/babysit-prs.md          # 5. AFTER — hourly self-arming sweep of open PRs until reviews drain
 skills/babysit/                  #    the deterministic, tested classifier/planner that sweep executes
 commands/bulldozer.md            #    hourly self-arming heartbeat that DRAINS easy backlog tickets, one fresh subagent per ticket
+skills/bulldozer-reconcile/      #    closes Bulldozer 1-offs whose premise is provably gone from the default branch (dry-run default)
 commands/cleanup.md              #    resolve cleanup debt — deletes the careful hook deferred during loops
+skills/scorecard/                #    weekly fleet quality report off the automation ledger — flags >20% window-over-window regressions
 skills/flushdeployed/            # 6. AUDIT — is each "Deployed" ticket REALLY live? validate against main + the deploy box
+skills/done-without-evidence/    #    standing sweep: tickets marked Done with no started state, PR, or commit (report-only)
 skills/assign/                   # 7. STAFF — roster-driven ticket discovery + assignment for a team (local SQLite + roster)
 skills/linear-gardener/          # standing board-hygiene pass — inventory/promote/re-chunk/sweep/apply, config-driven
 hooks/pr-gate.sh                 # enforcement: blocks `gh pr create` unless every gate is recorded at the current HEAD
@@ -60,6 +64,7 @@ hooks/bash-stdin-guard.py        # guardrail: restore the </dev/null stdin guard
 hooks/test-admission.py          # guardrail: machine-wide pytest admission — xdist worker cap + one full suite at a time
 hooks/shell-code-only.sh         # helper: code-only projection of a Bash command (heredoc/quote aware) for the Linear gates
 skills/skillify/                 # turn a repo's tribal knowledge into a project skill library (discover→map→author→review)
+skills/titles/                   # opt-in hook that re-emits Claude Code's `✳ <topic>` tab titles every turn (survive VS Code reloads)
 tests/ + run-tests.sh            # the safety-hook regression suite (isolated temp-HOME sandboxes; CI-wired)
 ruff.toml                        # the lint contract CI enforces (explicit-include ratchet, version-pinned)
 launchd/                         # headless scheduled skills — launchd fires `claude -p` on a schedule, no open session needed

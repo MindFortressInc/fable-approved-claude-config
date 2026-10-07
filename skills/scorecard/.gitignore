@@ -1,0 +1,3 @@
+# Runtime cache of the standing scorecard ticket — copy state.example.json to
+# state.json and fill in team/project; never committed.
+state.json
