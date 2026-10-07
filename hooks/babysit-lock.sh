@@ -86,14 +86,24 @@ case "${1:-}" in
       # reaped on this acquire.
       case "$hb" in ''|*[!0-9]*) hb=0 ;; esac
       [ "${#hb}" -gt 12 ] && hb=0
+      # Base 10 explicitly: a leading zero ("0999") would otherwise be parsed
+      # as octal and crash the arithmetic -- the never-self-heals case above.
+      hb=$(( 10#$hb ))
       # The length cap alone has a blind spot: a value that is still
       # enormous but never longer than 12 digits (e.g. 999999999999, ~year
       # 33658) sails through it and produces the same permanently-negative-age
-      # wedge the cap exists to prevent. A heartbeat can never legitimately be
-      # in the future -- it is always written as `$(now)` -- so any hb > now
-      # is corrupt too, regardless of digit count.
+      # wedge the cap exists to prevent. A heartbeat is always written as
+      # `$(now)`, so one more than a TTL in the future is corrupt regardless
+      # of digit count. A SMALL future skew is not: a wall clock stepped
+      # backward (NTP, sleep/wake) between a live sweep's refresh and this
+      # read must not hand its lock away, so that case clamps to age 0 and
+      # reads LOCKED, as it always did.
       nowv="$(now)"
-      [ "$hb" -gt "$nowv" ] && hb=0
+      if [ "$hb" -gt $(( nowv + TTL )) ]; then
+        hb=0
+      elif [ "$hb" -gt "$nowv" ]; then
+        hb=$nowv
+      fi
       age=$(( nowv - hb ))
       if [ "$lo" != "$ME" ] && [ "$age" -lt "$TTL" ]; then
         echo "LOCKED owner=$lo age=${age}s ttl=${TTL}s"

@@ -452,6 +452,32 @@ class RateBounceTests(SweepCase):
             self.assertEqual(self.pr(out, num)["state"], "RATE_LIMITED")
             self.assertNotIn(num, self.tier_prs(out, "strict"))
 
+    def test_a_bounce_buried_by_the_bump_ack_is_still_rate_limited(self):
+        """The sweep's own bump of a RATE_LIMITED PR is answered with a
+        "Review triggered" ack that becomes the newest comment. The bounce is
+        still the latest VERDICT, so an older clean summary must not revive."""
+        f = Fixtures(self.fx)
+        f.add_pr("acme-api", 4364, commit_date=ago(300),
+                 issues=[cr_issue(NO_ACTIONABLE_BODY, ago(600)),
+                         cr_issue(REVIEW_LIMIT_BODY, ago(100)),
+                         cr_issue(TRIGGERED_BODY, ago(50))])
+        f.finalize()
+        pr = self.pr(run_sweep(self.fx, self.state), 4364)
+        self.assertEqual(pr["state"], "RATE_LIMITED")
+        self.assertEqual(pr["tier"], "")
+
+    def test_a_clean_summary_newer_than_the_bounce_is_clean(self):
+        """Control: CodeRabbit recovered and reviewed after bouncing."""
+        f = Fixtures(self.fx)
+        f.add_pr("acme-api", 4365, commit_date=ago(600),
+                 issues=[cr_issue(REVIEW_LIMIT_BODY, ago(300)),
+                         cr_issue(NO_ACTIONABLE_BODY, ago(100)),
+                         cr_issue(TRIGGERED_BODY, ago(50))])
+        f.finalize()
+        pr = self.pr(run_sweep(self.fx, self.state), 4365)
+        self.assertEqual(pr["state"], "CLEAN")
+        self.assertEqual(pr["tier"], "strict")
+
 
 # ===========================================================================
 # fix 2: CR identity is an exact login allowlist
@@ -492,6 +518,11 @@ class InlineFindingTests(SweepCase):
         self.assertFalse(g("**Actionable comments posted: 0**"))
         self.assertFalse(g(WIDGET_BODY))
         self.assertFalse(g(None))
+        # CodeRabbit's category tags mark a finding even without a severity
+        # tag or an AI-prompt block.
+        self.assertTrue(g("_\u26a0\ufe0f Potential issue_\n\nThis crashes on None."))
+        self.assertTrue(g("_\U0001f4a1 Verification agent_\n\nCheck the caller."))
+        self.assertTrue(g("_\U0001f9f9 Nitpick_\n\nRename this."))
 
     def _pr(self, f, num, inline, threads=None):
         f.add_pr("acme-api", num, commit_date=ago(10), inline=inline,
@@ -669,6 +700,18 @@ class RollupDedupeTests(SweepCase):
         scr = [_run("pytest", "FAILURE", completed=T1), _run("pytest", "", started=T2)]
         self.assertEqual(bc.failing_check_names(scr), ["pytest"])
         self.assertEqual(bc.failing_check_names([_run("pytest", "", started=T2)]), [])
+
+    def test_app_checks_without_a_workflow_never_supersede(self):
+        """Nothing in the rollup tells two apps' same-named checks apart, so
+        a newer SUCCESS from one must not hide another's FAILURE."""
+        scr = [_run("build", "FAILURE", wf="", completed=T1),
+               _run("build", "SUCCESS", wf="", completed=T2)]
+        self.assertEqual(bc.failing_check_names(scr), ["build"])
+        ctx = [{"__typename": "StatusContext", "context": "deploy", "state": "FAILURE",
+                "startedAt": T1},
+               {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS",
+                "startedAt": T2}]
+        self.assertEqual(bc.failing_check_names(ctx), ["deploy"])
 
     def test_two_workflows_do_not_cross_launder(self):
         scr = [_run("lint", "FAILURE", wf="CI", completed=T1),

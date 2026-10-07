@@ -331,9 +331,19 @@ class RetargetPlanningTests(unittest.TestCase):
         return {(a["type"], a["pr"]) for a in actions}
 
     def test_a_merged_parent_relabels_rebase_as_retarget(self):
-        got = self._actions([entry(11, parent_state="MERGED", parent_pr=10)])
+        got = self._actions([entry(11, base="feat/parent", parent_state="MERGED",
+                                   parent_pr=10)])
         self.assertIn(("retarget", 11), got)
         self.assertNotIn(("rebase", 11), got)
+
+    def test_a_child_already_on_the_default_branch_gets_a_plain_rebase(self):
+        """GitHub (or a stack-guard workflow) already moved the base; the
+        title still names the merged parent, but a retarget would be a no-op
+        that loops every sweep without reaching the guarded merge."""
+        got = self._actions([entry(11, base="main", title="x (stacked on #10)",
+                                   parent_state="MERGED", parent_pr=10)])
+        self.assertIn(("rebase", 11), got)
+        self.assertNotIn(("retarget", 11), got)
 
     def test_an_open_or_unknown_parent_keeps_the_plain_rebase(self):
         got = self._actions([entry(11, parent_state="OPEN", parent_pr=10),
@@ -349,7 +359,8 @@ class RetargetPlanningTests(unittest.TestCase):
         with open(self.store, "w") as fh:
             json.dump({"fix_attempts": {"acme-api#11": {
                 "count": 2, "last": "semantic conflict", "head": "a" * 40}}}, fh)
-        got = self._actions([entry(11, parent_state="MERGED", parent_pr=10)])
+        got = self._actions([entry(11, base="feat/parent", parent_state="MERGED",
+                                   parent_pr=10)])
         self.assertFalse(got)
 
 

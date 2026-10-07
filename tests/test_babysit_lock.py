@@ -172,6 +172,28 @@ class LockTtlInvariantTest(LockTestBase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("ACQUIRED", p.stdout)
 
+    def test_a_small_clock_step_backward_does_not_steal_a_live_lock(self):
+        """A heartbeat a few seconds in the future is a wall clock stepped
+        backward (NTP, sleep/wake) after a LIVE sweep refreshed -- not a
+        corrupt record. It must read LOCKED, never reaped (invariant L1)."""
+        now = int(time.time())
+        with open(self.lock, "w") as fh:
+            json.dump({"owner": "live-other", "host": "h", "pid": 1,
+                       "launcher": "x", "started": now, "heartbeat": now + 5}, fh)
+        p = self.run_lock("acquire")
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn("LOCKED", p.stdout)
+
+    def test_a_leading_zero_heartbeat_does_not_crash_acquire(self):
+        """`0999` passes the digits filter; unguarded, bash parses it as
+        octal and acquire dies with neither ACQUIRED nor LOCKED."""
+        with open(self.lock, "w") as fh:
+            json.dump({"owner": "other", "host": "h", "pid": 1,
+                       "launcher": "x", "started": 1, "heartbeat": "0999"}, fh)
+        p = self.run_lock("acquire")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("ACQUIRED", p.stdout)
+
     def test_a_lock_past_the_ttl_is_reaped_on_acquire(self):
         ttl = self._default_ttl()
         self.write_lock(owner="other-session", heartbeat=int(time.time()) - (ttl + 60))

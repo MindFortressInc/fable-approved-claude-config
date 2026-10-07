@@ -143,7 +143,8 @@ BODY_ONLY_SECTION_RE = re.compile(r"(?:outside diff range|duplicate) comments \(
 # denylist breaks the moment CodeRabbit changes its output format.
 GENUINE_FINDING_RE = re.compile(
     r"_(?:🔴\s*critical|🟠\s*major|🟡\s*minor|🔵\s*trivial|"
-    r"🛠️?\s*refactor suggestion)_"                      # CR's severity-tag prefix
+    r"🛠️?\s*refactor suggestion|⚠️?\s*potential issue|"
+    r"💡\s*verification agent|🧹\s*nitpick)_"          # CR's severity/category tags
     r"|prompt for (?:all review comments with )?ai agents?",  # the AI-prompt block
     re.I)
 # CodeRabbit's in-thread SELF-WITHDRAWAL of one of its own findings. Two text
@@ -711,8 +712,8 @@ def _rollup_key(c):
     each define a check called `lint`; on the bare name one workflow's newer
     SUCCESS would launder the other's FAILURE. `gh pr view --json
     statusCheckRollup` returns `workflowName` (absent on app checks such as
-    CodeRabbit and Vercel, which group under "" and compare only to each
-    other).
+    CodeRabbit and Vercel; failing_check_names never applies supersession to
+    those, see there).
     """
     return (_rollup_name(c), c.get("workflowName") or "")
 
@@ -765,7 +766,12 @@ def failing_check_names(scr):
         concluded = [c for c in entries if _rollup_concl(c)]
         if not concluded:
             continue                  # nothing has a verdict yet -> not failing
-        if len(concluded) > 1 and any(not _rollup_ts(c) for c in concluded):
+        if not _wf or (len(concluded) > 1 and any(not _rollup_ts(c) for c in concluded)):
+            # No workflow name means an app check or a status context, and
+            # nothing in the rollup tells two different apps' same-named
+            # checks apart -- so one app's newer SUCCESS must not hide
+            # another's FAILURE. Supersession is only trusted inside one
+            # Actions workflow.
             failing = any(_rollup_concl(c) in FAIL_CONCL for c in concluded)
         else:
             # max() keeps the FIRST maximal element, so order the tie-break
@@ -1029,11 +1035,36 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     # out of the cli_launch net into CLEAN, i.e. the sweep bumped a PR out of
     # its own safety net. Scan ALL comments, exactly like any_no_actionable.
     any_auto_disabled = any(AUTO_DISABLED in _body(c) for c in cr_issues)
+    # A bounce NEWER than the newest "0 actionable" summary means the latest
+    # thing CodeRabbit said about this PR is "I did not review it", whatever
+    # was said before. Checking only the newest issue comment missed the
+    # common shape: the sweep's own bump of a RATE_LIMITED PR is answered
+    # with a "Review triggered" ack that becomes the newest comment, buries
+    # the bounce, and let the whole-history any_no_actionable scan below
+    # resurrect an OLDER clean summary into CLEAN/strict. Narrowing only: it
+    # can turn CLEAN into RATE_LIMITED, never the reverse.
+
+    def _newest(items, key, pred):
+        ts = [parse_iso(x.get(key)) for x in items if pred(_body(x))]
+        ts = [t for t in ts if t]
+        return max(ts) if ts else None
+
+    newest_bounce = max(
+        [t for t in (_newest(cr_issues, "created_at", is_rate_bounce),
+                     _newest(cr_reviews, "submitted_at", is_rate_bounce)) if t],
+        default=None)
+    newest_clean = max(
+        [t for t in (_newest(cr_issues, "created_at", lambda b: NO_ACTIONABLE in b),
+                     _newest(cr_reviews, "submitted_at", lambda b: NO_ACTIONABLE in b)) if t],
+        default=None)
+    bounce_is_latest_verdict = bool(
+        newest_bounce and (newest_clean is None or newest_bounce > newest_clean))
 
     # --- classify into ONE CR state (order = precedence) ---
     if actionable or body_actionable:
         state = "HAS_ACTIONABLE"
-    elif is_rate_bounce(li_body) or any(is_rate_bounce(_body(r)) for r in cr_reviews):
+    elif (is_rate_bounce(li_body) or any(is_rate_bounce(_body(r)) for r in cr_reviews)
+          or bounce_is_latest_verdict):
         # Rate-limit/credit text can land as a submitted REVIEW body, not
         # only an issue comment — scanning the latest issue comment alone
         # let such a PR fall through to `cr_reviews non-empty -> CLEAN` and
@@ -1794,7 +1825,14 @@ def build_actions(entries, now, quiet):
         # first proves (retarget-plan) that pointing the child at the default
         # branch is safe before touching any conflict, and a retarget is never
         # reported as a resolved rebase.
-        if e.get("parent_state") == "MERGED":
+        # Only while the child still TARGETS something other than a default
+        # branch: once GitHub (or a stack-guard workflow) has already moved
+        # its base, the title marker still names the merged parent, but a
+        # retarget is a no-op and its conflict is an ordinary one -- planning
+        # `retarget` there would loop every sweep without ever reaching the
+        # guarded merge or the attempt cap.
+        if (e.get("parent_state") == "MERGED"
+                and (e.get("base") or "") not in DEFAULT_BRANCHES):
             actions.append({
                 "type": "retarget", "repo": e["repo"], "pr": e["number"],
                 "why": f"parent PR #{e.get('parent_pr')} merged — retarget to the "
