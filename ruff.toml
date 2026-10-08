@@ -18,6 +18,8 @@
 #   hooks/            the safety spine — pr-gate, branch-name-gate, ...
 #   tests/            this suite
 #   skills/babysit/   the auto-merge/deploy classifier
+#   skills/done-without-evidence/, skills/bulldozer-reconcile/,
+#   skills/scorecard/, skills/titles/   batch-2A ports, clean on arrival
 #
 # This list is a RATCHET, not a permanent boundary: `skills/assign/` and
 # `skills/resume-fleet/` still carry pre-existing findings (29 between them at
@@ -29,6 +31,10 @@ include = [
     "hooks/**/*.py",
     "tests/**/*.py",
     "skills/babysit/**/*.py",
+    "skills/done-without-evidence/**/*.py",
+    "skills/bulldozer-reconcile/**/*.py",
+    "skills/scorecard/**/*.py",
+    "skills/titles/**/*.py",
 ]
 
 # Pinning `select` below is NOT on its own enough to stop version drift.
