@@ -269,6 +269,7 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
 0. Install the global rules — [`CLAUDE.md`](CLAUDE.md): core rules, specs-to-tracker, the work taxonomy the skills route follow-ups through, code style. [`AGENTS.md`](AGENTS.md) is a symlink to the same file for agents that read that name. Merge it into an existing `~/.claude/CLAUDE.md` rather than overwriting yours; on a fresh setup:
 
    ```bash
+   mkdir -p ~/.claude
    [ -e ~/.claude/CLAUDE.md ] || cp CLAUDE.md ~/.claude/CLAUDE.md
    # Codex reads AGENTS.md — point it at the same file so the two never drift:
    mkdir -p ~/.codex && [ -e ~/.codex/AGENTS.md ] || ln -s ~/.claude/CLAUDE.md ~/.codex/AGENTS.md
