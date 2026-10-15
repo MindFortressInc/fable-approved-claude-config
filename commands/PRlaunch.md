@@ -130,7 +130,7 @@ cd <repo>
      2. CR-deferred small self-contained 1-off (LLM-doable) → that project's standing "Bulldozer 1-offs" epic, **unassigned** (find by title; create it there if missing).
      3. Big idea surfaced mid-session → a new parked epic of its own; assign the owner.
 
-     Canonical bucket definitions: see the README's "Work taxonomy (Linear conventions)" section. This is the step that's easy to skip — don't. "Out of scope" means *track it elsewhere*, not *discard it*.
+     Canonical bucket definitions: see `CLAUDE.md` § Work Taxonomy. This is the step that's easy to skip — don't. "Out of scope" means *track it elsewhere*, not *discard it*.
    - Junk / not-a-real-issue → waive with a one-line reason (recorded in the wrapup report).
    Maintain a running disposition list (finding → fixed | ticket <id> | waived: reason). Phase 6 verifies it.
 4. Commit fixes.
