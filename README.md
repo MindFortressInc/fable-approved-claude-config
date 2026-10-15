@@ -23,6 +23,7 @@ A follow-on wave closed what that pass left half-wired. A canonical **work taxon
 ## What's in the box
 
 ```
+CLAUDE.md (+ AGENTS.md symlink)  # the global rules every skill assumes: core rules, work taxonomy, code style
 skills/execute/                  # 0. ORCHESTRATE — one command, whole lifecycle: read→validate→scope→plan→build→test→ship
 skills/orchestrate/              #    …or point it at a PROJECT and let it pick the next group itself
 skills/epicbuilder/              #    …or, if that project's backlog is a loose pile, structure it into epics first
@@ -246,19 +247,7 @@ Needs `git`. The Linear probe also needs `curl` + `jq`, and the PR probe needs `
 
 ## Cross-cutting: work taxonomy (Linear conventions)
 
-The vocabulary `PRlaunch`, `wrapup`, `bulldozer`, and `assign` all assume for filing and routing follow-up work. Canonical — those skills reference this section instead of restating it.
-
-- **PROJECT** = a whole board / program-scale grouping (e.g. one product line).
-- **EPIC** = one orchestratable chunk of work — roughly a session's worth, ~5 related tickets/PRs shipping a feature or feature-chunk. An epic stays open until it's genuinely done, **including its ops tail** (deploy verification, flag flips, doc updates, any follow-ups it spawned) — shipping the PRs is not the same as the epic being finished. Re-chunk an oversized epic into smaller session-sized epics chained by blocked-by rather than grinding through all of it in one pass.
-- **Ticket** ≈ one PR.
-
-**Follow-up filing buckets** — every follow-up ticket filed in any session picks exactly one bucket; nothing gets filed parentless:
-
-1. **CR-deferred 1-off** — a small, self-contained, LLM-doable finding from a repo-wide review with no cross-ticket ordering → parent it under that project's standing **"Bulldozer 1-offs"** epic (one per board/project, title exactly `Bulldozer 1-offs`, state Epics, never closes — create it if the board doesn't have one yet). File it **unassigned**: this is `/bulldozer`'s queue, not a human's.
-2. **Nit/ops follow-up on the feature being shipped** (a flag flip, a data migration, "turn this on once X is live") → the **same epic** as the feature it belongs to; that epic stays open until the follow-up is done.
-3. **A bigger idea surfaced mid-session** → its **own new parked epic**, even if it starts with a single ticket.
-
-`PRlaunch`, `wrapup`, `bulldozer`, and `assign` all route follow-ups through these three buckets — see each skill for where in its flow the routing happens.
+`PRlaunch`, `wrapup`, `bulldozer`, `assign` and `linear-gardener` share one PROJECT / EPIC / ticket vocabulary and a single 3-bucket follow-up-filing contract (the shipping feature's own epic, a standing "Bulldozer 1-offs" epic, or a fresh parked epic — never parentless). It lives in [`CLAUDE.md`](CLAUDE.md) § Work Taxonomy, because that is the file agents actually load; this README doesn't restate it.
 
 ## Cross-cutting: how we do memory
 
@@ -276,6 +265,14 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
 ---
 
 ## Install
+
+0. Install the global rules — [`CLAUDE.md`](CLAUDE.md): core rules, specs-to-tracker, the work taxonomy the skills route follow-ups through, code style. [`AGENTS.md`](AGENTS.md) is a symlink to the same file for agents that read that name. Merge it into an existing `~/.claude/CLAUDE.md` rather than overwriting yours; on a fresh setup:
+
+   ```bash
+   [ -e ~/.claude/CLAUDE.md ] || cp CLAUDE.md ~/.claude/CLAUDE.md
+   # Codex reads AGENTS.md — point it at the same file so the two never drift:
+   mkdir -p ~/.codex && [ -e ~/.codex/AGENTS.md ] || ln -s ~/.claude/CLAUDE.md ~/.codex/AGENTS.md
+   ```
 
 1. Copy the commands into your Claude Code config:
 
