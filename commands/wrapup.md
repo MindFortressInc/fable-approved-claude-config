@@ -31,7 +31,7 @@ Goal: every ticket touched this session reflects current reality.
     2. CR-deferred small self-contained 1-off (LLM-doable) → that project's standing "Bulldozer 1-offs" epic, unassigned (find by title; create it there if missing).
     3. Big idea surfaced mid-session → a new parked epic of its own; assign the owner.
 
-    Canonical bucket definitions: see the README's "Work taxonomy (Linear conventions)" section.
+    Canonical bucket definitions: see `CLAUDE.md` § Work Taxonomy.
 
 ## 2. GitHub
 
