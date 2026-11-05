@@ -34,7 +34,7 @@ Before anything else, list what we're shipping:
 - Walk the conversation for repos + branches touched.
 - Per repo: `git status --short`, `git log @{u}..HEAD --oneline` (or `git log origin/main..HEAD` if no upstream), `git branch --show-current`.
 - Group changes into shippable units. Usually = one branch = one PR. If a branch spans multiple tickets, ask the owner whether to split.
-- **Name the driver:** the skill that sent this unit here, for `/scorecard`. `execute`, `orchestrate` or `bulldozer` when the invoking skill or your brief names it; `manual` when a person ran `/PRlaunch` directly. Otherwise leave it empty: an untagged row is honest and a guessed one is not. Each Bash call is a new shell, so an `export` does not reach the next call. Put `LEDGER_DRIVER=<driver>` inline on each ledger-writing call below.
+- **Name the driver:** the skill that sent this unit here, for `/scorecard`. `execute`, `orchestrate` or `bulldozer` when the invoking skill or your brief names it; `manual` when a person ran `/PRlaunch` directly. Otherwise leave it empty: an untagged row is honest and a guessed one is not. Each Bash call is a new shell, so an `export` does not reach the next call. Put `LEDGER_DRIVER='<driver>'` inline on each ledger-writing call below; keep the quotes, so a placeholder left unfilled is a warned-and-dropped value rather than a shell redirect.
 - Make sure changes are committed to a feature branch (not sitting uncommitted, not on `main`). If uncommitted, commit them now — HEREDOC message, match repo style via `git log --oneline -5`, and include the attribution trailer unless `PRLAUNCH_NO_TRAILER=1` is set (see below).
 - Report the list back to the owner and confirm before proceeding: "I'm about to ship these N units through PRlaunch — confirm?"
 
@@ -305,7 +305,7 @@ Then, for what the core found:
 7. **Stamp the gate** — once deep-review is clean, record it against the current HEAD (run from inside the repo):
 
    ```bash
-   LEDGER_DRIVER=<driver> ~/.claude/hooks/prlaunch-gate.sh record deep_review --findings '<json>'
+   LEDGER_DRIVER='<driver>' ~/.claude/hooks/prlaunch-gate.sh record deep_review --findings '<json>'
    ```
 
    This writes the gate's HEAD sha into the ledger the `pr-gate` hook enforces; any commit after this stales the entry and you re-record it here (the re-gate rule, as code).
@@ -371,7 +371,7 @@ cd <repo>
 8. **Stamp the gate** — on the clean (non-skip) path, once every finding is fixed/ticketed/waived, record it against the current HEAD:
 
    ```bash
-   LEDGER_DRIVER=<driver> ~/.claude/hooks/prlaunch-gate.sh record cr_cli --findings '<json>'
+   LEDGER_DRIVER='<driver>' ~/.claude/hooks/prlaunch-gate.sh record cr_cli --findings '<json>'
    ```
 
    Same `--findings` contract as deep-review: every severity CR CLI reported this unit, with its disposition. Use CR's own severity words (`critical`/`major`/`minor`/`trivial`) — they are stored verbatim so this gate stays directly comparable to CodeRabbit's own review store. On a limit-skip there is nothing to record; pass no `--findings`. The wrapper's stderr names the run (`run=<id>`, plus `seat '<name>'` when a pool is registered); pass them as `--run-id <id>` (and `--seat <name>`) to tie the ledger entry to that exact run.
@@ -568,7 +568,7 @@ Same flow as `/wrapup`:
          --argjson regate true --argjson skip "$SKIP" \
        '{skill:"prlaunch", event:"unit", repo:$repo, pr:$pr,
          gates:{deep_review_findings:$dr, cr_cli:$cr, outcome_eval:$oe, regate:$regate, prlaunch_skip:$skip}}')
-     LEDGER_DRIVER=<driver> ~/.claude/hooks/ledger-append.sh "$U" \
+     LEDGER_DRIVER='<driver>' ~/.claude/hooks/ledger-append.sh "$U" \
        || echo "WARN: unit row REJECTED — this unit is missing from the durable record" >&2
    fi
    ```

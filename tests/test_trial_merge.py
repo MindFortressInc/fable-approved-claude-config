@@ -282,6 +282,26 @@ class CouldNotRun(Fixture):
         self.assertEqual(2, r.returncode, r.stdout + r.stderr)
         self.assertEqual([], os.listdir(self.scratch))
 
+    def test_a_fork_pr_is_refused_before_anything_runs(self):
+        self.pr(1, "one", {"a.txt": "a\n"})
+        self.prs["1"]["isCrossRepository"] = True
+        marker = os.path.join(self.root, "ran")
+        before = self.state()
+        r = self.run_script("--test", f"touch {marker}", "1")
+        self.assertEqual(2, r.returncode, r.stdout + r.stderr)
+        self.assertIn("fork", r.stderr)
+        self.assertFalse(os.path.exists(marker))
+        self.assert_nothing_left(before)
+
+    def test_test_commands_get_no_credentials(self):
+        self.pr(1, "one", {"a.txt": "a\n"})
+        self.env["GH_TOKEN"] = "ghp_SHOULD_NOT_LEAK"
+        self.env["LINEAR_API_KEY"] = "lin_api_SHOULD_NOT_LEAK"
+        r = self.run_script("--test", "env; exit 1", "1")
+        self.assertEqual(1, r.returncode, r.stdout + r.stderr)
+        self.assertIn("PATH=", r.stdout)
+        self.assertNotIn("SHOULD_NOT_LEAK", r.stdout)
+
     def test_prs_on_two_different_roots_are_refused(self):
         self.pr(1, "one", {"a.txt": "a\n"})
         self.git("push", "-q", "origin", "main:release")

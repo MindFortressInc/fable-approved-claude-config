@@ -282,7 +282,7 @@ class SkillTextTests(unittest.TestCase):
         for call in ("prlaunch-gate.sh record deep_review --findings",
                      "prlaunch-gate.sh record cr_cli --findings",
                      'ledger-append.sh "$U"'):
-            self.assertIn("LEDGER_DRIVER=<driver> ~/.claude/hooks/" + call, text)
+            self.assertIn("LEDGER_DRIVER='<driver>' ~/.claude/hooks/" + call, text)
 
     def test_each_orchestrator_names_its_own_driver(self):
         self.assertIn("LEDGER_DRIVER=execute", read(EXECUTE_MD))

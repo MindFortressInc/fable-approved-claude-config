@@ -19,6 +19,11 @@ printed on every run because a rate over a shrinking denominator looks like
 improvement. Clean CR runs are ledgered (findings_count 0), so "no cr_cli row"
 really means CR never ran.
 
+An escape is every CR finding at/after t0; nothing is subtracted for what
+deep-review already flagged, because the two tools title findings differently.
+So a deep-review finding that was waived or ticketed rather than fixed, and
+that CR then re-flags, counts as a miss. That is deliberate: it was not fixed.
+
 Classes are deterministic keyword/path rules seeded from a hand-labelled set of
 372 major+ escapes (2026-10-16); first match wins and the rest land in an
 explicit `other` bucket whose size is reported. No LLM, no network.

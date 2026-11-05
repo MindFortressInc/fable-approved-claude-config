@@ -31,8 +31,9 @@ The argument names the **work-list** — enumerate it before anything else:
 1. **Validate first, across the whole list:** run phases 1–2 (read + premise table) for EVERY unit before building any — a contradicted premise on unit 3 shouldn't surface after units 1–2 already shipped around it.
 2. **One batched ask:** collect ALL true forks found across the list into a single `AskUserQuestion`, then build straight through with the answers in hand.
 3. **Then per unit, sequentially, in dependency order:** phases 3–8 with its own worktree, own `me/dev-NNNN-slug` branch, own PR. If a unit hard-depends on an earlier unit's still-unmerged PR, branch off that PR's branch and mark the title "(stacked on #NNNN)".
-4. **A halted unit never kills the batch.** Contradicted premise / blocked / failed → record it, continue with the remaining units, and end with a per-unit report table: `unit → PR link / halted:<reason> / failed:<reason>`.
-5. **Long list (≳4 units):** run each unit's build phases (6–8) in a fresh subagent per the `briefs` six-section contract (bulldozer's pattern) so orchestrator context stays lean — validation and forks stay in the main session where the owner can answer. Name the driver in every build brief ("Your driver is `execute`: `LEDGER_DRIVER=execute` inline on PRlaunch's ledger-writing calls"), because a subagent inherits no shell state. Paste `/orchestrate`'s Worker gotcha pack into every build brief; its test bound (targeted + ratchet tests at `-n 2`, full suite left to CI) is what keeps N builders from exhausting the machine. Before spawning, check nothing else is already running a fleet here: `ps -axo command | grep -c '[c]laude -p --agent'` and `ps -axo command | grep -c '[-]m pytest'` (`hooks/test-admission.py` enforces the same bound mechanically).
+4. **After the last unit, phase 9:** trial-merge the batch's open PRs together before reporting.
+5. **A halted unit never kills the batch.** Contradicted premise / blocked / failed → record it, continue with the remaining units, and end with a per-unit report table: `unit → PR link / halted:<reason> / failed:<reason>`.
+6. **Long list (≳4 units):** run each unit's build phases (6–8) in a fresh subagent per the `briefs` six-section contract (bulldozer's pattern) so orchestrator context stays lean — validation and forks stay in the main session where the owner can answer. Name the driver in every build brief ("Your driver is `execute`: `LEDGER_DRIVER=execute` inline on PRlaunch's ledger-writing calls"), because a subagent inherits no shell state. Paste `/orchestrate`'s Worker gotcha pack into every build brief; its test bound (targeted + ratchet tests at `-n 2`, full suite left to CI) is what keeps N builders from exhausting the machine. Before spawning, check nothing else is already running a fleet here: `ps -axo command | grep -c '[c]laude -p --agent'` and `ps -axo command | grep -c '[-]m pytest'` (`hooks/test-admission.py` enforces the same bound mechanically).
 
 ## The pipeline
 
@@ -104,11 +105,11 @@ Build ON what exists. The phase-2 discovery already found the relevant substrate
 PRs that each pass alone can break together: one deletes a symbol another imports, and `main` stops booting the moment both land. So for each repo with 2+ open PRs from this batch, after the last `/PRlaunch` and before the per-unit report:
 
 ```
-timeout 3600 python3 ~/.claude/skills/execute/trial_merge.py --repo <clone> \
+python3 ~/.claude/skills/execute/trial_merge.py --repo <clone> --test-timeout 540 \
   --unit-test <PR>='<that unit targeted tests>' … --test '<repo ratchet tests>' <PR> <PR> …
 ```
 
-It merges the PRs in a detached scratch worktree off the base's live tip, stacked PRs in stack order, then runs each unit's targeted tests and the ratchet tests on that one tree, one command at a time. Keep the existing bound in those commands: `-n 2` at most, full suite left to CI. It pushes nothing, creates no ref, changes no PR, and removes only the worktree it made, including on SIGTERM.
+It merges the PRs in a detached scratch worktree off the base's live tip, stacked PRs in stack order, then runs each unit's targeted tests and the ratchet tests on that one tree, one command at a time. Keep the existing bound in those commands: `-n 2` at most, full suite left to CI. `--test-timeout` bounds each command (default 900s); keep the whole run inside your tool's foreground limit, because a SIGKILL from outside skips the cleanup. It pushes nothing, creates no ref, changes no PR, and removes only the worktree it made, including on SIGTERM. It refuses fork PRs, and test commands run without the usual credential variables (`GH_TOKEN`, `LINEAR_API_KEY`, model API keys).
 
 Paste its table into the per-unit report. A conflict or failure stays against the PRs it names: report it, never auto-resolve it, and don't touch the PRs to make it pass. Exit `0` clean, `1` conflict or failing test, `3` merged but no test ran (say so), `2` could not run or clean up, which is unknown, not clean.
 

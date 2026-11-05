@@ -84,7 +84,15 @@ class BulldozerLayout(unittest.TestCase):
         step = _section(self.text, "## Step 1b", "## Step 2")
         self.assertIn("With freshen off, that retry is all of Step 1b.", step)
         report = _section(self.text, "## Step 3", "</process>")
-        self.assertIn("With freshen off, `S` is 0 by definition and `<F>/<quota>` reads `off`.", report)
+        self.assertIn("With freshen off, `S` is 0 by definition", report)
+        self.assertIn("`<F>/<quota>` reads `off`", report)
+        step1 = _section(self.text, "## Step 1 ", "## Step 1b")
+        self.assertIn("`FRESHEN=on` or `FRESHEN=off`", step1)
+        self.assertIn("append any it returned to the end of `shortlist`", step1)
+
+    def test_a_close_that_keeps_failing_cannot_wedge_the_heartbeat(self):
+        step = _section(self.text, "## Step 1b", "## Step 2")
+        self.assertIn("on the third failure drop it from `pending_close`", step)
 
     def test_ledger_rows_carry_the_skill_the_count_selects_on(self):
         step2 = _section(self.text, "## Step 2", "## Step 3")
@@ -236,6 +244,47 @@ class FreshnessScriptBehaviour(unittest.TestCase):
 
     def test_missing_state_file_fails_closed(self):
         self.assertEqual(self._run(None), [])
+
+
+@unittest.skipUnless(shutil.which("jq") and shutil.which("bash"), "needs jq and bash")
+class ThroughputCountBehaviour(unittest.TestCase):
+    """Run Step 3's bulldozed-count snippet against a fixture ledger."""
+
+    def setUp(self):
+        with open(CMD, encoding="utf-8") as f:
+            report = _section(f.read(), "## Step 3", "</process>")
+        self.script = next(b for b in re.findall(r"```bash\n(.*?)```", report, re.S)
+                           if "automation-ledger.jsonl" in b)
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home)
+        os.makedirs(os.path.join(self.home, ".claude"))
+
+    def _run(self, rows):
+        with open(os.path.join(self.home, ".claude", "automation-ledger.jsonl"), "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        r = subprocess.run(["bash", "-c", self.script], env=dict(os.environ, HOME=self.home),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.split()
+
+    def test_distinct_tickets_and_untagged_rows_both_count(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        recent = (now - datetime.timedelta(days=2)).strftime("%FT%TZ")
+        older = (now - datetime.timedelta(days=20)).strftime("%FT%TZ")
+        rows = [
+            {"skill": "bulldozer", "status": "shipped", "ticket": "EX-1", "ts": recent},
+            {"skill": "bulldozer", "status": "shipped", "ticket": "EX-1", "ts": recent},  # same ticket twice
+            {"status": "shipped", "ticket": "EX-2", "ts": recent},  # written before the skill stamp
+            {"status": "shipped", "ticket": "EX-3", "ts": older},
+            {"skill": "bulldozer", "status": "resolved", "ticket": "EX-4", "ts": recent},
+            {"skill": "prlaunch", "event": "unit", "status": "shipped", "ticket": "EX-5", "ts": recent},
+        ]
+        self.assertEqual(self._run(rows), ["2", "3"])
+
+    def test_no_bulldozer_rows_is_unavailable_not_zero(self):
+        self.assertEqual(self._run([{"skill": "babysit", "event": "sweep", "ts": "2026-01-01T00:00:00Z"}]),
+                         ["unavailable"])
 
 
 if __name__ == "__main__":

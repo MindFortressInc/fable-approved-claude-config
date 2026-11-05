@@ -30,6 +30,11 @@ SCRATCH_GIT = [
     "-c", "user.name=trial-merge", "-c", "user.email=trial-merge@localhost",
 ]
 ENV = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+# Test commands run PR code and their failing output lands in the report, so
+# they get no credentials: a token in the env is one `print(os.environ)` away.
+CREDENTIALS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "LINEAR_API_KEY",
+               "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY", "CODERABBIT_API_KEY", "CR_SEAT_API_KEY")
+TEST_ENV = {k: v for k, v in ENV.items() if k not in CREDENTIALS}
 OUTPUT_TAIL = 40
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -54,13 +59,18 @@ def read_prs(repo, numbers):
     for n in numbers:
         try:
             p = subprocess.run(
-                ["gh", "pr", "view", str(n), "--json", "number,state,baseRefName,headRefName,headRefOid"],
+                ["gh", "pr", "view", str(n), "--json",
+                 "number,state,baseRefName,headRefName,headRefOid,isCrossRepository"],
                 cwd=repo, env=ENV, text=True, capture_output=True, timeout=60)
         except subprocess.TimeoutExpired:
             raise CannotRun(f"gh pr view {n} exceeded 60s")
         if p.returncode:
             raise CannotRun(f"gh pr view {n} failed: {p.stderr.strip()}")
-        prs.append(json.loads(p.stdout))
+        pr = json.loads(p.stdout)
+        # A fork's head is a stranger's code; running its tests on this machine is not a trial merge.
+        if pr.get("isCrossRepository"):
+            raise CannotRun(f"PR #{n} is from a fork; trial-merge runs only same-repo PRs")
+        prs.append(pr)
     return prs
 
 
@@ -122,7 +132,7 @@ class Running:
 
 
 def run_test(tree, cmd, limit):
-    proc = subprocess.Popen(cmd, shell=True, cwd=tree, env=ENV, text=True, errors="replace", start_new_session=True,
+    proc = subprocess.Popen(cmd, shell=True, cwd=tree, env=TEST_ENV, text=True, errors="replace", start_new_session=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     Running.group = proc.pid
     try:
@@ -150,8 +160,7 @@ def kill_group():
 
 def remove_scratch(repo, parent, tree):
     """Remove exactly what this run made. Never prunes: other agents' entries are not ours."""
-    for sig in SIGNALS:
-        signal.signal(sig, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)  # all at once: no gap between per-signal installs
     try:
         if os.path.exists(tree):
             git(repo, "worktree", "remove", "--force", tree)

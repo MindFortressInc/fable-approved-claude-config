@@ -118,18 +118,18 @@ if [ -z "$C" ]; then : > "$SCRATCH/reviewed_recent.txt"; echo "WARN: freshness c
   } | sort -u > "$SCRATCH/reviewed_recent.txt"
 fi
 ```
-Have it apply `<selection-criteria>` criteria 2-6 to every pooled ticket, then split the passes by criterion 1: **fresh** (created within `days`, in `reviewed_recent.txt`, or any pass at all while freshen is off) goes to `shortlist`, ranked; **stale** (passes 2-6, not fresh) goes to `stale`, oldest `createdAt` first. It returns ONE **strict JSON object**, nothing else:
+Put this wake's freshen value (`FRESHEN=on` or `FRESHEN=off`, from Step 0) in its brief, and have it apply `<selection-criteria>` criteria 2-6 to every pooled ticket, then split the passes by criterion 1: **fresh** (created within `days`, in `reviewed_recent.txt`, or any pass at all while freshen is off) goes to `shortlist`, ranked; **stale** (passes 2-6, not fresh) goes to `stale`, oldest `createdAt` first. It returns ONE **strict JSON object**, nothing else:
 ```json
 {"shortlist":[{"identifier":"DEV-NNNN","repo":"<repo>","one_line_fix":"<the concrete fix>","assignee":"unassigned|you","source":"backlog|bulldozer-1offs","gitBranchName":"<the tracker's branch-name hint>","rank":1}],
  "stale":[{"identifier":"DEV-NNNN","repo":"<repo>","one_line_fix":"<the concrete fix>","assignee":"unassigned|you","source":"backlog|bulldozer-1offs","gitBranchName":"<the tracker's branch-name hint>","created":"YYYY-MM-DD","title":"…"}],
  "pool":{"total":0,"ineligible":0,"eligible_fresh":0,"eligible_stale":0}}
 ```
 `pool` counts **Bulldozer 1-offs children only** (`source:"bulldozer-1offs"`, including a recent backlog ticket that is also one): it is the size of bulldozer's own queue. Plain recent backlog still drains through `shortlist` but is never counted in `pool`.
-**Validate it before using it:** `jq -e '(.shortlist|type=="array") and (.stale|type=="array") and (.stale|all(has("identifier") and has("repo") and has("one_line_fix") and (.gitBranchName|type=="string"))) and (.pool.eligible_fresh|type=="number") and (.pool.eligible_stale|type=="number") and (.shortlist|all(has("identifier") and has("repo") and has("one_line_fix") and has("rank") and (.gitBranchName|type=="string"))) and ((.shortlist+.stale)|map(.identifier)|length==(unique|length))'`. On validation failure, re-ask the parse-subagent ONCE for JSON-only; if it still doesn't parse, treat it as an empty shortlist and empty stale list for this wake (report the pool counts as `?`). Keep the validated object in hand for Step 1b, the drain loop and the report. For every shortlist ticket whose `state.freshen` entry has `build_ok: true` and an `at` inside the `days` window, attach that entry: its worker brief gets the TICKET-REVIEW VERDICT block from it. An entry that is `failed`, `uncertain`, blocked or out of the window is never attached; a ticket that is fresh for another reason is built from its ticket text.
+**Validate it before using it:** `jq -e '(.shortlist|type=="array") and (.stale|type=="array") and (.stale|all(has("identifier") and has("repo") and has("one_line_fix") and (.gitBranchName|type=="string"))) and (.pool.eligible_fresh|type=="number") and (.pool.eligible_stale|type=="number") and (.shortlist|all(has("identifier") and has("repo") and has("one_line_fix") and has("rank") and (.gitBranchName|type=="string"))) and ((.shortlist+.stale)|map(.identifier)|length==(unique|length))'`. On validation failure, re-ask the parse-subagent ONCE for JSON-only; if it still doesn't parse, treat it as an empty shortlist and empty stale list for this wake (report the pool counts as `?`). With freshen off, nothing will ever review a `stale` entry, so append any it returned to the end of `shortlist` and add `eligible_stale` into `eligible_fresh` before going on. Keep the validated object in hand for Step 1b, the drain loop and the report. For every shortlist ticket whose `state.freshen` entry has `build_ok: true` and an `at` inside the `days` window, attach that entry: its worker brief gets the TICKET-REVIEW VERDICT block from it. An entry that is `failed`, `uncertain`, blocked or out of the window is never attached; a ticket that is fresh for another reason is built from its ticket text.
 
 ## Step 1b — Freshen tax (per batch, before the drain; opt-in)
 
-First, every wake: retry every `state.pending_close` entry (step 3, `superseded`) and remove each once it succeeds. With freshen off, that retry is all of Step 1b.
+First, every wake: retry every `state.pending_close` entry (step 3, `superseded`) and remove each once it succeeds. Count failed retries in the entry's `attempts`; on the third failure drop it from `pending_close` and name it in the wake report as `close failed — finish by hand`, so one ticket the tracker will not close cannot hold the heartbeat, the stall streak and every later batch. With freshen off, that retry is all of Step 1b.
 
 A stale ticket was written against code that has since moved, so a worker would build against a premise nobody re-checked. With freshen on, each batch pays a tax to fix that: it freshens **half as many stale tickets as its target**, `quota = ceil(target / 2)` (the default target of 10 shipped PRs → **up to 5** freshens for the whole batch, not per ticket and not per wake), **oldest first**, whether or not the fresh shortlist is empty. `state.freshened_batch` counts what this batch has spent. A wake takes `quota − freshened_batch` tickets, so the first wake usually pays the whole tax and later wakes in the batch skip the review. Skip it also when no stale ticket is left to take.
 
@@ -202,10 +202,10 @@ STOP CONDITIONS (bail instead of thrashing; ALWAYS return the JSON so the orches
 Set `no_progress_streak = 0` if this wake shipped or resolved ≥1 ticket or Step 1b promoted ≥1 (a review that only came back `uncertain` or blocked is not progress), else `+= 1` — except leave it unchanged when Step 1b had quota left and skipped ≥1 stale ticket inside a `failed` entry's 24-hour cooldown (whatever else it skipped), or recorded ≥1 new `failed` verdict this wake, so the stall stop cannot fire before that retry comes due. Leave it unchanged too while `state.pending_close` is still nonempty after this wake's Step 1b retry: the stall stop deletes the heartbeat, and that heartbeat is the only thing that retries a pending close, so a closure that keeps failing must never count a wake toward the stop. Write `last_iter_at = now`, persist state. Compute the throughput counts from the automation ledger, counting distinct tickets, since one worker can append more than one row:
 ```bash
 L=~/.claude/automation-ledger.jsonl
-if [ -s "$L" ] && jq -e 'select(.skill=="bulldozer")' "$L" >/dev/null; then
+if [ -s "$L" ] && jq -e 'select(.skill=="bulldozer" or (.skill==null and .ticket!=null))' "$L" >/dev/null; then
   for d in 7 30; do
     C=$(date -u -v-${d}d +%FT%TZ 2>/dev/null || date -u -d "-${d} days" +%FT%TZ)
-    jq -r --arg c "$C" 'select(.skill=="bulldozer" and .status=="shipped" and .ts>=$c) | .ticket' "$L" | sort -u | wc -l
+    jq -r --arg c "$C" 'select((.skill=="bulldozer" or (.skill==null and .ticket!=null)) and .status=="shipped" and .ts>=$c) | .ticket' "$L" | sort -u | wc -l
   done   # → X (7 days), Y (30 days)
 else
   echo "unavailable"   # report "Bulldozed: unavailable (no ledger rows)", never zeros
@@ -220,7 +220,7 @@ shipped <s>/<target> · resolved-no-pr <r> · this wake: <k> shipped, <m> resolv
 Bulldozed: <X> in last 7 days · <Y> in last 30 days
 Remaining 1-offs: <E> eligible (fresh ≤7d) · <S> stale · freshened this batch <F>/<quota>
 ```
-With a `days` argument other than 7, print the real window in the Remaining line (for example `fresh ≤14d`). With freshen off, `S` is 0 by definition and `<F>/<quota>` reads `off`.
+With a `days` argument other than 7, print the real window in the Remaining line (for example `fresh ≤14d`). With freshen off, `S` is 0 by definition, `E` counts every eligible 1-off whatever its age, and `<F>/<quota>` reads `off`.
 Then:
 - **`shipped >= target`** → AUTO-STOP (target met): CronDelete the `/bulldozer` job, final summary, exit — unless `state.pending_close` is still nonempty: the heartbeat is the only thing that retries a pending close, so leave it armed, report `TARGET MET, closes pending (heartbeat armed)`, and let Step 0's close-retry wake finish them before this stop fires.
 - **`no_progress_streak >= 3`** → AUTO-STOP (stalled): 3 consecutive wakes cleared nothing (queue dry or all-drifted) — never reached while a `pending_close` entry is outstanding, since such a wake does not advance the streak. CronDelete first, then persist `stopped: "stalled"` to state, so an interrupted stop never leaves a live heartbeat that would reset the batch, then `AUTO-STOPPED (stalled)`, exit.
