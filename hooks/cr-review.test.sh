@@ -532,5 +532,108 @@ o=$(CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
 check "review output kept" "handled in api/limits.py" "$o"
 check "no seat put on cooldown" "0" "$(ls "$SCRATCH/seats"/*/.limited_until 2>/dev/null | wc -l | tr -d ' ')"
 
+echo "T25: the monthly spend cap exits 75 at once, without rotating seats"
+# Real shape: every seat fails "Failed to start review" with exit 1, and only an
+# OAuth identity's `coderabbit usage` can see billing -- API-key seats print
+# "unavailable". The stub gives billing to seat alpha alone.
+cat > "$SCRATCH/bin/coderabbit" <<'STUB25'
+#!/usr/bin/env bash
+seat=$(basename "$HOME")
+if [[ "${1:-}" = usage ]]; then
+  echo "usage probe seat=$seat" >> "$CALLS"
+  echo "Billing period"
+  if [[ "$seat" = alpha ]]; then
+    echo "Organization  : example-org"
+    echo "Your spend    : \$${SPEND:-50.00}"
+    echo "Review cap    : \$50.00 per billing month (shared subscription; inactive)"
+    echo "Period resets : 2026-11-04"
+  else
+    echo "Availability : unavailable"
+    echo "Note         : Billing-period usage isn't available with API-key authentication."
+  fi
+  exit 0
+fi
+echo "review seat=$seat" >> "$CALLS"
+case "${MODE:-capped}" in
+  capped) echo "Review failed: Failed to start review. Please try again." >&2; exit 1 ;;
+  ok)     echo "Review complete. 0 issues found."; exit 0 ;;
+  adverse) echo "Review: hooks/cr-review.sh:260 -- the Failed to start review branch skips rotation (major)"; exit 1 ;;
+  status)  echo "Review failed: Failed to start review. Please try again."; exit 1 ;;
+  agent)   echo '{"type":"error","message":"Failed to start review. Please try again."}'; exit 1 ;;
+esac
+STUB25
+chmod +x "$SCRATCH/bin/coderabbit"
+export CALLS="$SCRATCH/calls"
+reset25() { rm -f "$SCRATCH/seats"/*/.uses "$SCRATCH/seats"/*/.limited_until "$CALLS"; touch "$CALLS"; }
+# Pin the ranking so the FIRST seat tried is an API-key seat: alpha has the most
+# recent use, so the usage probe must look past the failing seat.
+reset25; echo "$(( $(date +%s) - 120 ))" > "$SCRATCH/seats/alpha/.uses"
+o=$(CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+[[ $rc -eq 75 ]] && { echo "  PASS: exit 75"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 75)"; fail=$((fail+1)); }
+check "names the spend cap + reset date" "MONTHLY SPEND CAP REACHED (\$50.00 of \$50.00, resets 2026-11-04)" "$o"
+check "reports exhaustion" "ALL SEATS EXHAUSTED" "$o"
+check "CLI failure line surfaced" "Failed to start review" "$o"
+check "ONE review launch, no rotation" "1" "$(grep -c '^review' "$CALLS")"
+first=$(sed -n 's/^review seat=//p' "$CALLS" | head -1)
+[[ -n "$first" && "$first" != alpha ]] && { echo "  PASS: first seat ($first) is an API-key seat"; pass=$((pass+1)); } \
+  || { echo "  FAIL: first seat was '${first}', probe path not exercised"; fail=$((fail+1)); }
+check "usage read from the OAuth seat" "usage probe seat=alpha" "$(cat "$CALLS")"
+check "failing seat probed once, not twice" "1" "$(grep -c "^usage probe seat=${first:-none}\$" "$CALLS")"
+check "no seat put on cooldown" "0" "$(ls "$SCRATCH/seats"/*/.limited_until 2>/dev/null | wc -l | tr -d ' ')"
+check "no use recorded" "1" "$(cat "$SCRATCH/seats"/*/.uses 2>/dev/null | wc -l | tr -d ' ')"
+
+echo "T26: 'Failed to start review' with spend UNDER the cap stays a real failure"
+reset25
+o=$(SPEND=12.50 CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+[[ $rc -eq 1 ]] && { echo "  PASS: exit 1"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 1)"; fail=$((fail+1)); }
+if grep -qF "SPEND CAP" <<<"$o"; then echo "  FAIL: claimed a spend cap under the cap"; fail=$((fail+1));
+else echo "  PASS: no spend-cap claim"; pass=$((pass+1)); fi
+
+echo "T27: spend AT the cap but the review runs -> the review's verdict, usage never consulted"
+# Usage has read \$50.00/\$50.00 while reviews still exited 0.
+for m in ok:0 adverse:1; do
+  reset25
+  o=$(MODE="${m%%:*}" CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+  [[ $rc -eq ${m##*:} ]] && { echo "  PASS: ${m%%:*} -> exit $rc"; pass=$((pass+1)); } || { echo "  FAIL: ${m%%:*} -> exit $rc (want ${m##*:})"; fail=$((fail+1)); }
+  check "${m%%:*}: usage not probed" "0" "$(grep -c '^usage' "$CALLS")"
+done
+
+echo "T28: the NO-SEAT fallback path maps the spend cap to 75 too"
+reset25; mkdir -p "$SCRATCH/home/alpha"
+o=$(HOME="$SCRATCH/home/alpha" CR_SEATS_DIR="$SCRATCH/empty" "$WRAP" --base main 2>&1); rc=$?
+check "took the fallback path" "falling back to the default identity" "$o"
+[[ $rc -eq 75 ]] && { echo "  PASS: exit 75"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 75)"; fail=$((fail+1)); }
+check "names the spend cap" "MONTHLY SPEND CAP REACHED" "$o"
+
+echo "T29: a finding QUOTING the failure, at spend == cap, is a verdict, not a skip"
+# Usage reads \$50/\$50 while reviews still run, so the trigger line is all that
+# separates "refused" from "reviewed adversely" -- it must not match mid-finding.
+reset25
+o=$(MODE=adverse CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+[[ $rc -eq 1 ]] && { echo "  PASS: exit 1"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 1)"; fail=$((fail+1)); }
+check "finding surfaced" "skips rotation" "$o"
+check "usage not probed" "0" "$(grep -c '^usage' "$CALLS")"
+
+echo "T30: the failure as a stdout status line or an --agent error event still earns 75"
+for m in status agent; do
+  reset25
+  o=$(MODE=$m CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+  [[ $rc -eq 75 ]] && { echo "  PASS: $m -> exit 75"; pass=$((pass+1)); } || { echo "  FAIL: $m -> exit $rc (want 75)"; fail=$((fail+1)); }
+done
+
+echo "T31: a hung 'coderabbit usage' is bounded ONCE across all probes and falls back to the CLI's own exit"
+# 3 seats + the default identity: a per-probe bound would take >= 4 x 2s.
+cat > "$SCRATCH/bin/coderabbit" <<'STUB31'
+#!/usr/bin/env bash
+[[ "${1:-}" = usage ]] && exec sleep 30
+echo "Review failed: Failed to start review. Please try again." >&2; exit 1
+STUB31
+chmod +x "$SCRATCH/bin/coderabbit"
+reset25; t0=$(date +%s)
+o=$(CR_USAGE_TIMEOUT=2 CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+el=$(( $(date +%s) - t0 ))
+[[ $rc -eq 1 ]] && { echo "  PASS: exit 1"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 1)"; fail=$((fail+1)); }
+(( el < 6 )) && { echo "  PASS: returned in ${el}s"; pass=$((pass+1)); } || { echo "  FAIL: took ${el}s"; fail=$((fail+1)); }
+
 echo; echo "RESULT: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
