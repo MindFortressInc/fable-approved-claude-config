@@ -162,7 +162,8 @@ class CodexLaneOffByDefaultTest(unittest.TestCase):
         self.assertEqual(offenders, [], "hooks that dispatch Codex: %r" % offenders)
 
     def test_deep_review_gates_the_lane_on_explicit_opt_in(self):
-        with open(os.path.join(REPO_ROOT, "commands", "deep-review.md")) as fh:
+        # The lane's detail lives in the deep-review playbook since the split.
+        with open(os.path.join(REPO_ROOT, "playbooks", "deep-review", "codex-lane.md")) as fh:
             text = fh.read()
         m = re.search(r"### Codex second-opinion lane[^\n]*\n(.*?)\n### ", text, re.S)
         self.assertIsNotNone(m, "Codex lane section not found")
@@ -174,7 +175,7 @@ class CodexLaneOffByDefaultTest(unittest.TestCase):
     def test_no_model_id_is_defaulted_anywhere(self):
         pat = re.compile(r"CODEX_REVIEW_MODEL=[\w.-]+|\bgpt-\d")
         hits = []
-        for rel in ("commands/*.md", "hooks/*", "README.md"):
+        for rel in ("commands/*.md", "playbooks/*/*.md", "hooks/*", "README.md"):
             for path in glob.glob(os.path.join(REPO_ROOT, rel)):
                 if not os.path.isfile(path):
                     continue

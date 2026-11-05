@@ -34,8 +34,10 @@ skills/executing-plans/          #    …then execute it with review checkpoints
 skills/mf-frontend-design/       # 2. BUILD — the frontend-design skill every FE surface goes through
 skills/test-driven-development/  #    build-stage discipline                     (obra/superpowers, MIT)
 skills/systematic-debugging/     #    when something breaks                      (obra/superpowers, MIT)
-commands/PRlaunch.md             # 3. SHIP — the pipeline: 7 phases, gate order, disposition rules
-commands/deep-review.md          #    Deep Review Process v7.5 — the methodology gate 1 runs
+commands/PRlaunch.md             # 3. SHIP — the pipeline: 7 phases, gate order, disposition rules; the deep-review core runs inline in §1
+commands/deep-review.md          #    Deep Review Process v7.7 — the map: which step lives in the core and which in a playbook
+playbooks/deep-review/           #    the rest of deep-review, one file per concern, each read when the core's trigger row applies
+playbooks/prlaunch/rationale.md  #    the incidents and measurements behind PRlaunch's rules (reference, not run)
 commands/wrapup.md               # 4. WRAP UP — tracker sync, GitHub sync, branch hygiene, memory, cleanup, report
 commands/babysit-prs.md          # 5. AFTER — hourly self-arming sweep of open PRs until reviews drain
 skills/babysit/                  #    the deterministic, tested classifier/planner that sweep executes (+ merge guard, worktree lease, CI re-run mode, digest)
@@ -62,6 +64,7 @@ hooks/loop-mode-arm.sh           # helper: time-box check-careful's loop-mode so
 hooks/reconcile-ticket.sh        # advance a ticket to Deployed only when EVERY linked PR is merged (multi-PR race fix)
 hooks/linear-review-gate.py      # deny moving a ticket to In Review when no PR is linked (fail-open, no-op without a key)
 hooks/ledger-append.sh           # append-one-validated-JSON-line automation ledger (fail-loud validator)
+hooks/commonly-missed.py         # OPTIONAL deep-review lens loader: pastes a shared lens file into every reviewer prompt (COMMONLY_MISSED_SOURCE)
 hooks/model-preamble.sh          # SessionStart: inject a strict process-first preamble for weaker-than-frontier models
 skills/briefs/                   # the six-section worker-brief contract every orchestrator's subagent prompt follows
 agents/opus-worker.md            # the default worker subagent every orchestrator spawns (Opus, effort high)
@@ -123,7 +126,7 @@ Each gate catches a bug class the others can't see:
 
 | Gate | Grades | Catches |
 |------|--------|---------|
-| **1. Deep review** ([deep-review.md](commands/deep-review.md), v7.5) | the **diff** | correctness, security, architecture — "will this overwrite the DB before the user accepts?" |
+| **1. Deep review** (the core inline in PRlaunch §1; [deep-review.md](commands/deep-review.md) maps the rest, v7.7) | the **diff** | correctness, security, architecture — "will this overwrite the DB before the user accepts?" |
 | **2. Secondary reviewer** (CodeRabbit CLI via [`hooks/cr-review.sh`](hooks/cr-review.sh), or similar) | the **repo** | style, nits, patterns |
 | **3. Outcome eval** | the **running product, from the user's seat** | the "basic stuff that always gets missed": raw `**markdown**` shown to users, an LLM that asks for context it already has, a spinner that never resolves, a layout broken at the real viewport |
 
@@ -144,11 +147,22 @@ With nothing configured you get Claude's deep review plus single-account CodeRab
 | **CodeRabbit seat pool** — rotate gate 2 across several CodeRabbit seats so parallel agent workers stop sharing one hourly bucket | register seats: `CR_SEAT_API_KEY=… ~/.claude/hooks/cr-seats.sh add <name>` (or pipe the key on stdin; `adopt <name>` for the current login); `CR_SEATS_DIR` to relocate the pool. Only if your CodeRabbit plan/terms allow it | `cr-review.sh` runs the CLI once under your own login, like bare `coderabbit review` |
 | **`review-gate/cr-cli` commit status** — advisory status a CI review-gate check can read | `PRLAUNCH_PUBLISH_CR_STATUS=1` | the ledger entry is the only record; no GitHub call |
 | **Codex second-opinion lane** (deep-review Step 3) — a second model family reviews the same diff read-only; its findings are claims until Claude confirms them | `CODEX_REVIEW_ENABLED=1` **and** a `codex-review.sh` wrapper installed (not shipped here yet); model via `CODEX_REVIEW_MODEL` | lane skipped; review runs exactly as before. No model id is ever defaulted — unset `CODEX_REVIEW_MODEL` means the Codex account default |
+| **Commonly-missed lens file** (deep-review Step 3) — a shared markdown list of the defect classes reviewers most often miss, pasted into every reviewer prompt | `COMMONLY_MISSED_SOURCE=<path or https:// URL>`; a URL is cached at `~/.claude/review/commonly-missed.md` for when the fetch fails | `hooks/commonly-missed.py prompt` prints nothing; the review uses its built-in lenses |
 | **Automation ledger** — durable per-unit rows a scorecard can aggregate | install `hooks/ledger-append.sh`; `LEDGER_SKILL` / `BABYSIT_LAUNCH_ID` stamp rows when exported | the PRlaunch append is a silent no-op |
 
 Gate 2's wrapper gives every caller one exit-code contract, configured or not: `0` a review ran (its findings are on stdout), `75` rate-limited — the **only** code that earns PRlaunch's authorized skip — `70` the wrapper itself failed (retry; never a skip), `71` the CLI rejected our arguments (fix the invocation; never retry it unchanged), anything else a real CodeRabbit failure. `tests/test_unconfigured_defaults.py` pins the default path: no seat pool, no status publish, nothing that dispatches Codex, no model id anywhere.
 
-### Deep Review highlights (v6.9 → v7.5)
+### Where deep review lives
+
+Gate 1's process used to be one 100KB file, more than a single plain Read loads, so most launches only ever saw its first half. It is now split by when each part runs:
+
+- **The core** — triage depth, branch alignment, the Step 1.5/1.6 mechanical passes, reviewer launch with the repo-invariant and lens loaders, the refute pass, the severity and origin tables, 5b/5e and the 5f test-vacuity check — sits inline in PRlaunch §1 between `<!-- deep-review-core:start -->` and `<!-- deep-review-core:end -->` markers, so every launch reads it. It opens with a trigger table: one row per reference file saying when to read it.
+- **The references** — `playbooks/deep-review/*.md` (reviewer prompts, mechanical passes, Codex lane, refuters and the precedent ledger, consolidation detail, validation, publish and fix, triage and branch, principles and version history). Each section moved there unchanged; they are always read from `~/.claude/playbooks/deep-review/`, never from a copy in the repo under review.
+- **The map** — `commands/deep-review.md` keeps `/deep-review` working standalone: it prints the core and lists where every step lives.
+
+v7.7 adds effort-weighted severity (a heavy-lift CRITICAL/HIGH is merge-blocking or waived with a filed ticket, never deferred), three noise-suppression publish classes, a twelfth AI-cheat detector (`workflow-trust`: an untrusted-code CI trigger on a persistent runner), a provenance step in the tenancy pass, an executed overlap run on charge/reservation/save paths (which also never take PRlaunch's outcome-eval N/A exit), and the optional lens loader above. `tests/test_deep_review_layout.py` pins that no section of the old file fell out of reach and that PRlaunch stays under one plain Read (65,200 bytes); `tests/test_prlaunch_layout.py` pins that PRlaunch's rules stay inline while their history lives in `playbooks/prlaunch/rationale.md`.
+
+### Deep Review highlights (v6.9 → v7.7)
 
 A 10-step review process with empirical validation at its core — *evidence over opinion: a finding without proof is not a finding*. Notable machinery:
 
@@ -166,6 +180,8 @@ A 10-step review process with empirical validation at its core — *evidence ove
 - **AI-cheat pass + changed-surface enumeration** (v7.2–v7.3): eleven mechanical detectors for diffs that fake success (swallowed errors, relaxed assertions, mocks of things that don't exist, …) and a caller sweep for renamed/retyped symbols
 - **Ticket compliance** (v7.4): when a ticket resolves, an agent checks the diff against every requirement in it and flags scope drift
 - **Optional Codex second opinion** (v7.5, off by default): disagreement between model families is signal, not a verdict — Codex-only findings must pass the same evidence check before they can be published
+- **Effort-weighted severity** (v7.7): fix rates track cost-to-fix, not importance, so a heavy-lift CRITICAL/HIGH must be blocked or waived with a filed ticket — the deliberately counterintuitive half of the severity table
+- **Trust provenance and overlap runs** (v7.7): the tenancy pass asks where each scope value came from, a `workflow-trust` detector flags untrusted CI triggers on persistent runners, and charge/reservation/save paths get an executed two-request overlap run
 
 ## 4. Wrap up
 
@@ -290,6 +306,13 @@ The effect compounds: deploy gotchas, reviewer false-positive lists, infra quirk
    ```bash
    mkdir -p ~/.claude/skills
    cp -R skills/* ~/.claude/skills/
+   ```
+
+   And the playbooks the commands read on demand (the deep-review references and PRlaunch's rationale):
+
+   ```bash
+   mkdir -p ~/.claude/playbooks
+   cp -R playbooks/* ~/.claude/playbooks/
    ```
 
    And the worker agent the orchestrator skills spawn (`subagent_type: "opus-worker"`):
