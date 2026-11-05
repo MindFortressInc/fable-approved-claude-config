@@ -99,8 +99,10 @@ if argv[0] == "search":
 elif argv[0] == "api":
     endpoint = argv[1] if len(argv) > 1 else ""
     if endpoint == "graphql" and any("viewer{pullRequests" in a for a in argv):
-        # The PR-store cross-check behind an empty discovery search.
-        emit("graphql_viewer_prs.json")
+        # The PR-store cross-check behind an empty discovery search; a later
+        # page is keyed by its `-f after=<cursor>`.
+        after = [a.split("=", 1)[1] for a in argv if a.startswith("after=")]
+        emit("graphql_viewer_prs%s.json" % ("_" + after[0] if after else ""))
     if endpoint == "graphql":
         f = dict(a.split("=", 1) for a in argv[2:] if "=" in a)
         emit("graphql_threads_%s_%s_%s.json" % (f.get("o", ""), f.get("r", ""), f.get("n", "")))
@@ -136,6 +138,14 @@ def _w(path, obj):
 
 def default_head(num):
     return ("%07d" % num) + "abcdef" + "0" * 27
+
+
+def viewer_page(nwos, cursor=None):
+    """One GraphQL `viewer.pullRequests` page; `cursor` = more pages follow."""
+    return {"data": {"viewer": {"pullRequests": {
+        "pageInfo": {"hasNextPage": bool(cursor), "endCursor": cursor},
+        "nodes": [{"repository": {"name": n.partition("/")[2], "nameWithOwner": n}}
+                  for n in nwos]}}}}
 
 
 class Fixtures:
@@ -185,9 +195,8 @@ class Fixtures:
         _w(self._f("search_merged.json"), [])
         # The PR store an empty search is cross-checked against. Mirrors
         # search_open -- a healthy GitHub, where the two backends agree.
-        _w(self._f("graphql_viewer_prs.json"), {"data": {"viewer": {
-            "pullRequests": {"totalCount": len(self.search_open), "nodes": [
-                {"repository": p["repository"]} for p in self.search_open]}}}})
+        _w(self._f("graphql_viewer_prs.json"), viewer_page(
+            [p["repository"]["nameWithOwner"] for p in self.search_open]))
 
 
 def cr_issue(body, at, login=CR):
@@ -1127,13 +1136,9 @@ class EmptySearchCrossCheckTests(SweepCase):
         Fixtures(self.fx).finalize()        # search_open.json == []
         _w(self.state, {"pending_count": 3, "no_progress_streak": 0})
 
-    def _viewer(self, nwos, total=None):
-        _w(os.path.join(self.fx, "graphql_viewer_prs.json"), {
-            "data": {"viewer": {"pullRequests": {
-                "totalCount": len(nwos) if total is None else total,
-                "nodes": [{"repository": {"name": n.partition("/")[2],
-                                          "nameWithOwner": n}}
-                          for n in nwos]}}}})
+    def _viewer(self, nwos, cursor=None, after=None):
+        name = "graphql_viewer_prs%s.json" % ("_" + after if after else "")
+        _w(os.path.join(self.fx, name), viewer_page(nwos, cursor))
 
     def test_empty_search_while_the_pr_store_has_rows_is_not_drained(self):
         self._viewer([f"{OWNER}/acme-api"])
@@ -1155,9 +1160,28 @@ class EmptySearchCrossCheckTests(SweepCase):
         self.assertEqual(out.get("error"), "search_fetch_fail")
         self.assertNotEqual(out["decision"], "DRAINED")
 
-    def test_a_truncated_page_cannot_prove_absence(self):
-        self._viewer(["someone-else/repo"], total=150)
+    def test_a_page_that_fails_to_load_cannot_prove_absence(self):
+        self._viewer(["someone-else/repo"], cursor="c1")    # no page c1 fixture
         self.assertEqual(run_sweep(self.fx, self.state).get("error"), "search_fetch_fail")
+
+    def test_later_pages_are_walked_so_many_prs_elsewhere_still_drain(self):
+        """More than one page of open PRs in OTHER owners: the walk must reach
+        the end, not stop at page one and call it unverified forever."""
+        self._viewer(["other-org/a"] * 100, cursor="c1")
+        self._viewer(["other-org/b"] * 100, cursor="c2", after="c1")
+        self._viewer(["other-org/c"], after="c2")
+        self.assertEqual(run_sweep(self.fx, self.state)["decision"], "DRAINED")
+
+    def test_a_pr_on_a_later_page_blocks_the_drain(self):
+        self._viewer(["other-org/a"] * 100, cursor="c1")
+        self._viewer([f"{OWNER}/acme-api"], after="c1")
+        self.assertEqual(run_sweep(self.fx, self.state).get("error"), "search_fetch_fail")
+
+    def test_a_walk_past_the_page_cap_is_unverified(self):
+        with mock.patch.object(bc, "gh_json",
+                               return_value=viewer_page(["other-org/a"], "again")) as g:
+            self.assertFalse(bc.empty_search_confirmed("gh", OWNER))
+        self.assertEqual(g.call_count, bc.VIEWER_OPEN_PRS_MAX_PAGES)
 
     def test_prs_outside_the_swept_owner_do_not_block_a_drain(self):
         self._viewer(["other-org/tool"])
@@ -1172,20 +1196,21 @@ class EmptySearchCrossCheckTests(SweepCase):
 
     def test_an_unreadable_pr_store_answer_is_unverified(self):
         """In-process: shapes the function cannot read never confirm a drain."""
-        def viewer(nodes, total):
-            return {"data": {"viewer": {"pullRequests": {"totalCount": total,
-                                                         "nodes": nodes}}}}
+        def viewer(nodes, more=False, cursor=None):
+            return {"data": {"viewer": {"pullRequests": {
+                "pageInfo": {"hasNextPage": more, "endCursor": cursor}, "nodes": nodes}}}}
         ok = {"repository": {"name": "x", "nameWithOwner": "other/x"}}
         for name, payload, owner in (
-                ("non-dict node", viewer(["junk"], 1), OWNER),
-                ("null node", viewer([None], 1), OWNER),
-                ("non-dict repository", viewer([{"repository": "x"}], 1), OWNER),
-                ("bool total", viewer([], True), OWNER),
-                ("negative total", viewer([], -1), OWNER),
-                ("no owner", viewer([ok], 1), "")):
+                ("non-dict node", viewer(["junk"]), OWNER),
+                ("null node", viewer([None]), OWNER),
+                ("non-dict repository", viewer([{"repository": "x"}]), OWNER),
+                ("no pageInfo", {"data": {"viewer": {"pullRequests": {"nodes": [ok]}}}}, OWNER),
+                ("non-bool hasNextPage", viewer([ok], more="no"), OWNER),
+                ("more pages, no cursor", viewer([ok], more=True), OWNER),
+                ("no owner", viewer([ok]), "")):
             with self.subTest(name), mock.patch.object(bc, "gh_json", return_value=payload):
                 self.assertFalse(bc.empty_search_confirmed("gh", owner), name)
-        with mock.patch.object(bc, "gh_json", return_value=viewer([ok], 1)):
+        with mock.patch.object(bc, "gh_json", return_value=viewer([ok])):
             self.assertTrue(bc.empty_search_confirmed("gh", OWNER), "control")
 
     def test_a_non_empty_search_never_spends_the_cross_check(self):

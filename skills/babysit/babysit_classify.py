@@ -2248,9 +2248,11 @@ def should_skip(pr):
 
 
 VIEWER_OPEN_PRS_QUERY = (
-    "{viewer{pullRequests(states:OPEN,first:100,"
+    "query($after:String){viewer{pullRequests(states:OPEN,first:100,after:$after,"
     "orderBy:{field:UPDATED_AT,direction:DESC})"
-    "{totalCount nodes{repository{name nameWithOwner}}}}}")
+    "{pageInfo{hasNextPage endCursor} nodes{repository{name nameWithOwner}}}}}")
+# Pages walked before giving up as unverified: 2,000 open PRs.
+VIEWER_OPEN_PRS_MAX_PAGES = 20
 
 
 def empty_search_confirmed(gh_bin, owner, repos_filter=""):
@@ -2261,38 +2263,50 @@ def empty_search_confirmed(gh_bin, owner, repos_filter=""):
     cannot tell from a genuinely empty queue -- and an empty queue is what
     `decide()` turns into DRAINED, two of which in a row stop a `/loop`.
     GraphQL `viewer.pullRequests` reads the PR store directly, so it is the
-    cross-check: one call, no repo inventory to remember.
+    cross-check: no repo inventory to remember. It lists your open PRs in
+    EVERY owner, so it is paged (stopping at the first PR under `owner`):
+    one page alone left anyone with more than 100 open PRs elsewhere unable
+    to ever drain.
 
-    True only when that lookup SUCCEEDS and shows no open PR of yours under
-    `owner` (and in --repos, if given). A failed lookup is unverified, and a
-    page that does not cover totalCount cannot prove absence: both are False,
-    never a DRAINED."""
-    d = gh_json(gh_bin, ["api", "graphql", "-f",
-                         "query=" + VIEWER_OPEN_PRS_QUERY])
-    try:
-        conn = d["data"]["viewer"]["pullRequests"]
-        if isinstance(conn["totalCount"], bool):
-            return False
-        total = int(conn["totalCount"])
-        nodes = list(conn["nodes"] or [])
-    except (TypeError, KeyError, ValueError):
-        return False
+    True only when every page loads and shows no open PR of yours under
+    `owner` (and in --repos, if given). A failed or unreadable page, or a walk
+    longer than VIEWER_OPEN_PRS_MAX_PAGES, is unverified: False, never a
+    DRAINED."""
     if not owner:
         return False
     want = {r.strip().lower() for r in (repos_filter or "").split(",")
             if r.strip()}
-    for n in nodes:
-        # A node this function cannot read is a PR it cannot rule out.
-        repo = n.get("repository") if isinstance(n, dict) else None
-        if not isinstance(repo, dict):
+    after = None
+    for _ in range(VIEWER_OPEN_PRS_MAX_PAGES):
+        args = ["api", "graphql", "-f", "query=" + VIEWER_OPEN_PRS_QUERY]
+        if after:
+            args += ["-f", "after=" + after]
+        d = gh_json(gh_bin, args)
+        try:
+            conn = d["data"]["viewer"]["pullRequests"]
+            nodes = list(conn["nodes"] or [])
+            more = conn["pageInfo"]["hasNextPage"]
+            after = conn["pageInfo"]["endCursor"]
+        except (TypeError, KeyError, ValueError):
             return False
-        nwo = (repo.get("nameWithOwner") or "").lower()
-        if nwo.partition("/")[0] != owner.lower():
-            continue
-        if want and (repo.get("name") or "").lower() not in want:
-            continue
-        return False
-    return total >= 0 and len(nodes) >= total
+        if not isinstance(more, bool):
+            return False
+        for n in nodes:
+            # A node this function cannot read is a PR it cannot rule out.
+            repo = n.get("repository") if isinstance(n, dict) else None
+            if not isinstance(repo, dict):
+                return False
+            nwo = (repo.get("nameWithOwner") or "").lower()
+            if nwo.partition("/")[0] != owner.lower():
+                continue
+            if want and (repo.get("name") or "").lower() not in want:
+                continue
+            return False
+        if not more:
+            return True
+        if not isinstance(after, str) or not after:
+            return False
+    return False
 
 
 # ============================================================================
