@@ -14,6 +14,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -376,12 +378,44 @@ class UrlSourceTest(unittest.TestCase):
         rc, out, _ = self.run_main("prompt", self.fails(urllib.error.URLError("dns")))
         self.assertIn("Source: `cached copy of %s from " % URL, out)
 
-    def test_a_slow_fetch_hits_the_overall_deadline(self):
-        clock = iter([0, 0, self.mod.TIMEOUT + 1])
-        with mock.patch.object(self.mod.time, "monotonic", lambda: next(clock)):
-            rc, out, err = self.run_main("prompt", self.serves(FIXTURE))
+    def test_a_slow_drip_server_hits_the_overall_deadline(self):
+        # One read() that never completes inside the deadline: the shape of a
+        # server dripping a byte just under every socket timeout.
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class _Drip(_Resp):
+            def read(self, *args):
+                release.wait(10)
+                return super().read(*args)
+
+        start = time.monotonic()
+        with mock.patch.object(self.mod, "TIMEOUT", 0.2):
+            rc, out, err = self.run_main("prompt", lambda url: _Drip(FIXTURE.encode("utf-8")))
+        self.assertLess(time.monotonic() - start, 5)
         self.assertEqual((rc, out), (0, ""))
         self.assertIn("timed out", err)
+
+    def test_a_slow_open_hits_the_overall_deadline(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def _slow_open(url):
+            release.wait(10)
+            return _Resp(FIXTURE.encode("utf-8"))
+
+        start = time.monotonic()
+        with mock.patch.object(self.mod, "TIMEOUT", 0.2):
+            rc, out, err = self.run_main("prompt", _slow_open)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("timed out", err)
+
+    def test_an_oversized_body_is_refused(self):
+        big = FIXTURE + "x" * (2 * 1024 * 1024)
+        rc, out, err = self.run_main("prompt", self.serves(big))
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("over", err)
 
     def test_an_unexpected_error_never_blocks_the_review(self):
         rc, out, err = self.run_main("prompt", self.fails(RuntimeError("boom")))

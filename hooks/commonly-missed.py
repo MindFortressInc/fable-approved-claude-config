@@ -36,7 +36,7 @@ import http.client
 import os
 import re
 import sys
-import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,7 +46,6 @@ INVARIANTS = "## Generic Review Invariants"
 CLASSES = "## Commonly Missed"
 TIMEOUT = 30          # whole fetch, not per socket read
 MAX_BYTES = 2 * 1024 * 1024
-CHUNK = 64 * 1024
 
 PREAMBLE = """\
 > "Check the diff against each Generic Review Invariant and each numbered
@@ -126,6 +125,19 @@ def _open(url):
     return urllib.request.build_opener(_HttpsOnlyRedirects).open(url, timeout=TIMEOUT)
 
 
+def _download(url):
+    """(body, None) or (None, reason): the network half of `_fetch`."""
+    try:
+        with _open(url) as resp:
+            if not resp.geturl().lower().startswith("https://"):
+                return None, "the fetch left https"
+            return resp.read(MAX_BYTES + 1), None
+    except urllib.error.HTTPError as exc:
+        return None, "fetch failed (HTTP %d)" % exc.code
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+        return None, "fetch failed (%s)" % type(exc).__name__
+
+
 def _fetch(url):
     """(text, None) or (None, a short fixed reason).
 
@@ -142,25 +154,28 @@ def _fetch(url):
         return None, "the URL does not parse"
     if has_userinfo:
         return None, "a URL with credentials in it is refused"
-    deadline = time.monotonic() + TIMEOUT
-    try:
-        with _open(url) as resp:
-            if not resp.geturl().lower().startswith("https://"):
-                return None, "the fetch left https"
-            chunks, size = [], 0
-            while size <= MAX_BYTES:
-                if time.monotonic() > deadline:
-                    return None, "fetch timed out after %ds" % TIMEOUT
-                chunk = resp.read(CHUNK)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-            body = b"".join(chunks)
-    except urllib.error.HTTPError as exc:
-        return None, "fetch failed (HTTP %d)" % exc.code
-    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
-        return None, "fetch failed (%s)" % type(exc).__name__
+    # The socket timeout bounds each read, not the fetch: a server dripping a
+    # byte just under it keeps one read (or the headers) going indefinitely.
+    # So the whole open-and-read runs on a daemon thread joined with TIMEOUT;
+    # a fetch still running then is abandoned and dies with the process.
+    box = []
+
+    def run():
+        try:
+            box.append(_download(url))
+        except Exception as exc:
+            box.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(TIMEOUT)
+    if not box:
+        return None, "fetch timed out after %ds" % TIMEOUT
+    if isinstance(box[0], Exception):
+        raise box[0]
+    body, err = box[0]
+    if err:
+        return None, err
     if len(body) > MAX_BYTES:
         return None, "fetched file is over %d bytes" % MAX_BYTES
     try:
