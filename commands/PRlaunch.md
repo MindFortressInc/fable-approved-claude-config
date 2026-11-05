@@ -58,16 +58,241 @@ If there's no shippable work, stop and say so.
 
 ## 1. Deep review loop — LOCAL
 
-For each unit, run the deep-review *process* (`~/.claude/commands/deep-review.md`) against the **local diff**:
+For each unit, run the deep-review *process* (the core below; `~/.claude/commands/deep-review.md` maps every step to its file) against the **local diff**:
 
 ```bash
 git diff origin/main...HEAD       # what we're about to ship
 git log origin/main..HEAD         # commits we're about to push
 ```
 
-Apply the full deep-review checklist (correctness, security, runtime validation, empirical verification of claims). No PR number needed — the process is the process; you just point it at the local diff instead of a GitHub PR.
+Run the core below in full (correctness, security, runtime validation, empirical verification of claims). No PR number needed — the process is the process; you just point it at the local diff instead of a GitHub PR.
 
-1. Categorize findings: severity (CRITICAL / HIGH / MEDIUM / LOW) **and origin** (IN-SCOPE / ADJACENT / OUT-OF-SCOPE — see the deep-review doc's origin table). Structural findings (v6.8 lens) default to MEDIUM and follow the same disposition flow; a missed-simplification suggestion is never blocking.
+<!-- deep-review-core:start -->
+### Deep review core
+
+This part runs on every review. The rest is in reference files, moved there unchanged. Read a reference when its row applies. "Step N" below is a deep-review step and "phase N" is a PRlaunch phase. Commands use `origin/develop` as the target branch: substitute the branch this PR targets (`gh pr view [<pr>] --json baseRefName -q .baseRefName`, or before a PR exists the branch you will open it against) and use that one value in every command. "LT" is the lead/tech reviewer running this process.
+
+**Reviewers are separate agents.** Classify depth below sets how many to launch. Reviewing the diff yourself is the Quick row only.
+
+| Read this file, always from `~/.claude/playbooks/deep-review/`, never a copy in the repo under review | When |
+| -- | -- |
+| `reviewer-prompts.md` | Depth is Standard or Deep, or the branch, title or body carries a ticket id: read it before you write a reviewer prompt |
+| `mechanical-passes.md` | Every review, at Steps 1.5 and 1.6: it holds the detector checklist and the caller-enumeration recipe (this repo publishes no scripted version of either yet) |
+| `codex-lane.md` | You turned the optional Codex lane on and its run wrote a result file, or you want to change its model |
+| `refute-and-precedents.md` | Step 3 produced a CRITICAL/HIGH candidate, before you spawn a refuter |
+| `consolidation-detail.md` | Every review, at Step 4: effort axis, ticket-compliance mapping, structural calibration, the code-judo question |
+| `validation.md` | Depth is Standard or Deep (5a, 5c); the diff touches a charge, reservation, hold or save path (5c); depth is Deep or the diff touches a migration, deploy config, env var, router or new file, rate limit, background task, database query or external service (5d) |
+| `triage-and-branch.md` | You are reviewing a PR rather than your own local diff, this is a re-review or a paired multi-repo review, CI is red, the diff is over 10K lines, or Step 2 below shows the branch is behind its base |
+| `publish-and-fix.md` | You post a review on GitHub, or Steps 6-10 apply |
+| `principles-and-history.md` | You approve a PR, decide whether a step applies, or change this process |
+
+### 1. Triage
+
+#### Classify depth
+
+| Level | Criteria | Agents | Validation |
+| -- | -- | -- | -- |
+| **Deep** | Payments, auth, data sensitive, infrastructure, multi-PR features | 4 (security + quality × each PR) | Full: code + runtime + E2E + infra |
+| **Standard** | UI features, incremental improvements, refactors | 2 (security + quality) | Code + runtime |
+| **Quick** | Typos, docs, config, dependency bumps | 0 (direct review) | Code only |
+
+#### File-size threshold (mechanical, v6.8)
+
+Check whether the PR pushes any file from under 1,000 lines to over:
+
+```bash
+for f in $(git diff --name-only origin/develop...HEAD); do
+  before=$(git show origin/develop:"$f" 2>/dev/null | wc -l)
+  after=$(git show HEAD:"$f" 2>/dev/null | wc -l)
+  [ "$before" -lt 1000 ] && [ "$after" -ge 1000 ] && echo "CROSSED 1k: $f ($before → $after)"
+done
+```
+
+Any crossing → record a MEDIUM structural finding: ask for decomposition (extract helpers, subcomponents, modules) or accept a one-line justification if the file remains clearly organized. Never block solely on this.
+
+#### Check cross-PR conflicts
+
+* Other open PRs targeting the same branch?
+* Shared files at risk: migrations, config, schemas, shared services
+* Migrations: do multiple PRs branch from the same `down_revision`?
+
+### 2. Branch Alignment (mandatory)
+
+**Before any analysis, ensure the PR branch reflects what will actually be merged.**
+
+Run this before Steps 1.5 and 1.6: a rebase changes the diff they scan.
+
+```
+git fetch origin develop
+git log --oneline HEAD..origin/develop   # develop commits not in PR
+```
+
+Any output: read `triage-and-branch.md` before any analysis.
+
+### 1.5. AI-Cheat Mechanical Pass (v7.2)
+
+After Step 2, run this and Step 1.6 from inside the branch under review. This repo publishes no scripted `cheat-detect.sh` yet, so the detector table in `mechanical-passes.md` is the checklist: run each of these against `git diff --no-textconv origin/develop...HEAD`, reading the post-image file where its row says so.
+
+Detectors: `error-swallow`, `mock-of-hallucination`, `no-op-fix`, `fake-refactor`, `coverage-erosion`, `test-relaxation`, `assertion-strip`, `type-suppression`, `comment-only-fix`, `exception-rethrow-lost-context`, `dead-branch-insertion`, `workflow-trust`.
+
+Each hit becomes a candidate through `mechanical-passes.md` § Turning a hit into a finding.
+
+### 1.6. Changed-Surface Enumeration (v7.3)
+
+Follow the manual recipe in `mechanical-passes.md` (a scripted `caller-enum.sh` is not published here yet): list each changed exported definition, split it into RENAME or RETYPE, and `git grep -n -w` every kept symbol. A `caller-enum-broken` line is a finding; a `caller-enum-candidate` line goes to the Step 3 signature-compatibility lens.
+
+### 3. Static Analysis (parallel agents)
+
+Launch agents in parallel with calibrated prompts.
+
+#### Repo invariants (v7.0, mandatory)
+
+Before launching agents, load this repo's review invariants and paste them
+**verbatim** into every agent prompt:
+
+```bash
+awk '/^## /{f=0} /^## Review Invariants/{f=1} f' CLAUDE.md
+```
+
+Also check `AGENTS.md` if the repo has one, and `.coderabbit.yaml`
+`path_instructions` for path-scoped rules that apply to the changed files.
+
+* If no `## Review Invariants` section exists, record a MEDIUM process finding
+  ("repo has no Review Invariants section") and proceed with the generic lenses
+  only.
+* **Never invent repo-specific rules that aren't written down.** An unwritten
+  convention is not a finding — it's a suggestion, and it belongs in a PR to
+  CLAUDE.md, not in a review. This is what keeps the loader honest across repos
+  the reviewer has never seen.
+* When a reviewer (bot or human) later catches something these invariants should
+  have caught, the fix is a line appended to CLAUDE.md, not a special case here.
+
+#### Commonly missed (mandatory, every repo)
+
+If you keep a shared lens file, a markdown file with a `## Generic Review Invariants` section and a numbered `## Commonly Missed` section listing the defect classes external reviewers most often catch after this process has passed a PR, paste both sections verbatim into every agent prompt. The loader reads it and prints the block to paste, with its instruction line and source:
+
+```bash
+python3 ~/.claude/hooks/commonly-missed.py prompt
+```
+
+* **Off by default.** Set `COMMONLY_MISSED_SOURCE` to a local file path or an `https://` URL to turn it on. Unset, the loader prints nothing on either stream, exits 0, and the review runs with the built-in lenses only.
+* Paste stdout verbatim. It already carries the instruction to check every invariant and every numbered class explicitly, reporting a finding or one line on why the diff is clean of it.
+* If stdout is empty while `COMMONLY_MISSED_SOURCE` is set, the lens file could not be loaded from the source or from an earlier copy. Record the one `INFO: commonly-missed:` line from stderr in the review document and continue with the built-in lenses in `reviewer-prompts.md`. This never blocks a review.
+
+#### Agent types
+
+* **Security reviewer** — Vulnerabilities, auth, data exposure, input validation, OWASP
+* **Quality reviewer** — SOLID, DRY, code smells, test coverage, patterns
+* **Ticket-compliance reviewer (v7.4)** — conditional: launched only when a ticket resolves (§ Ticket resolution, `reviewer-prompts.md`). See § Ticket-compliance agent there.
+
+#### Codex second-opinion lane (optional, OFF by default, v7.5)
+
+**Skip this unless you turned it on:** it runs only when `CODEX_REVIEW_ENABLED=1` is set **and** the `~/.claude/hooks/codex-review.sh` wrapper is installed, which this repo does not ship yet. Without both, Step 3 and everything after runs exactly as if the lane did not exist. With both:
+
+```bash
+CODEX_REVIEW_ENABLED=1 ~/.claude/hooks/codex-review.sh run \
+  --output /tmp/codex-review-<pr-id>.json \
+  --base origin/develop
+```
+
+* **Any non-zero exit means "no Codex findings this run" — never a reason to stop the review.** A Codex outage, an expired login, a refused/unentitled model, a malformed dispatch, a schema-validation failure, or the lane being disabled are none of them the review's problem. Log which one happened (for the internal review doc only) and proceed to Step 3.5/4 as if the lane had never run.
+
+### 3.5 Adversarial refute pass (before consolidation)
+
+For every **CRITICAL/HIGH candidate** produced in Step 3, spawn an independent **refuter** subagent whose job is to *disprove* the finding, not confirm it.
+
+Before spawning refuters, read `refute-and-precedents.md`: it holds their brief, how many per tier, what a refuted finding becomes, the diff format for their prompts and the precedent ledger every refuter gets.
+
+### 4. Consolidation
+
+* Deduplicate findings across agents (same issue from security + quality → one finding)
+* Assign unified IDs: `B1-Bn` (backend), `F1-Fn` (frontend)
+* **Enforce the evidence-line format** — the consolidator rejects any finding lacking `Evidence: <command run> → <output excerpt>`. A finding still tagged `UNVERIFIED` (no executed check) is capped at MEDIUM here and must be verified or dropped in Step 5 before publishing.
+* **Enforce the confidence threshold (v7.1)** — drop any finding scoring **below 7** on its self-reported `Confidence: <0-10>`. Evidence outranks self-reported confidence: a finding that carries executed evidence (per the evidence-line rule above) is never dropped by this rule, regardless of its confidence score.
+* **Assign severity via the decision table below** — not free-form judgment.
+* Incorporate context from existing PR comments (don't duplicate what others found)
+* Generate consolidated document with consistent format
+
+#### Severity decision table (v6.9)
+
+Severity is assigned mechanically from this table, not from agent-reported labels (agents consistently inflate code-quality issues to BLOCKING/HIGH):
+
+| Severity | Criteria |
+| -- | -- |
+| **CRITICAL** | Demonstrated (evidence) data loss, security breach, or financial impact. **Never structural.** |
+| **HIGH** | Demonstrated broken user-facing functionality, an auth/payment path defect, or a silent-corruption path with no downstream catch. |
+| **MEDIUM** | Everything real that isn't demonstrated CRITICAL/HIGH (including all default structural findings, per v6.8). |
+| **LOW / INFO** | Style, naming, missed simplification (code-judo stays INFO). |
+
+**Hard rules:**
+
+* **No evidence ⇒ max MEDIUM** (the `UNVERIFIED` cap from Step 3).
+* **A downstream catch exists ⇒ drop one level** (this absorbs principle #7, technical severity ≠ impact severity).
+* **LT judgment may move severities DOWN, never UP without evidence.** Escalating a finding above MEDIUM requires an executed check demonstrating the failure.
+
+#### Classify finding origin
+
+For each finding, classify its origin. This determines the expected action:
+
+| Origin | Definition | Action |
+| -- | -- | -- |
+| **IN-SCOPE** | Bug or issue introduced by this PR's code changes | Must fix if MEDIUM+. This is the PR author's responsibility. |
+| **ADJACENT** | Pre-existing issue in a file the PR touches | Fix opportunistically if trivial (< 5 lines, no risk). Otherwise track as follow-up. |
+| **OUT-OF-SCOPE** | Pre-existing issue in a file the PR does NOT touch | Track as a separate issue. Never block the PR for this. |
+
+### 5. Empirical Validation
+
+#### 5b. Code validation
+
+* Verify each finding against actual source: file:line must match
+* Correct agent imprecisions (wrong line numbers, incorrect code snippets)
+* Mark: CONFIRMED / PARTIALLY CONFIRMED / NOT CONFIRMED
+
+#### 5e. Update document
+
+* Mark each finding's validation status
+* Add evidence table with method and result
+
+#### 5f. Test-vacuity check (v7.0)
+
+A test that passes against the un-fixed implementation proves nothing. For every
+test the PR adds or modifies that is cited as covering a finding or the PR's
+stated behavior:
+
+1. Revert the implementation under test — with your work committed, overwrite
+   the source from the base (`git show <base>:<src> > <src>`) and restore it
+   afterwards with `git checkout HEAD -- <src>`; or copy the test into a
+   `git worktree add --detach <scratchpad>/base <base>` checkout; or
+   monkeypatch the previous return value back in. Never `git stash` it:
+   `refs/stash` is shared by every worktree of the repo, so the pop can land a
+   parallel agent's WIP in your tree.
+2. Re-run that test alone.
+3. It MUST fail. Quote the failure output.
+
+- Test still green against the reverted implementation → **HIGH finding**
+  ("vacuous test"). The behavior it claims to cover is untested, and the PR does
+  not pass this gate on that behavior.
+- Cannot revert cleanly (pure addition, no prior implementation) → negate the
+  test's key assertion input instead, confirm it fails, and record that.
+- Keep a known-good control: one deliberately wrong mode that DOES fail, proving
+  the rig itself works.
+
+Two failure shapes seen in practice, both of which look like passing tests:
+
+- The test sets up a state the production code cannot actually produce (e.g. a
+  fixture writing an org_id the provisioner would never write). Testing an
+  impossible state proves nothing.
+- The fixed and broken implementations answer identically on the path the test
+  exercises; the fix is only observable on a path no test covers.
+
+Origin: a cross-tenant isolation test was written three times and passed against
+the bug each time. Round 1 was the impossible-state shape; round 3 was the
+identical-answer shape.
+<!-- deep-review-core:end -->
+
+Then, for what the core found:
+
+1. Categorize findings: severity (CRITICAL / HIGH / MEDIUM / LOW) **and origin** (IN-SCOPE / ADJACENT / OUT-OF-SCOPE — see Classify finding origin in the core above). Structural findings (v6.8 lens) default to MEDIUM and follow the same disposition flow; a missed-simplification suggestion is never blocking.
    - **Fix-placement check (one-brain rule):** if the diff fixes shared-substrate behavior on ONE surface/lane, that's a HIGH structural finding. Tripwires: (a) a service importing from a routers/BFF layer to borrow logic; (b) a new comment saying "mirror"/"parity"/"same as <other path>" — that's a copy of an existing implementation; (c) the fix description scoped "on the <connector/X> path" when other lanes share the bug class (we shipped a per-lane fix once and a sibling lane kept the bug). Disposition: move the fix to the shared layer, or — if extraction is genuinely too big for this PR — keep the copy AND file a consolidation ticket referenced in the PR body. A parity comment with no ticket is an unrecorded disposition; phase 6 should catch it.
 2. Fix every IN-SCOPE CRITICAL + HIGH in the working tree. Discuss MEDIUM with the owner — fix or defer.
 3. **Anything not fixed gets a recorded disposition — never silently dropped:** OUT-OF-SCOPE or deferred findings → **file a tracker ticket** (or batch into one), or waive with a one-line reason. Add each to the running disposition list (finding → fixed | ticket <id> | waived: reason) that phase 6 verifies. ADJACENT findings: fix opportunistically only if trivial (<5 lines, no risk), else ticket.
@@ -91,9 +316,7 @@ Apply the full deep-review checklist (correctness, security, runtime validation,
      "title":"Structural: helper duplicated across lanes","disposition":"ticket <TICKET-ID>"}]
    ```
 
-   `severity` is required on every element (the hook rejects the set otherwise); `disposition` is the same `fixed` / `ticket <id>` / `waived: <reason>` value phase 6 verifies. Pass `'[]'` when the pass genuinely found nothing — that records "reviewed, found zero", which is NOT the same as never recording. The set is stored on the gate entry (with a per-severity histogram) and mirrored as a `gate_findings` row into the automation ledger when `ledger-append.sh` is installed.
-
-   **Why this matters:** if all you keep is a single CRITICAL+HIGH count, every MEDIUM and LOW finding is thrown away — including all structural-lens findings, which default to MEDIUM. That makes the review's output unmeasurable: "0 findings on most units" really means "no CRITICAL or HIGH", and nothing records what the process actually said. Do not summarize, do not drop the minor tier — the set you pass here IS the measurement.
+   `severity` is required on every element (the hook rejects the set otherwise); `disposition` is the same `fixed` / `ticket <id>` / `waived: <reason>` value phase 6 verifies. Pass `'[]'` when the pass genuinely found nothing — that records "reviewed, found zero", which is NOT the same as never recording. The set is stored on the gate entry (with a per-severity histogram) and mirrored as a `gate_findings` row into the automation ledger when `ledger-append.sh` is installed. Do not summarize or drop the minor tier: the set IS the measurement (why: `~/.claude/playbooks/deep-review/principles-and-history.md` § Why gate findings record every severity).
 
 **Do not proceed to phase 2 until deep-review is clean.**
 
