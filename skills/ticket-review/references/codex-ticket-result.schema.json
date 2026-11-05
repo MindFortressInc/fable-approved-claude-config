@@ -9,7 +9,7 @@
         "type": "object",
         "properties": {
           "ticket": {"type": "string"},
-          "verdict": {"type": "string"},
+          "verdict": {"type": "string", "enum": ["agree", "revise", "superseded", "uncertain"]},
           "conclusion": {"type": "string"},
           "evidence": {
             "type": "array",

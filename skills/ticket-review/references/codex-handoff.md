@@ -41,7 +41,7 @@ Requested outcome: review this epic's proposed tickets against code and the epic
 <<<END TICKET>>>
 ```
 
-Complete TASK, CONSTRAINTS, RETURN CONTRACT, VERIFICATION REQUIREMENT and STOP CONDITIONS from [the reviewer contract](reviewer-contract.md). Restrict output to the assigned targets; parent/context IDs get no per-ticket verdict. Paste the literal repo invariants and checked references: Codex does not inherit Claude's context. The receiver must not infer new scope from the project name or invoke this skill recursively.
+Complete TASK, CONSTRAINTS, RETURN CONTRACT, VERIFICATION REQUIREMENT and STOP CONDITIONS from [the reviewer contract](reviewer-contract.md). In Codex mode the RETURN CONTRACT is the result schema: every field is required, and an empty string `""` stands in for each `null` the reviewer contract shows (the orchestrator normalizes it back). Restrict output to the assigned targets; parent/context IDs get no per-ticket verdict. Paste the literal repo invariants and checked references: Codex does not inherit Claude's context. The receiver must not infer new scope from the project name or invoke this skill recursively.
 
 Use the **briefs** strictly read-only Git constraint, verbatim. Tell Codex to use `python3`, never plain `python`, for anything it runs itself.
 
@@ -53,9 +53,10 @@ Codex runs with no tracker or memory access of its own, so Claude does all disco
 2. Dispatch plain `codex exec` per lane — read-only is not a knob, and the `review` subcommand ignores `--output-schema`:
 
    ```bash
-   MODEL_FLAG=()   # an array: zsh does not word-split, so a string "-m x" would arrive as one argument
+   MODEL_FLAG=()   # an array: zsh does not word-split, so a string "-m x" would arrive as one argument;
+                  # the ${…+…} form keeps an empty array safe under bash 3.2 `set -u`
    [ -n "${CODEX_REVIEW_MODEL:-}" ] && MODEL_FLAG=(-m "$CODEX_REVIEW_MODEL")
-   codex exec -s read-only -C /absolute/repo "${MODEL_FLAG[@]}" \
+   codex exec -s read-only -C /absolute/repo ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} \
      --output-schema "$HOME/.claude/skills/ticket-review/references/codex-ticket-result.schema.json" \
      -o "$REVIEW_RUN/codex/r1_result.json" \
      - < "$REVIEW_RUN/briefs/r1_brief.txt" > "$REVIEW_RUN/codex/r1_stream.log" 2>&1

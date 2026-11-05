@@ -175,11 +175,12 @@ class CodexLaneOffByDefaultTest(unittest.TestCase):
     def test_ticket_review_codex_mode_gates_on_explicit_opt_in(self):
         with open(os.path.join(REPO_ROOT, "skills", "ticket-review", "SKILL.md")) as fh:
             text = fh.read()
-        m = re.search(r"## Codex mode[^\n]*\n(.*)", text, re.S)
+        m = re.search(r"## Codex mode[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S)
         self.assertIsNotNone(m, "Codex mode section not found")
         section = m.group(0)
         self.assertIn("off by default", section)
-        self.assertIn("CODEX_REVIEW_ENABLED=1", section)
+        self.assertIn("**both** the user asks for it **and** `CODEX_REVIEW_ENABLED=1` is set", section)
+        self.assertIn("With the flag unset, say Codex mode is disabled and stop", section)
         self.assertIn("unset means the Codex account default", section)
         self.assertIn("`--via native` (the default)", text)
 

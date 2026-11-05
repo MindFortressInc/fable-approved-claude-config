@@ -2,7 +2,7 @@
 
 Use **briefs** for the six prompt sections, in order: CONTEXT, TASK, CONSTRAINTS, RETURN CONTRACT, VERIFICATION REQUIREMENT, STOP CONDITIONS. Fill them with the assigned tickets, exact repo refs, relevant repo invariants, and the artifact to return. Do not send a worker to fetch a ticket specification the brief does not carry.
 
-Workers read source and propose verdicts. They never write the tracker, memory, repositories or production. They are not alone in the workspace: they must not revert others' work or use `git stash`, because the stash is one stack shared by every worktree of a repo. Paste the **briefs** strictly read-only Git constraint verbatim. Scratch output belongs in the assigned run directory. Independent groups should not repeat discovery the orchestrator already did.
+Workers read source and propose verdicts. They never write the tracker, memory, repositories or production. They are not alone in the workspace: they must not revert others' work or use `git stash`, because the stash is one stack shared by every worktree of a repo. Paste the **briefs** strictly read-only Git constraint verbatim. Native agents may write scratch files only in the assigned run directory, never in a repository; a Codex lane writes nothing, and the orchestrator captures its result file. Independent groups should not repeat discovery the orchestrator already did.
 
 Write the discovery obligation into each brief: before substantial reconstruction, proposing a mechanism, concluding absence, or re-measuring a running system, search the tracker for the concern, grep the relevant source, and search the full memory store if one is configured. Read the relevant hits in full; an injected memory preview is not the corpus. Reuse existing mechanisms and measurements. A direct file read that settles a question needs no elaborate investigation.
 
@@ -39,7 +39,7 @@ Ask each reviewer to return one JSON object per assigned ticket:
 }
 ```
 
-Use `proposed_comment: null` for agreement or insufficient evidence. Source excerpts must be literal contiguous lines starting at `line`; explanations belong in `conclusion`, never disguised as quotations. Cite exact PR head refs when reviewing unmerged work and label them unmerged. A missing or inaccessible source yields `uncertain`, not agreement.
+Use `proposed_comment: null` for agreement or insufficient evidence (in Codex mode, `""` replaces every `null`; see the Codex handoff). Source excerpts must be literal contiguous lines starting at `line`; explanations belong in `conclusion`, never disguised as quotations. Cite exact PR head refs when reviewing unmerged work and label them unmerged. A missing or inaccessible source yields `uncertain`, not agreement.
 
 The review lenses:
 
