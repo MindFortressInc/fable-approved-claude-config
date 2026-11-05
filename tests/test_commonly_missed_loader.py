@@ -229,6 +229,16 @@ class LocalFileSourceTest(SubprocessTestBase):
         self.assertIn("no '## Commonly Missed' section", err)
         self.assertEqual(len(_info_lines(err)), 1, err)
 
+    def test_a_required_heading_only_inside_a_fence_is_rejected(self):
+        fenced = FIXTURE.replace(
+            "## Generic Review Invariants\n",
+            "```markdown\n## Generic Review Invariants\n```\n",
+        )
+        rc, out, err = self.run_loader("prompt", source=self.write("lens.md", fenced))
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("no '## Generic Review Invariants' section", err)
+        self.assertEqual(len(_info_lines(err)), 1, err)
+
     def test_a_heading_with_trailing_whitespace_is_accepted(self):
         padded = FIXTURE.replace("## Commonly Missed\n", "## Commonly Missed  \n")
         rc, out, err = self.run_loader("prompt", source=self.write("lens.md", padded))

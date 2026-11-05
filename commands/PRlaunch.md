@@ -330,16 +330,16 @@ Local CodeRabbit CLI (it bypasses the cloud credit block, but its own budget is 
 
 ```bash
 cd <repo>
-~/.claude/hooks/cr-review.sh --base main >out.txt 2>&1
+~/.claude/hooks/cr-review.sh --base <target-branch> >out.txt 2>&1
 ```
 
-**Call the wrapper, not bare `coderabbit review`.** With nothing configured it runs the CLI once under your own login, exactly like the bare command — what it adds is one exit-code contract every caller can trust (step 7; why: `~/.claude/playbooks/prlaunch/rationale.md` § CR CLI). **Seat pool (optional, off by default):** register one seat per teammate key with `~/.claude/hooks/cr-seats.sh add <name>` (key on stdin or in `$CR_SEAT_API_KEY`, never on the command line; or `adopt <name>` for the current login), and the wrapper rotates them with per-seat locks and cooldowns. `cr-seats.sh list` shows each seat's usage; with no seats registered, none of this runs. If the repo's default branch isn't `main`, swap it (`gh repo view --json defaultBranchRef -q .defaultBranchRef.name`).
+**Call the wrapper, not bare `coderabbit review`.** With nothing configured it runs the CLI once under your own login, exactly like the bare command — what it adds is one exit-code contract every caller can trust (step 7; why: `~/.claude/playbooks/prlaunch/rationale.md` § CR CLI). **Seat pool (optional, off by default):** register one seat per teammate key with `~/.claude/hooks/cr-seats.sh add <name>` (key on stdin or in `$CR_SEAT_API_KEY`, never on the command line; or `adopt <name>` for the current login), and the wrapper rotates them with per-seat locks and cooldowns. `cr-seats.sh list` shows each seat's usage; with no seats registered, none of this runs. `<target-branch>` is the same branch phase 1 uses (`gh pr view [<pr>] --json baseRefName -q .baseRefName`, or before a PR exists the branch you will open it against): use that one value for the base here, the scope diff in step 1, and the re-run in step 5.
 
 **Redirect the full run to a file (`>out.txt 2>&1`) and read the file — never pipe it through `| tail -N`.** In a background command only the final tail survives, and the findings before it are lost for good.
 
 1. **Classify every finding by origin FIRST** (CR CLI reviews the WHOLE repo, not just your diff, so it surfaces pre-existing main-branch findings on files you never touched). Anchor on:
    ```bash
-   git diff --name-only origin/main..HEAD    # the files actually in scope
+   git diff --name-only origin/<target-branch>..HEAD    # the files actually in scope
    ```
    - **IN-SCOPE** — finding is in a file your diff changed → this PR owns it.
    - **OUT-OF-SCOPE** — finding is in a file your diff did NOT touch → pre-existing; never bundle the fix into this feature PR.
@@ -352,7 +352,7 @@ cd <repo>
    - Junk / not-a-real-issue → waive with a one-line reason (recorded in the wrapup report).
    Maintain a running disposition list (finding → fixed | ticket <id> | waived: reason). Phase 6 verifies it.
 4. Commit fixes.
-5. Re-run `~/.claude/hooks/cr-review.sh --base main >out.txt 2>&1`.
+5. Re-run `~/.claude/hooks/cr-review.sh --base <target-branch> >out.txt 2>&1`.
 6. Loop until every IN-SCOPE finding is fixed-or-ticketed and every OUT-OF-SCOPE finding is ticketed-or-waived.
 7. **Read the wrapper's exit code — never infer the gate from stdout** (a wrapper that dies prints nothing, which reads exactly like "reviewed, found nothing"):
    - **75 — limit-blown skip (authorized):** the account is rate-limited (or, with a seat pool, every seat is rate-limited or at cap; the wrapper already rotated and applied cooldowns). Before treating it as terminal, `pgrep -f 'coderabbit review'` and kill stale hung runs (a hung run holds the slot), and if you killed one, re-run the wrapper once — skip only if that also returns 75. If the dashboard shows credits exhausted, that is the same skip. `cr-seats.sh list` shows which seats are cooling/busy/at-cap.
@@ -531,7 +531,7 @@ For each unit:
 Same flow as `/wrapup`:
 
 1. **Tracker** — update tickets to "In Review", then **verify the PR attachment actually landed**: `mcp__linear__get_issue <id>` and confirm the PR URL is in `attachments`/links. If it's missing (the `Closes`/branch auto-link didn't fire), attach it explicitly (`mcp__linear__save_issue` with `links: [{url, title}]`) — don't assume the magic word stuck (tickets are systematically under-linked). Comment on session progress.
-2. **Disposition gate** — walk the running disposition list from phases 1+2+3. Every finding must be `fixed`, `ticket <id>`, or `waived: <reason>`. **If any OUT-OF-SCOPE-but-legit finding has no ticket yet, file it now** (batch related ones; link source PR + `file:line`), parented and assigned exactly as in phase 2 step 3 (buckets: `## Work Taxonomy` of `~/.claude/CLAUDE.md`; a Bulldozer 1-off files **unassigned**, the other two assign the owner) — never parentless. A finding with no disposition is a bug in the wrapup — resolve it before reporting. **Ops steps disposition the same way:** every ops step from phase 5 appears here as its own ticket id, never as a sentence. If one survives only as prose — in a PR body, an epic comment, or this report — it isn't tracked; file it now. Zero ops steps → say so explicitly.
+2. **Disposition gate** — walk the running disposition list from phases 1+2+3. Every finding must be `fixed`, `ticket <id>`, or `waived: <reason>`; a heavy-lift CRITICAL/HIGH finding is `waived: <reason>` only together with a filed follow-up ticket linked from the review (`~/.claude/playbooks/deep-review/consolidation-detail.md`). **If any OUT-OF-SCOPE-but-legit finding has no ticket yet, file it now** (batch related ones; link source PR + `file:line`), parented and assigned exactly as in phase 2 step 3 (buckets: `## Work Taxonomy` of `~/.claude/CLAUDE.md`; a Bulldozer 1-off files **unassigned**, the other two assign the owner) — never parentless. A finding with no disposition is a bug in the wrapup — resolve it before reporting. **Ops steps disposition the same way:** every ops step from phase 5 appears here as its own ticket id, never as a sentence. If one survives only as prose — in a PR body, an epic comment, or this report — it isn't tracked; file it now. Zero ops steps → say so explicitly.
 
    **Durable per-unit record (guarded no-op if the helper is absent).** For EACH shipped unit, append one `prlaunch`/`unit` event to `~/.claude/automation-ledger.jsonl` (a durable quality record a weekly scorecard can aggregate). Pull `cr_cli` (clean or its skip-reason) and `outcome_eval` (`na` or scenario count) straight from this unit's gate ledger; supply the deep-review CRITICAL+HIGH count, `regate` done, and whether `PRLAUNCH_SKIP` was used:
    ```bash

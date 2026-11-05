@@ -94,10 +94,34 @@ def _display(path):
     return path
 
 
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+
+
+def _section(lines, heading):
+    out, on, fence = [], False, ""
+    for line in lines:
+        m = FENCE.match(line)
+        if fence:  # a `# comment` in a fenced example is not a heading
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                    and not line[m.end():].strip():
+                fence = ""
+        elif m:
+            fence = m.group(1)
+        elif re.match(r"#{1,2} ", line):  # a `# ` heading ends a section too
+            on = line.rstrip() == heading
+        if on:
+            out.append(line)
+    return "".join(out).rstrip("\n")
+
+
 def _missing(text):
-    """The required headings `text` lacks; [] means it is a usable lens file."""
-    present = {line.rstrip() for line in (text or "").splitlines()}
-    return [h for h in (INVARIANTS, CLASSES) if h not in present]
+    """The required headings `text` lacks; [] means it is a usable lens file.
+
+    Parsed exactly as `prompt()` reads it, so a heading inside a fenced example
+    does not count as the section.
+    """
+    lines = (text or "").splitlines(keepends=True)
+    return [h for h in (INVARIANTS, CLASSES) if not _section(lines, h)]
 
 
 def _missing_msg(text):
@@ -245,26 +269,6 @@ def sync():
         return cached, "cached copy of %s from %s" % (origin, age), False
     _info("lens file unavailable (%s); continuing with the built-in lenses only" % err)
     return None, None, False
-
-
-FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
-
-
-def _section(lines, heading):
-    out, on, fence = [], False, ""
-    for line in lines:
-        m = FENCE.match(line)
-        if fence:  # a `# comment` in a fenced example is not a heading
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
-                    and not line[m.end():].strip():
-                fence = ""
-        elif m:
-            fence = m.group(1)
-        elif re.match(r"#{1,2} ", line):  # a `# ` heading ends a section too
-            on = line.rstrip() == heading
-        if on:
-            out.append(line)
-    return "".join(out).rstrip("\n")
 
 
 def prompt():
