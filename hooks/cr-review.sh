@@ -9,7 +9,9 @@
 # ~/.claude/cr-seats, or CR_SEATS_DIR pointing at an empty dir) this runs the
 # CLI ONCE under your own HOME/login, exactly like bare `coderabbit review`,
 # and only adds the exit-code contract: 70/71 below, and 75 when that single
-# account reports a rate limit (so PRlaunch can record its authorized skip).
+# account reports a rate limit or a spent monthly cap (so PRlaunch can record
+# its authorized skip). Only a failed run that names the cap ever triggers a
+# `coderabbit usage` call to confirm it.
 #
 # Why a pool exists at all: CodeRabbit rate-limits per developer. Parallel agent
 # workers on one box all authenticate as one identity, so they burn one seat's
@@ -270,14 +272,19 @@ run_cli() { # run_cli <home|""> <out> <err> [cli args...]
 # ("Billing-period usage isn't available with API-key authentication"); the
 # first identity that reports a cap decides.
 #
-# Same stream discipline as `limited`: stdout carries review FINDINGS, which can
-# quote this phrase (a review of this very file does), and usage reads
-# spend >= cap even while reviews run -- so on stdout only a STATUS-shaped line
-# or an --agent status/error event counts, never the phrase mid-finding.
+# Stricter stream discipline than `limited`: stdout carries review FINDINGS,
+# which can quote this phrase (a review of this very file does), and usage reads
+# spend >= cap even while reviews run. So on stdout only a line that IS the
+# failure message counts, or an --agent status/error event whose message value
+# is exactly it -- anchored at both ends, so a finding that merely starts with
+# the phrase ("- Failed to start review errors fall through ...") stays a verdict.
 SPEND_FAIL_RE='failed to start review'
-SPEND_FAIL_LINE_RE='^[^[:alnum:]]*(error:?[[:space:]]*)?(review failed:?[[:space:]]*)?failed to start review'
-# An `--agent` JSON status/error event (one object per line).
+SPEND_FAIL_MSG='(error:?[[:space:]]*)?(review failed:?[[:space:]]*)?failed to start review([.!]([[:space:]]*please try again[.!]?)?)?[[:space:]]*'
+SPEND_FAIL_LINE_RE="^[^[:alnum:]]*${SPEND_FAIL_MSG}\$"
+# An `--agent` JSON status/error event (one object per line) whose message field
+# is exactly that failure.
 AGENT_EVENT_RE='^[[:space:]]*\{.*"type"[[:space:]]*:[[:space:]]*"(status|error)"'
+SPEND_FAIL_AGENT_RE="\"(message|error|status|detail)\"[[:space:]]*:[[:space:]]*\"${SPEND_FAIL_MSG}\""
 # `coderabbit usage` is a network call made while holding a seat lock, so it is
 # bounded; perl's alarm is the portable timeout (macOS ships no `timeout`).
 # CR_USAGE_TIMEOUT is ONE deadline across every identity probed, not per probe:
@@ -288,7 +295,7 @@ spend_capped() { # spend_capped <rc> <out> <err> <home|"">... -> 0 + prints "$S 
   (( rc != 0 )) || return 1
   grep -qiE "$SPEND_FAIL_RE" "$err" 2>/dev/null \
     || grep -qiE "$SPEND_FAIL_LINE_RE" "$out" 2>/dev/null \
-    || grep -iE "$AGENT_EVENT_RE" "$out" 2>/dev/null | grep -qiE "$SPEND_FAIL_RE" \
+    || grep -iE "$AGENT_EVENT_RE" "$out" 2>/dev/null | grep -qiE "$SPEND_FAIL_AGENT_RE" \
     || return 1
   t_end=$(( $(now) + USAGE_TIMEOUT ))
   for h in "$@"; do
@@ -310,10 +317,14 @@ spend_capped() { # spend_capped <rc> <out> <err> <home|"">... -> 0 + prints "$S 
   return 1
 }
 
-# The pool is spent for the month: no seat can help, so stop without rotating.
-die_spend_cap() { # die_spend_cap <detail>
-  log "MONTHLY SPEND CAP REACHED ($1) run=$CR_RUN_ID -- every seat shares it, not rotating."
-  log "ALL SEATS EXHAUSTED (monthly spend cap) -- record the authorized cr_cli skip"
+# The cap is spent for the month: no seat can help, so stop without rotating.
+die_spend_cap() { # die_spend_cap <detail> [pool]
+  if [[ "${2:-}" == pool ]]; then
+    log "MONTHLY SPEND CAP REACHED ($1) run=$CR_RUN_ID -- every seat shares it, not rotating."
+    log "ALL SEATS EXHAUSTED (monthly spend cap) -- record the authorized cr_cli skip"
+  else
+    log "MONTHLY SPEND CAP REACHED ($1) run=$CR_RUN_ID -- the default identity's cap is spent and no seat pool is registered -- record the authorized cr_cli skip"
+  fi
   finished=1
   exit 75
 }
@@ -637,7 +648,7 @@ while :; do
     if capped=$(spend_capped "$rc" "$out" "$err" "${probe[@]}" ""); then
       cat "$out"; cat "$err" >&2
       rm -f "$out" "$err"; release "$seat"; held=""
-      die_spend_cap "$capped"
+      die_spend_cap "$capped" pool
     fi
 
     cat "$out"; cat "$err" >&2
