@@ -1,6 +1,6 @@
 ---
 name: scorecard
-description: Weekly automation quality report for the fleet (bulldozer, babysit-prs, PRlaunch, wrapup). Reads the durable automation ledger and grades shipping, sweeping, and gate integrity window-over-window, then posts the report as a comment on the standing Linear ticket. Use for "/scorecard", "automation scorecard", "how is the fleet doing", "weekly automation quality report".
+description: Weekly automation quality report for the fleet (bulldozer, babysit-prs, PRlaunch, wrapup). Reads the durable automation ledger and grades shipping, sweeping, gate integrity, and the deep-review → CodeRabbit escape rate window-over-window, then posts the report as a comment on the standing Linear ticket. Use for "/scorecard", "automation scorecard", "how is the fleet doing", "weekly automation quality report".
 argument-hint: "[--days N] (default 7) [--no-gh] [--gh-owner OWNER]"
 allowed-tools:
   - Bash
@@ -19,12 +19,12 @@ Grade how the automation fleet is doing. `scorecard.py` reads the durable ledger
 bulldozer/babysit/PRlaunch/wrapup call site) and computes, over a `--days` window vs
 the prior equal window: bulldozer shipped/resolved/failed + merged-vs-open-vs-closed
 outcomes for shipped PRs; babysit sweeps/bumps/fixes/red_ci; PRlaunch gate integrity
-(cr_cli skips, outcome_eval N/A, PRLAUNCH_SKIP uses); cleanup-queue depth; and stale
-prlaunch-ok orphans. It flags any metric that regressed >20% window-over-window.
+(cr_cli skips, outcome_eval N/A, PRLAUNCH_SKIP uses); /execute units, split by PRlaunch
+`driver`; deep-review escapes (CodeRabbit CLI
+findings recorded after a branch's first deep-review, via `hooks/cr-parity.py`); cleanup-queue
+depth; stale prlaunch-ok orphans; and stale open `Ops:` Linear tickets. It flags any metric that regressed >20% window-over-window.
 
-This exists because the fleet's run state otherwise lives only in `/tmp` and is lost
-— and when the driver model changes, you need a standing measurement loop to tell
-whether quality held.
+This exists because the fleet's run state otherwise lives only in `/tmp` and is lost.
 </objective>
 
 <process>
@@ -40,12 +40,31 @@ python3 ~/.claude/skills/scorecard/scorecard.py ${ARGUMENTS:-}
   state. Ledger rows that record a bare repo name (no `owner/`) need an owner to
   resolve against: pass `--gh-owner OWNER` or set `$SCORECARD_GH_OWNER`; without
   one, those PRs count as `unknown` rather than guessing. If `gh` is
-  unavailable/slow this session, re-run with `--no-gh` (PR-state enrichment is
-  skipped, everything else still computes).
+  unavailable/slow this session, re-run with `--no-gh` (PR-state enrichment and
+  the Linear stale-Ops count are skipped, everything else still computes).
 - It degrades gracefully: an absent/partial ledger prints "no data yet — ledger
   empty" per section, never a traceback.
 
 Capture the full markdown output — that IS the report you post in Step 3.
+
+The **/execute** row counts PRlaunch `unit` rows with `driver:"execute"`, and its note
+splits every unit by driver. Rows with no driver count as `untagged`: they
+predate the field or the caller named none, so the /execute count is a floor while
+untagged is above 0. A stale Ops ticket is open, titled `Ops:` and not updated in 14
+days; `n/a` means the Linear query failed, not that there are none.
+
+The **Deep-review escapes** section comes from `hooks/cr-parity.py`:
+- **What counts.** Branches are bucketed by their first deep-review. An escape is a
+  CR CLI finding at/after that point.
+- **Denominator.** Rates are over CR-covered branches only. A deep-reviewed branch CR
+  never ran on is *unknown*, not clean. So CR coverage is itself a graded metric: a
+  falling escape rate means nothing if coverage fell with it.
+- **Classes.** The miss-class line lists the top major+ classes and the size of the
+  unclassified `other` bucket.
+- **Full trend.** For the per-week trend, the repo × class miss-rate table, the parity
+  statement and the proposed CR-deprecation bar, run
+  `python3 ~/.claude/hooks/cr-parity.py`. The bar is informational only; it needs
+  the owner's sign-off and nothing is gated on it.
 
 ## Step 2 — Find (or create once) the standing scorecard ticket
 
@@ -117,6 +136,10 @@ say so (PR-state outcomes were skipped this run).
   `tests/test_scorecard.py`); only the gh/cleanup/orphan enrichment touches the
   outside world, and `--no-gh` turns the network part off.
 - Regression flag = a tracked metric moved >20% the wrong way vs the prior window
-  (shipped/fixes down, or failed/red_ci/cr_cli-skips/PRLAUNCH_SKIP up). A metric with
-  no prior baseline is never flagged.
+  (shipped/fixes/CR coverage down, or failed/red_ci/cr_cli-skips/PRLAUNCH_SKIP/
+  branches-with-escape %/major+ escapes per 100 branches up). A metric with no prior
+  baseline is never flagged.
+- Escape-section tests live in `tests/test_scorecard_escapes.py`; `cr-parity.py`'s in
+  `tests/test_cr_parity.py`.
+- Driver and stale-Ops tests live in `tests/test_execute_driver.py`.
 </notes>
