@@ -51,12 +51,12 @@ if [ -f "$HEARTBEAT" ]; then
   mt=$(stat -f%m "$HEARTBEAT" 2>/dev/null || echo 0)
   age=$(( now - mt ))
   if [ "$age" -lt "$STALE_S" ]; then
-    echo "$(date '+%F %T') [babysit] SKIP: interactive babysit alive (heartbeat age ${age}s < ${STALE_S}s)" >>"$LOG"
+    echo "$(date '+%F %T %z') [babysit] SKIP: interactive babysit alive (heartbeat age ${age}s < ${STALE_S}s)" >>"$LOG"
     exit 0
   fi
-  echo "$(date '+%F %T') [babysit] heartbeat stale (age ${age}s >= ${STALE_S}s) -> running backup" >>"$LOG"
+  echo "$(date '+%F %T %z') [babysit] heartbeat stale (age ${age}s >= ${STALE_S}s) -> running backup" >>"$LOG"
 else
-  echo "$(date '+%F %T') [babysit] no heartbeat -> running backup" >>"$LOG"
+  echo "$(date '+%F %T %z') [babysit] no heartbeat -> running backup" >>"$LOG"
 fi
 
 export HEADLESS_BABYSIT=1
@@ -126,7 +126,7 @@ on_signal() {
     wait "$child" 2>/dev/null
   fi
   reaped=1   # suppress this attempt's reap too -- same uncertainty
-  echo "$(date '+%F %T') [babysit] signal: lock NOT reaped (sweep may still be running); left to the TTL" >>"$LOG"
+  echo "$(date '+%F %T %z') [babysit] signal: lock NOT reaped (sweep may still be running); left to the TTL" >>"$LOG"
 }
 trap 'reap_once' EXIT
 trap 'on_signal; exit 143' TERM
@@ -152,7 +152,7 @@ while true; do
 
   verdict_out="$("$HOME/.claude/hooks/babysit-fire-log.sh" verdict "$attempt_start" "$rc" "$dur" --lock "$REAP_OUTCOME" 2>&1)"
   verdict_rc=$?
-  echo "$(date '+%F %T') [babysit] verdict (attempt=$attempt rc=$rc dur=${dur}s): $verdict_out" >>"$LOG"
+  echo "$(date '+%F %T %z') [babysit] verdict (attempt=$attempt rc=$rc dur=${dur}s): $verdict_out" >>"$LOG"
 
   if [ "$verdict_rc" -ne 1 ]; then
     recovery=none
@@ -161,13 +161,13 @@ while true; do
 
   # FORFEIT. Exactly one retry -- see the file header.
   if [ $attempt -ge 2 ]; then
-    echo "$(date '+%F %T') [babysit] FORFEIT AGAIN on attempt $attempt -- NOT retrying; this cycle is lost." >>"$LOG"
-    echo "$(date '+%F %T') [babysit] a second forfeit means the EXECUTION MODE rule in commands/babysit-prs.md is not holding. Do not raise the retry count; fix the rule." >>"$LOG"
+    echo "$(date '+%F %T %z') [babysit] FORFEIT AGAIN on attempt $attempt -- NOT retrying; this cycle is lost." >>"$LOG"
+    echo "$(date '+%F %T %z') [babysit] a second forfeit means the EXECUTION MODE rule in commands/babysit-prs.md is not holding. Do not raise the retry count; fix the rule." >>"$LOG"
     recovery=failed
     break
   fi
 
-  echo "$(date '+%F %T') [babysit] FORFEIT on attempt $attempt -- reaping orphaned classifier(s) before relaunch" >>"$LOG"
+  echo "$(date '+%F %T %z') [babysit] FORFEIT on attempt $attempt -- reaping orphaned classifier(s) before relaunch" >>"$LOG"
 
   # Reap the forfeited sweep's ORPHANED classifier before relaunching.
   #
@@ -187,7 +187,7 @@ while true; do
     [ -n "$cpid" ] || continue
     cppid=$(ps -o ppid= -p "$cpid" 2>/dev/null | tr -d ' ')
     if [ "$cppid" = "1" ]; then
-      echo "$(date '+%F %T') [babysit] reaping orphaned classifier pid=$cpid (parent sweep is gone)" >>"$LOG"
+      echo "$(date '+%F %T %z') [babysit] reaping orphaned classifier pid=$cpid (parent sweep is gone)" >>"$LOG"
       # WAIT for it to actually die. `kill` only queues a SIGTERM and returns
       # immediately, so continuing here would let a slow or unresponsive
       # classifier overlap attempt 2 -- the very race this reap exists to
@@ -195,27 +195,27 @@ while true; do
       kill "$cpid" 2>/dev/null || true
       for _ in {1..10}; do kill -0 "$cpid" 2>/dev/null || break; sleep 1; done
       if kill -0 "$cpid" 2>/dev/null; then
-        echo "$(date '+%F %T') [babysit] classifier pid=$cpid ignored SIGTERM after 10s -- SIGKILL" >>"$LOG"
+        echo "$(date '+%F %T %z') [babysit] classifier pid=$cpid ignored SIGTERM after 10s -- SIGKILL" >>"$LOG"
         kill -9 "$cpid" 2>/dev/null || true
         for _ in {1..5}; do kill -0 "$cpid" 2>/dev/null || break; sleep 1; done
       fi
       if kill -0 "$cpid" 2>/dev/null; then
-        echo "$(date '+%F %T') [babysit] WARNING: classifier pid=$cpid still alive -- NOT relaunching on top of it" >>"$LOG"
+        echo "$(date '+%F %T %z') [babysit] WARNING: classifier pid=$cpid still alive -- NOT relaunching on top of it" >>"$LOG"
         orphan_blocked=1
       fi
     fi
   done
 
   if [ "$orphan_blocked" -eq 1 ]; then
-    echo "$(date '+%F %T') [babysit] relaunch BLOCKED by unreaped orphan classifier" >>"$LOG"
+    echo "$(date '+%F %T %z') [babysit] relaunch BLOCKED by unreaped orphan classifier" >>"$LOG"
     recovery=blocked_by_orphan
     break
   fi
 
   attempt=2
   recovery=relaunched
-  echo "$(date '+%F %T') [babysit] relaunching once (attempt=$attempt)" >>"$LOG"
+  echo "$(date '+%F %T %z') [babysit] relaunching once (attempt=$attempt)" >>"$LOG"
 done
 
-echo "$(date '+%F %T') [babysit] cycle done attempt=$attempt recovery=$recovery rc=$rc" >>"$LOG"
+echo "$(date '+%F %T %z') [babysit] cycle done attempt=$attempt recovery=$recovery rc=$rc" >>"$LOG"
 exit $rc

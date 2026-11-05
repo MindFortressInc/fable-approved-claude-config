@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import unittest
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import HookSandbox, REAL_HOOKS
@@ -361,6 +362,26 @@ class VerdictTest(unittest.TestCase):
             body = fh.read()
         self.assertIn("[babysit] fire: /babysit-prs no-loop", body)
         self.assertIn("[babysit] exit=0", body)
+
+    def test_fire_and_exit_stamp_local_time_with_its_offset(self):
+        """babysit_digest._log_ts_to_utc() needs the offset to place a row in
+        the repeated fall-back hour: the stamp must be this instant, in local
+        time, carrying the local offset rather than UTC's."""
+        log = os.path.join(self.sbx.claude, "logs", "headless-babysit.log")
+        for args in (["fire", "/babysit-prs no-loop"], ["exit", "0"]):
+            p = subprocess.run(["bash", FIRE_LOG_HOOK, *args],
+                               capture_output=True, text=True, env=self.sbx.env())
+            self.assertEqual(p.returncode, 0, p.stderr)
+        with open(log) as fh:
+            lines = fh.read().splitlines()
+        self.assertRegex(lines[0], r"^=== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4} "
+                                   r"\[babysit\] fire: /babysit-prs no-loop$")
+        self.assertRegex(lines[1], r"^=== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4} "
+                                   r"\[babysit\] exit=0$")
+        stamp = lines[0][4:].split(" [babysit]")[0]
+        stamped = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S %z")
+        self.assertEqual(stamp[-5:], time.strftime("%z"))
+        self.assertLess(abs(stamped.timestamp() - time.time()), 120)
 
 
 class ForfeitThresholdOverrideTest(VerdictTest):

@@ -97,6 +97,9 @@ if argv[0] == "search":
     emit_search("search_merged.json" if "--merged" in argv else "search_open.json", argv)
 elif argv[0] == "api":
     endpoint = argv[1] if len(argv) > 1 else ""
+    if endpoint == "graphql" and any("viewer{pullRequests" in a for a in argv):
+        # The PR-store cross-check behind an empty discovery search.
+        emit("graphql_viewer_prs.json")
     if endpoint == "graphql":
         f = dict(a.split("=", 1) for a in argv[2:] if "=" in a)
         emit("graphql_threads_%s_%s_%s.json" % (f.get("o", ""), f.get("r", ""), f.get("n", "")))
@@ -179,6 +182,11 @@ class Fixtures:
     def finalize(self):
         _w(self._f("search_open.json"), self.search_open)
         _w(self._f("search_merged.json"), [])
+        # The PR store an empty search is cross-checked against. Mirrors
+        # search_open -- a healthy GitHub, where the two backends agree.
+        _w(self._f("graphql_viewer_prs.json"), {"data": {"viewer": {
+            "pullRequests": {"totalCount": len(self.search_open), "nodes": [
+                {"repository": p["repository"]} for p in self.search_open]}}}})
 
 
 def cr_issue(body, at, login=CR):
@@ -233,7 +241,7 @@ WIDGET_BODY = ("<!-- This is an auto-generated comment: summarize by coderabbit.
 
 
 def run_sweep(fxdir, state_path, *, repos="", quiet="no:test", progress=None,
-              extra_env=None, with_stderr=False):
+              extra_env=None, with_stderr=False, owner=OWNER):
     """Run `babysit_classify.py sweep` against the fake gh with a pinned env.
     `progress` (a dict) becomes the $BABYSIT_PROGRESS store for this run."""
     env = dict(os.environ)
@@ -254,7 +262,7 @@ def run_sweep(fxdir, state_path, *, repos="", quiet="no:test", progress=None,
     })
     env.update(extra_env or {})
     args = [sys.executable, SCRIPT, "sweep", "--state", state_path,
-            "--gh-bin", SHIM, "--owner", OWNER]
+            "--gh-bin", SHIM, "--owner", owner]
     if repos:
         args += ["--repos", repos]
     p = subprocess.run(args, capture_output=True, text=True, env=env, timeout=120)
@@ -1052,6 +1060,289 @@ class AttemptCapSweepTests(SweepCase):
         capped = {r["pr"]: r for r in out["attempt_capped"]}
         self.assertEqual(list(capped), [870])
         self.assertEqual((capped[870]["path"], capped[870]["guard_exit"]), ("rebase", "2"))
+
+
+# ===========================================================================
+# every action names the owner that holds its PR
+# ===========================================================================
+class OwnerOnEveryActionTests(SweepCase):
+    """The runbook's per-action `gh` calls (the OPEN re-check, the bump
+    comment, ci_triage's `gh run list`, the retarget parent lookup) address
+    `<owner>/<repo>`. Only the action can say what `<owner>` is, so every
+    action carries it -- never a hand-edited org placeholder in the prose."""
+
+    ORG = "acme-co"   # deliberately NOT OWNER_DEFAULT
+
+    def test_every_action_and_pr_row_carries_its_owner(self):
+        f = Fixtures(self.fx)
+        o = self.ORG
+        f.add_pr("acme-api", 1201, owner=o, commit_date=ago(10),          # fix
+                 reviews=[cr_review("**Actionable comments posted: 1**", ago(5), rid=1)])
+        f.add_pr("acme-api", 1202, owner=o, mss="BLOCKED",                 # bump
+                 issues=[cr_issue(RATE_BODY, ago(400))])
+        f.add_pr("acme-api", 1203, owner=o, mss="DIRTY",                   # rebase
+                 issues=[cr_issue(NO_ACTIONABLE_BODY, ago(20))])
+        f.add_pr("acme-api", 1204, owner=o, mss="UNSTABLE",                # ci_triage
+                 issues=[cr_issue(NO_ACTIONABLE_BODY, ago(20))],
+                 scr=[{"__typename": "CheckRun", "name": "pytest", "conclusion": "FAILURE"}])
+        f.add_pr("acme-api", 1205, owner=o, base="feat/pr-1204",          # cli_launch
+                 issues=[cr_issue(STACKED_BODY, ago(30))])
+        f.add_pr("acme-api", 1206, owner=o, write_view=False)              # FETCH_FAIL
+        f.finalize()
+        out = run_sweep(self.fx, self.state, quiet="yes:test", owner=o)
+        types = {a["type"] for a in out["actions"]}
+        self.assertTrue({"fix", "bump", "rebase", "ci_triage", "cli_launch"} <= types, types)
+        self.assertEqual({(a["type"], a.get("owner")) for a in out["actions"]},
+                         {(t, o) for t in types})
+        self.assertEqual({p["number"]: p.get("owner") for p in out["prs"]},
+                         {n: o for n in range(1201, 1207)})
+
+    def test_runbook_per_action_calls_never_name_a_placeholder_org(self):
+        with open(os.path.join(REPO_ROOT, "commands", "babysit-prs.md")) as fh:
+            doc = fh.read()
+        self.assertNotIn("<your-org>/<repo>", doc)
+        for call in ("gh -R <owner>/<repo> pr view <pr> --json state",
+                     "gh -R <owner>/<repo> pr comment <pr> --body \"@coderabbitai review\"",
+                     "gh run list -R <owner>/<repo> --branch"):
+            self.assertIn(call, doc)
+
+
+# ===========================================================================
+# an empty `gh search` is cross-checked before it can read as DRAINED
+# ===========================================================================
+class EmptySearchCrossCheckTests(SweepCase):
+    """An empty `[]` from `gh search prs` is trusted only once a non-search
+    source (GraphQL viewer.pullRequests, the PR store) agrees. A GitHub search
+    incident returns `[]` with exit 0 while the PRs are still open; accepted,
+    that reads DRAINED, and two in a row stop a `/loop`."""
+
+    def setUp(self):
+        super().setUp()
+        Fixtures(self.fx).finalize()        # search_open.json == []
+        _w(self.state, {"pending_count": 3, "no_progress_streak": 0})
+
+    def _viewer(self, nwos, total=None):
+        _w(os.path.join(self.fx, "graphql_viewer_prs.json"), {
+            "data": {"viewer": {"pullRequests": {
+                "totalCount": len(nwos) if total is None else total,
+                "nodes": [{"repository": {"name": n.partition("/")[2],
+                                          "nameWithOwner": n}}
+                          for n in nwos]}}}})
+
+    def test_empty_search_while_the_pr_store_has_rows_is_not_drained(self):
+        self._viewer([f"{OWNER}/acme-api"])
+        out = run_sweep(self.fx, self.state)
+        self.assertNotEqual(out["decision"], "DRAINED")
+        self.assertEqual(out.get("error"), "search_fetch_fail")
+        self.assertEqual(out["pending"], 3, "prior pending carried, not zeroed")
+
+    def test_empty_search_confirmed_by_the_pr_store_is_drained(self):
+        self._viewer([])
+        out = run_sweep(self.fx, self.state)
+        self.assertNotIn("error", out)
+        self.assertEqual(out["decision"], "DRAINED")
+
+    def test_a_failed_cross_check_is_unverified_not_drained(self):
+        # no fixture -> the shim prints nothing -> gh_json gives None
+        os.unlink(os.path.join(self.fx, "graphql_viewer_prs.json"))
+        out = run_sweep(self.fx, self.state)
+        self.assertEqual(out.get("error"), "search_fetch_fail")
+        self.assertNotEqual(out["decision"], "DRAINED")
+
+    def test_a_truncated_page_cannot_prove_absence(self):
+        self._viewer(["someone-else/repo"], total=150)
+        self.assertEqual(run_sweep(self.fx, self.state).get("error"), "search_fetch_fail")
+
+    def test_prs_outside_the_swept_owner_do_not_block_a_drain(self):
+        self._viewer(["other-org/tool"])
+        self.assertEqual(run_sweep(self.fx, self.state)["decision"], "DRAINED")
+
+    def test_repos_filter_scopes_the_cross_check(self):
+        self._viewer([f"{OWNER}/busy"])
+        self.assertEqual(run_sweep(self.fx, self.state, repos="quiet")["decision"],
+                         "DRAINED")
+        self.assertEqual(run_sweep(self.fx, self.state, repos="busy").get("error"),
+                         "search_fetch_fail")
+
+    def test_a_non_empty_search_never_spends_the_cross_check(self):
+        f = Fixtures(self.fx)
+        f.add_pr("acme-api", 1301, issues=[cr_issue(NO_ACTIONABLE_BODY, ago(20))])
+        f.finalize()
+        log = os.path.join(self.tmp, "gh.log")
+        run_sweep(self.fx, self.state, extra_env={"BABYSIT_GH_LOG": log})
+        with open(log) as fh:
+            self.assertNotIn("viewer{pullRequests", fh.read())
+
+
+# ===========================================================================
+# a clean /PRlaunch attestation at the live head counts as CLI coverage
+# ===========================================================================
+CLEAN_ATTEST = "verdict=reviewed findings=0 seat=seat-1 run=run-1"
+CR_CLI_OK = {"__typename": "StatusContext", "context": "review-gate/cr-cli", "state": "SUCCESS"}
+
+
+class AttestationCoverageTests(SweepCase):
+    """/PRlaunch publishes `review-gate/cr-cli` (PRLAUNCH_PUBLISH_CR_STATUS=1)
+    after its own CR CLI run. Babysit read only its own store row and harvest
+    comment, so it re-reviewed commits /PRlaunch had already reviewed clean,
+    and the PR could not green via `cli` on that review."""
+
+    def _stacked(self, num, *, rollup=(CR_CLI_OK,), statuses=None, head=None,
+                 issues=None, **kw):
+        """A cloud-rejected stacked PR (the cli_launch population) whose live
+        head carries `statuses` (newest first) on the commit-status API."""
+        head = head or default_head(num)
+        f = self.f
+        f.add_pr("acme-api", num, base="feat/parent-%d" % num, head_oid=head,
+                 scr=list(rollup), issues=issues or [cr_issue(STACKED_BODY, ago(30))],
+                 **kw)
+        if statuses is not None:
+            _w(os.path.join(self.fx, f"api_repos_{OWNER}_acme-api_commits_{head}_statuses.json"),
+               statuses)
+
+    @staticmethod
+    def status(desc=CLEAN_ATTEST, state="success", login=AUTHOR,
+               context="review-gate/cr-cli"):
+        return {"context": context, "state": state, "description": desc,
+                "creator": {"login": login}}
+
+    def setUp(self):
+        super().setUp()
+        self.f = Fixtures(self.fx)
+
+    def sweep(self, **kw):
+        self.f.finalize()
+        return run_sweep(self.fx, self.state, quiet="yes:test", **kw)
+
+    def assert_not_attested(self, out, num):
+        """Not attested, so still launchable (`cli_covers_head` is the
+        planner's gate; CLI_CAP bounds how many launch in one sweep)."""
+        pr = self.pr(out, num)
+        self.assertFalse(pr["cli_attested_at_head"], pr)
+        self.assertFalse(pr["cli_covers_head"], pr)
+        self.assertNotEqual(pr["green_via"], "cli", pr)
+
+    def test_clean_attestation_at_head_plans_no_launch_and_greens_via_cli(self):
+        self._stacked(1401, statuses=[self.status()])
+        out = self.sweep()
+        pr = self.pr(out, 1401)
+        self.assertTrue(pr["cli_attested_at_head"], pr)
+        self.assertTrue(pr["cli_covers_head"], pr)
+        self.assertNotIn(1401, self.acts(out, "cli_launch"))
+        self.assertEqual((pr["tier"], pr["green_via"]), ("strict", "cli"))
+
+    def test_attestation_without_a_seat_or_run_still_counts(self):
+        self._stacked(1402, statuses=[self.status("verdict=reviewed findings=0 seat=n/a run=n/a")])
+        self.assertTrue(self.pr(self.sweep(), 1402)["cli_attested_at_head"])
+
+    def test_non_clean_descriptions_still_launch(self):
+        descs = ("verdict=reviewed findings=2 seat=s run=r",
+                 "verdict=reviewed findings=n/a seat=s run=r",
+                 "verdict=skipped seat=s run=r findings=n/a reason=rate-limit",
+                 "verdict=reviewed findings=0 seat=s run=r extra",
+                 "")
+        for i, d in enumerate(descs):
+            self._stacked(1410 + i, statuses=[self.status(d)])
+        out = self.sweep()
+        for i in range(len(descs)):
+            with self.subTest(desc=descs[i]):
+                self.assert_not_attested(out, 1410 + i)
+
+    def test_only_the_newest_status_for_the_context_counts(self):
+        self._stacked(1420, statuses=[self.status("verdict=reviewed findings=1 seat=s run=r"),
+                                      self.status()])
+        self.assert_not_attested(self.sweep(), 1420)
+
+    def test_a_status_from_an_untrusted_login_does_not_count(self):
+        """Anyone with write access, or a workflow with `statuses: write`, can
+        post this context: the creator must be a trusted login."""
+        self._stacked(1421, statuses=[self.status(login="drive-by-user")])
+        self._stacked(1422, statuses=[{"context": "review-gate/cr-cli", "state": "success",
+                                       "description": CLEAN_ATTEST}])   # no creator
+        out = self.sweep()
+        self.assert_not_attested(out, 1421)
+        self.assert_not_attested(out, 1422)
+
+    def test_a_non_success_rollup_or_fetched_state_does_not_count(self):
+        pending = dict(CR_CLI_OK, state="PENDING")
+        self._stacked(1423, rollup=(pending,), statuses=[self.status()])
+        self._stacked(1424, statuses=[self.status(state="pending")])
+        out = self.sweep()
+        self.assert_not_attested(out, 1423)
+        self.assert_not_attested(out, 1424)
+
+    def test_unreadable_statuses_fail_closed(self):
+        self._stacked(1425)                     # rollup says success, no statuses fixture
+        out = self.sweep()
+        self.assert_not_attested(out, 1425)
+        self.assertIn(1425, self.acts(out, "cli_launch"))
+
+    def test_a_status_on_another_commit_does_not_count(self):
+        """The status API is keyed by sha: an attestation on an older head is
+        simply not in the answer for the live one."""
+        self._stacked(1426)
+        _w(os.path.join(self.fx, f"api_repos_{OWNER}_acme-api_commits_{'e' * 40}_statuses.json"),
+           [self.status()])
+        self.assert_not_attested(self.sweep(), 1426)
+
+    def test_a_different_context_does_not_count(self):
+        other = dict(CR_CLI_OK, context="review-gate")
+        self._stacked(1427, rollup=(other,), statuses=[self.status(context="review-gate")])
+        self.assert_not_attested(self.sweep(), 1427)
+
+    def test_live_cloud_finding_vetoes(self):
+        self.f.add_pr("acme-api", 1430, head_oid=default_head(1430), commit_date=ago(10),
+                      scr=[CR_CLI_OK],
+                      reviews=[cr_review("**Actionable comments posted: 1**", ago(5), rid=1)])
+        _w(os.path.join(self.fx, f"api_repos_{OWNER}_acme-api_commits_{default_head(1430)}_statuses.json"),
+           [self.status()])
+        out = self.sweep()
+        pr = self.pr(out, 1430)
+        self.assertEqual(pr["state"], "HAS_ACTIONABLE")
+        self.assertFalse(pr["cli_attested_at_head"])
+        self.assertEqual(pr["tier"], "")
+
+    def test_open_findings_harvested_at_this_head_veto(self):
+        head = default_head(1431)
+        self._stacked(1431, statuses=[self.status()], commit_date=ago(60),
+                      issues=[cr_issue(STACKED_BODY, ago(300)),
+                              harvest(ago(10), head, unapplied=1, major=1)])
+        out = self.sweep()
+        pr = self.pr(out, 1431)
+        self.assertIsNotNone(pr["cli_findings_open"])
+        self.assertFalse(pr["cli_attested_at_head"])
+        self.assertEqual(pr["tier"], "")
+
+    def test_store_row_with_findings_at_this_head_vetoes(self):
+        head = default_head(1432)
+        self._stacked(1432, statuses=[self.status()])
+        progress = {"cli_reviewed": {"acme-api#1432": {
+            "head": head[:9], "sev": {"critical": 0, "major": 1, "minor": 0, "trivial": 0},
+            "total": 1, "rounds": 1}}}
+        self.f.finalize()
+        out = run_sweep(self.fx, self.state, quiet="yes:test", progress=progress)
+        self.assertFalse(self.pr(out, 1432)["cli_attested_at_head"])
+
+    def test_red_ci_is_still_never_green(self):
+        self._stacked(1433, statuses=[self.status()], mss="UNSTABLE",
+                      rollup=(CR_CLI_OK, {"__typename": "CheckRun", "name": "pytest",
+                                          "conclusion": "FAILURE"}))
+        pr = self.pr(self.sweep(), 1433)
+        self.assertTrue(pr["cli_attested_at_head"])
+        self.assertEqual(pr["tier"], "red_ci")
+
+    def test_no_context_in_the_rollup_spends_no_request(self):
+        self._stacked(1434, rollup=())
+        log = os.path.join(self.tmp, "gh.log")
+        out = self.sweep(extra_env={"BABYSIT_GH_LOG": log})
+        self.assert_not_attested(out, 1434)
+        with open(log) as fh:
+            self.assertNotIn("/statuses", fh.read())
+
+    def test_fetch_fail_entry_carries_the_fields(self):
+        self.f.add_pr("acme-api", 1435, write_view=False)
+        pr = self.pr(self.sweep(), 1435)
+        self.assertEqual((pr["cli_covers_head"], pr["cli_attested_at_head"]), (False, False))
 
 
 if __name__ == "__main__":

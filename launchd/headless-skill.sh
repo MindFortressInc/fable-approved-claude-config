@@ -33,15 +33,15 @@ fi
 if ! mkdir "$LOCK" 2>/dev/null; then
   age=$(( $(date +%s) - $(stat -f%m "$LOCK" 2>/dev/null || echo 0) ))
   if [ "$age" -lt $(( TIMEOUT * 2 )) ]; then
-    echo "$(date '+%F %T') [$NAME] SKIP: previous run still holds $LOCK (age ${age}s)" >>"$LOG"
+    echo "$(date '+%F %T %z') [$NAME] SKIP: previous run still holds $LOCK (age ${age}s)" >>"$LOG"
     exit 0
   fi
-  echo "$(date '+%F %T') [$NAME] reclaiming stale lock (age ${age}s)" >>"$LOG"
+  echo "$(date '+%F %T %z') [$NAME] reclaiming stale lock (age ${age}s)" >>"$LOG"
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 {
-  echo "=== $(date '+%F %T') [$NAME] fire: $PROMPT"
+  echo "=== $(date '+%F %T %z') [$NAME] fire: $PROMPT"
   # launchd PATH is minimal — give claude the tools its Bash calls expect
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   # `-k 60` makes the cap a BOUND, not a request: plain `timeout` sends
@@ -51,5 +51,5 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
   # out. SIGKILL 60s after the deadline closes that path.
   timeout -k 60 "$TIMEOUT" "$CLAUDE_BIN" -p "$PROMPT" --dangerously-skip-permissions
   rc=$?
-  echo "=== $(date '+%F %T') [$NAME] exit=$rc"
+  echo "=== $(date '+%F %T %z') [$NAME] exit=$rc"
 } >>"$LOG" 2>&1

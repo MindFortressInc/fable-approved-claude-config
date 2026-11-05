@@ -75,48 +75,98 @@ RENDER_FULL_GAP_MIN = 60
 # terminal): fall back to a fixed lookback rather than refuse to render.
 COLD_START_LOOKBACK_H = 2
 
+# Every writer stamps `date '+%F %T %z'`: local time plus the offset in force.
+# The offset is optional here because rows written before it carry none and
+# stay in the log until it rotates.
+_LOG_TS = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: [+-]\d{4})?)"
+
 # launchd/headless-skill.sh and hooks/babysit-fire-log.sh write these two lines
-# per launch, in LOCAL time via `date '+%F %T'`:
-#   `=== 2026-01-01 09:00:00 [babysit] fire: /babysit-prs no-loop`
-#   `=== 2026-01-01 09:31:12 [babysit] exit=0`
+# per launch:
+#   `=== 2026-01-01 09:00:00 -0800 [babysit] fire: /babysit-prs no-loop`
+#   `=== 2026-01-01 09:31:12 -0800 [babysit] exit=0`
 # A prior command's unflushed stdout with no trailing newline can run straight
 # into the "===" (e.g. "Execution error=== ... exit=124"), so these search
 # anywhere in the line, never anchor to column 0.
-FIRE_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[babysit\] fire: (.*)")
-EXIT_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[babysit\] exit=(-?\d+)")
+FIRE_RE = re.compile(_LOG_TS + r" \[babysit\] fire: (.*)")
+EXIT_RE = re.compile(_LOG_TS + r" \[babysit\] exit=(-?\d+)")
 
-# launchd/babysit-hourly-gate.sh writes ONE of these per backstop slot, in
-# LOCAL time and with NO `=== ` prefix:
+# launchd/babysit-hourly-gate.sh writes ONE of these per backstop slot, with
+# the same stamp and NO `=== ` prefix:
 #   `... [babysit] SKIP: interactive babysit alive (heartbeat age 507s < 4200s)`
 #   `... [babysit] heartbeat stale (age 9000s >= 4200s) -> running backup`
 #   `... [babysit] no heartbeat -> running backup`
 # headless-skill.sh's own `SKIP: previous run still holds <lock>` carries no
 # heartbeat age, so GATE_SKIP_RE deliberately does not match it.
-GATE_SKIP_RE = re.compile(
-    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[babysit\] SKIP: .*?heartbeat age (\d+)s")
+GATE_SKIP_RE = re.compile(_LOG_TS + r" \[babysit\] SKIP: .*?heartbeat age (\d+)s")
 GATE_RUN_RE = re.compile(
-    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[babysit\] (?:heartbeat stale|no heartbeat) .*running backup")
+    _LOG_TS + r" \[babysit\] (?:heartbeat stale|no heartbeat) .*running backup")
 # The gate's own STALE_S (pinned equal by a test). A SKIP means "a heartbeat
 # fresher than this exists", so the sweep that justifies it must fall inside it.
 GATE_STALE_S = 4200
 
 
-def _local_naive_to_utc(s):
-    """Parse a naive 'YYYY-MM-DD HH:MM:SS' LOCAL-time string into a UTC-aware
-    datetime.
+def _log_ts_to_utc(s, fold=0):
+    """Parse a headless-babysit.log stamp into a UTC-aware datetime.
 
-    headless-babysit.log is the one source here that is NOT UTC: its writers
-    use `date '+%F %T'` with no `-u`, unlike ledger-append.sh (`date -u`) and
-    babysit_classify.py's iso()/now_dt(). `time.mktime` interprets the naive
-    struct in the process's CURRENT local timezone, which is exactly how the
-    line was produced -- self-consistent on whatever machine this runs on.
+    This log is the one source here that is NOT UTC (ledger-append.sh uses
+    `date -u`, babysit_classify.py's iso()/now_dt() are UTC throughout). Its
+    writers stamp local time plus the offset in force,
+    'YYYY-MM-DD HH:MM:SS -0700', which stays exact through the repeated
+    fall-back hour.
+
+    A row from before the offset has only the naive local time, read in the
+    process's current timezone (the machine that wrote it). Inside the
+    repeated hour that names two instants and the row cannot say which, so it
+    defaults to the first (fold=0). The old `time.mktime` read took the
+    second, landing a row up to an hour in the FUTURE of its own digest's
+    `now` -- out of every window, so a false `unobserved_sweeps` and
+    `gate.no_data` beside a healthy sweep. fold=0 errs at most an hour into
+    the past, and _date_log_rows_for_window() moves a row to fold=1 only when
+    the rows recorded around it prove that occurrence.
     """
     try:
-        naive = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
+        if len(s) > 19:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S %z").astimezone(timezone.utc)
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(fold=fold).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    epoch = time.mktime(naive.timetuple())
-    return datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+
+def _date_log_rows_for_window(events, since_dt, now_dt_):
+    """Settle each legacy repeated-hour row's occurrence from what was recorded.
+
+    A naive stamp in the repeated hour names two instants, and falling inside
+    a window proves neither: a 01:10 row from the first hour would pass for
+    current in any window over the second. The log is append-only, so a row is
+    no earlier than the rows above it and no later than the rows below it or
+    `now`. A row those bounds leave with one instant is dated by it, whichever
+    fold that is.
+
+    A row they leave with both keeps the first. If only the second is in the
+    window, it stays out and is flagged `occurrence_unknown`, so coverage says
+    neither "observed" nor "unobserved". Offset-stamped and unrepeated rows
+    name one instant and are unaffected.
+    """
+    rows = sorted(events, key=lambda e: e["line"])
+    instants = [(e["ts"], max(e["ts"], _log_ts_to_utc(e["stamp"], fold=1) or e["ts"]))
+                for e in rows]
+    earliest = []
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    for first, second in instants:
+        earliest.append(second if first < floor <= second else first)
+        floor = max(floor, earliest[-1])
+    dated = []
+    ceiling = now_dt_
+    for e, (first, second), early in zip(reversed(rows), reversed(instants), reversed(earliest)):
+        # A step back outranks `now`: an old window's log runs on past its `now`.
+        late = first if early == first and first <= ceiling < second else second
+        ceiling = min(ceiling, late)
+        if early == late:
+            e = {**e, "ts": late}
+        elif first < since_dt <= second <= now_dt_:
+            e = {**e, "occurrence_unknown": True}
+        dated.append(e)
+    return sorted(reversed(dated), key=lambda e: e["ts"])  # ties keep log order
 
 
 # ============================================================================
@@ -155,22 +205,25 @@ def in_window(rows, since_dt, now_dt_):
 
 
 def read_log_events(path):
-    """[{"kind": "fire"|"exit", "ts": dt, ...}], sorted ascending."""
+    """[{"kind": "fire"|"exit", "ts": dt, "stamp": str, "line": n, ...}],
+    sorted ascending."""
     events = []
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+            for n, line in enumerate(fh):
                 m = FIRE_RE.search(line)
                 if m:
-                    ts = _local_naive_to_utc(m.group(1))
+                    ts = _log_ts_to_utc(m.group(1))
                     if ts:
-                        events.append({"kind": "fire", "ts": ts, "prompt": m.group(2).strip()})
+                        events.append({"kind": "fire", "ts": ts, "stamp": m.group(1), "line": n,
+                                       "prompt": m.group(2).strip()})
                     continue
                 m = EXIT_RE.search(line)
                 if m:
-                    ts = _local_naive_to_utc(m.group(1))
+                    ts = _log_ts_to_utc(m.group(1))
                     if ts:
-                        events.append({"kind": "exit", "ts": ts, "rc": int(m.group(2))})
+                        events.append({"kind": "exit", "ts": ts, "stamp": m.group(1), "line": n,
+                                       "rc": int(m.group(2))})
     except (FileNotFoundError, OSError):
         return []
     events.sort(key=lambda e: e["ts"])
@@ -184,18 +237,19 @@ def read_gate_events(path):
     events = []
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+            for n, line in enumerate(fh):
                 m = GATE_SKIP_RE.search(line)
                 if m:
-                    ts = _local_naive_to_utc(m.group(1))
+                    ts = _log_ts_to_utc(m.group(1))
                     if ts:
-                        events.append({"kind": "skip", "ts": ts, "heartbeat_age_s": int(m.group(2))})
+                        events.append({"kind": "skip", "ts": ts, "stamp": m.group(1), "line": n,
+                                       "heartbeat_age_s": int(m.group(2))})
                     continue
                 m = GATE_RUN_RE.search(line)
                 if m:
-                    ts = _local_naive_to_utc(m.group(1))
+                    ts = _log_ts_to_utc(m.group(1))
                     if ts:
-                        events.append({"kind": "run", "ts": ts})
+                        events.append({"kind": "run", "ts": ts, "stamp": m.group(1), "line": n})
     except (FileNotFoundError, OSError):
         return []
     events.sort(key=lambda e: e["ts"])
@@ -268,18 +322,26 @@ def assess_coverage(log_events, ledger_rows_in_window, since_dt, now_dt_):
                          sweeps (e.g. headless and interactive sweeps mixed).
                          Counts fires only, never exits: an exit without its
                          fire is a window-boundary artifact, not coverage.
+      occurrence_unknown_rows  legacy repeated-hour rows that may or may not
+                         belong to this window (_date_log_rows_for_window).
+                         Left out of the counts above, so `stall` stays
+                         vacuous; they may also be the sweeps the ledger saw,
+                         so they hold off both launcher anomalies.
     """
     windowed = [e for e in log_events if since_dt <= e["ts"] <= now_dt_]
     fires = [e for e in windowed if e["kind"] == "fire"]
+    unknown = [e for e in log_events if e.get("occurrence_unknown")]
+    maybe_fires = len(fires) + sum(e["kind"] == "fire" for e in unknown)
     sweep_rows = [r for r in ledger_rows_in_window if r.get("event") == "sweep"]
     return {
         "fire_exit_rows": len(windowed),
         "fire_rows": len(fires),
         "sweep_rows": len(sweep_rows),
+        "occurrence_unknown_rows": len(unknown),
         "stall_no_data": len(windowed) == 0,
         "cadence_no_data": len(sweep_rows) < 2,
-        "unobserved_sweeps": len(sweep_rows) > 0 and len(windowed) == 0,
-        "partially_observed": len(sweep_rows) > 0 and len(fires) < len(sweep_rows),
+        "unobserved_sweeps": len(sweep_rows) > 0 and len(windowed) == 0 and not unknown,
+        "partially_observed": len(sweep_rows) > 0 and maybe_fires < len(sweep_rows),
     }
 
 
@@ -482,7 +544,12 @@ def fold(*, since_dt, now_dt_, ledger_path, log_path, cold_start=False):
     something a sweep or launcher already wrote."""
     all_ledger_rows = read_ledger(ledger_path)
     ledger_rows = in_window(all_ledger_rows, since_dt, now_dt_)
-    log_events = read_log_events(log_path)
+    # One file, so both row shapes bound each other's occurrence in the
+    # repeated fall-back hour (see _date_log_rows_for_window).
+    log_rows = _date_log_rows_for_window(
+        read_log_events(log_path) + read_gate_events(log_path), since_dt, now_dt_)
+    log_events = [e for e in log_rows if e["kind"] in ("fire", "exit")]
+    gate_events = [e for e in log_rows if e["kind"] in ("skip", "run")]
     gap_minutes = (now_dt_ - since_dt).total_seconds() / 60.0
     return {
         "since": iso(since_dt),
@@ -495,7 +562,7 @@ def fold(*, since_dt, now_dt_, ledger_path, log_path, cold_start=False):
         # Whether `stall`/`gap` can speak about this window at all. A sibling,
         # not folded into `stall`, so `stall` stays a plain list.
         "coverage": assess_coverage(log_events, ledger_rows, since_dt, now_dt_),
-        "gate": build_gate(read_gate_events(log_path), log_events, all_ledger_rows,
+        "gate": build_gate(gate_events, log_events, all_ledger_rows,
                            since_dt, now_dt_),
         "shipped": build_shipped(ledger_rows),
         "queue": build_queue(ledger_rows),

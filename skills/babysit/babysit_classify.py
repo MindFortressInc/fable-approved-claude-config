@@ -247,6 +247,17 @@ CLI_CRITICAL_MARKERS = (
     re.compile(r"🔴"),                                   # CR's own red marker
 )
 
+# ---- PRlaunch's CR-CLI attestation (the `review-gate/cr-cli` commit status) --
+# hooks/prlaunch-gate.sh `cr_cli_status_from` (published through
+# hooks/review-gate-status.sh, only when PRLAUNCH_PUBLISH_CR_STATUS=1) is the
+# ONE writer of this context. A clean review publishes exactly
+# `verdict=reviewed findings=0 seat=<s> run=<r>` as `success`. Full-match, so
+# everything else fails closed: findings=N and findings=n/a (a `success` that
+# proves no cleanliness), and verdict=skipped (published `pending` anyway).
+# seat/run may be `n/a`: they are optional on `record cr_cli`.
+CR_CLI_CONTEXT = "review-gate/cr-cli"
+CR_CLI_CLEAN_ATTESTATION_RE = re.compile(r"verdict=reviewed findings=0 seat=\S+ run=\S+")
+
 
 def _sha_eq(a, b):
     """Do two git SHAs name the same commit? UNKNOWN on either side is False.
@@ -839,6 +850,9 @@ def fetch_view(gh_bin, owner, repo, num):
 def _fetch_fail(repo, pr):
     return {
         "repo": repo, "number": pr["number"], "branch": "",
+        # The PR's own owner, so every action planned off this entry can
+        # address `gh -R <owner>/<repo>` without guessing an org.
+        "owner": pr.get("_owner") or OWNER_DEFAULT,
         "state": "FETCH_FAIL", "mergeable": None, "mss": None,
         "failing_checks": [], "red_failing": [], "tier": "", "lane": "owner",
         "last_cr_activity": "", "base": "",
@@ -848,8 +862,34 @@ def _fetch_fail(repo, pr):
         # prs[] row, and a renderer must never KeyError on a transient
         # FETCH_FAIL.
         "cli_findings_open": None, "ruled_via_pr_comment": [], "green_via": "",
-        "head_oid": "",
+        "head_oid": "", "cli_covers_head": False, "cli_attested_at_head": False,
     }
+
+
+def fetch_cr_cli_attestation(gh_bin, owner, repo, sha):
+    """The NEWEST `review-gate/cr-cli` status at `sha` in owner/repo, as
+    {state, description, creator}, or None.
+
+    The rollup classify_pr already holds carries a StatusContext's `context`
+    and `state` but not its `description`, which is the only place a clean
+    review is told apart from `findings=N`. So this is one extra REST read,
+    reached only for a PR whose rollup already shows the context `success`.
+    The LIST endpoint (not the combined `/status`) because only it names the
+    `creator`; GitHub returns it newest-first, so the first match is the
+    status in force. None on any failure -- the caller treats that as "no
+    attestation", the fail-closed direction.
+    """
+    d = gh_json(gh_bin, ["api", f"repos/{owner}/{repo}/commits/{sha}/statuses?per_page=100"])
+    if not isinstance(d, list):
+        return None
+    for st in d:
+        if isinstance(st, dict) and (st.get("context") or "") == CR_CLI_CONTEXT:
+            return {
+                "state": (st.get("state") or "").lower(),
+                "description": st.get("description") or "",
+                "creator": (((st.get("creator") or {}).get("login")) or "").lower(),
+            }
+    return None
 
 
 def fetch_resolved_roots(gh_bin, owner, repo, num):
@@ -1278,6 +1318,49 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
             cli_clean_at_head = (_findings_left(_body(newest_harvest)) == 0
                                  or _cli_open_cleared_by_waiver)
 
+    # A CLEAN ATTESTATION AT THIS HEAD IS CLI COVERAGE. The two sources above
+    # are babysit's own, so a commit /PRlaunch had already reviewed clean was
+    # reviewed again. PRlaunch's `review-gate/cr-cli` status (published only
+    # when PRLAUNCH_PUBLISH_CR_STATUS=1) answers the same question by commit
+    # identity: the status API is keyed by sha, so a status on any other
+    # commit, PR or repo is simply not in the answer.
+    #
+    # Sets BOTH flags: coverage alone would stop the launch while the green
+    # gate stayed shut -- never reviewable, never green.
+    #
+    # Same vetoes as the harvest path, plus "any known source that disagrees
+    # vetoes" for sources naming THIS head: a clean pass never overrules a
+    # finding still on the PR. Sources naming an OLDER head are not in
+    # conflict; the attestation just postdates them.
+    #
+    # AUTHOR GATE, same as harvest comments: anyone with write access (or a
+    # workflow holding `statuses: write`) can post a commit status under any
+    # context name, so only a status CREATED by a login in _ruling_authors()
+    # counts. Asked last, and only when the rollup shows the context `success`
+    # and nothing else already answered, so a PR that is clean on babysit's
+    # own sources spends no request here.
+    _cr_cli_rollup = next(
+        ((c.get("state") or "").upper() for c in scr
+         if (c.get("context") or "") == CR_CLI_CONTEXT), "")
+    cli_attested_at_head = False
+    if (not cli_clean_at_head
+            and _cr_cli_rollup == "SUCCESS"
+            and head_oid
+            and cli_open is None
+            and state not in ("HAS_ACTIONABLE", "TRIGGERED_WAITING")
+            and not (_hm and _sha_eq(_hm.group(1), head_oid)
+                     and _findings_left(_body(newest_harvest)) != 0
+                     and not _cli_open_cleared_by_waiver)
+            and not (_sha_eq(rec.get("head") or "", head_oid) and rec.get("total"))):
+        _att = fetch_cr_cli_attestation(gh_bin, owner, repo, head_oid) or {}
+        cli_attested_at_head = bool(
+            _att.get("state") == "success"
+            and _att.get("creator") in _trusted
+            and CR_CLI_CLEAN_ATTESTATION_RE.fullmatch(_att.get("description") or ""))
+    if cli_attested_at_head:
+        cli_covers_head = True
+        cli_clean_at_head = True
+
     # --- green tier (only CR-CLEAN PRs are green candidates) ---
     failing = failing_check_names(scr)
     red_failing = [n for n in failing if not check_is_cosmetic(n)]
@@ -1316,6 +1399,7 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
 
     return {
         "repo": repo, "number": pr["number"], "branch": branch,
+        "owner": owner,
         "cli_findings_open": cli_open,
         # Finding-keys ruled WAIVE via a structured PR comment this sweep
         # (harvest_ruling_comments), regardless of whether the local
@@ -1333,6 +1417,12 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
         "blurb": pr.get("title", ""),
         # The live head, so the attempt-cap gates can re-arm on a real push.
         "head_oid": head_oid,
+        # Some CLI review is known to cover the live head (babysit's own
+        # store row + harvest, or a clean attestation), so cli_launch skips it.
+        "cli_covers_head": cli_covers_head,
+        # True when the clean attestation, not babysit's own sources, made
+        # this head clean -- shows what the sweep chose not to re-review.
+        "cli_attested_at_head": cli_attested_at_head,
     }
 
 
@@ -1798,6 +1888,7 @@ def build_actions(entries, now, quiet):
                 continue
             actions.append({
                 "type": "fix", "repo": e["repo"], "pr": e["number"],
+                "owner": e.get("owner") or OWNER_DEFAULT,
                 "why": "CR left actionable inline comment(s) newer than last push",
                 "verify_open": True,
             })
@@ -1807,6 +1898,7 @@ def build_actions(entries, now, quiet):
     for e in bumps:
         actions.append({
             "type": "bump", "repo": e["repo"], "pr": e["number"],
+            "owner": e.get("owner") or OWNER_DEFAULT,
             "why": f"{e['state']}: consume this hour's CR refill "
                    f"(last CR activity {e['last_cr_activity'] or 'none'})",
             "verify_open": True, "comments": "@coderabbitai review",
@@ -1835,6 +1927,7 @@ def build_actions(entries, now, quiet):
                 and (e.get("base") or "") not in DEFAULT_BRANCHES):
             actions.append({
                 "type": "retarget", "repo": e["repo"], "pr": e["number"],
+                "owner": e.get("owner") or OWNER_DEFAULT,
                 "why": f"parent PR #{e.get('parent_pr')} merged — retarget to the "
                        f"default branch if the files do not overlap",
                 "verify_open": True, "mode": "retarget",
@@ -1843,6 +1936,7 @@ def build_actions(entries, now, quiet):
             continue
         actions.append({
             "type": "rebase", "repo": e["repo"], "pr": e["number"],
+            "owner": e.get("owner") or OWNER_DEFAULT,
             "why": f"{e['mss']} — bring branch current with {e['base'] or 'base'} "
                    f"(mechanical, in-lane)",
             "verify_open": True, "mode": "update-branch",
@@ -1855,6 +1949,7 @@ def build_actions(entries, now, quiet):
     for e in triage[:CI_TRIAGE_CAP]:
         actions.append({
             "type": "ci_triage", "repo": e["repo"], "pr": e["number"],
+            "owner": e.get("owner") or OWNER_DEFAULT,
             "why": f"CR-clean+mergeable but {e['mss']} on real check(s): "
                    f"{','.join(e['red_failing'])}",
             "verify_open": True,
@@ -1862,12 +1957,17 @@ def build_actions(entries, now, quiet):
 
     # cli_launch (Step 4.5) — stacked PRs, only when the owner is quiet, cap 3
     if quiet.startswith("yes"):
+        # A head some CLI review already covers (cli_covers_head: babysit's
+        # own store row and harvest agreeing, or a clean attestation) is not
+        # re-reviewed -- byte-identical code returns the same verdict.
         cli = [e for e in entries if e["state"] == "STACKED_BLOCKED"
                and e["cr_inline_count"] == 0
-               and e["base"] not in ("main", "master", "develop")]
+               and e["base"] not in ("main", "master", "develop")
+               and not e.get("cli_covers_head")]
         for e in cli[:CLI_CAP]:
             actions.append({
                 "type": "cli_launch", "repo": e["repo"], "pr": e["number"],
+                "owner": e.get("owner") or OWNER_DEFAULT,
                 "why": f"stacked PR (base {e['base']}) — cloud CR auto-disabled; "
                        f"run CR CLI locally (owner quiet)",
                 "verify_open": True, "mode": "stacked",
@@ -2134,6 +2234,47 @@ def should_skip(pr):
     return False
 
 
+VIEWER_OPEN_PRS_QUERY = (
+    "{viewer{pullRequests(states:OPEN,first:100,"
+    "orderBy:{field:UPDATED_AT,direction:DESC})"
+    "{totalCount nodes{repository{name nameWithOwner}}}}}")
+
+
+def empty_search_confirmed(gh_bin, owner, repos_filter=""):
+    """May an empty `gh search prs --author @me` be trusted?
+
+    The search index and the PR store are separate GitHub backends: during a
+    search incident `gh search prs` returns `[]` with exit 0, which gh_json
+    cannot tell from a genuinely empty queue -- and an empty queue is what
+    `decide()` turns into DRAINED, two of which in a row stop a `/loop`.
+    GraphQL `viewer.pullRequests` reads the PR store directly, so it is the
+    cross-check: one call, no repo inventory to remember.
+
+    True only when that lookup SUCCEEDS and shows no open PR of yours under
+    `owner` (and in --repos, if given). A failed lookup is unverified, and a
+    page that does not cover totalCount cannot prove absence: both are False,
+    never a DRAINED."""
+    d = gh_json(gh_bin, ["api", "graphql", "-f",
+                         "query=" + VIEWER_OPEN_PRS_QUERY])
+    try:
+        conn = d["data"]["viewer"]["pullRequests"]
+        total = int(conn["totalCount"])
+        nodes = list(conn["nodes"] or [])
+    except (TypeError, KeyError, ValueError):
+        return False
+    want = {r.strip().lower() for r in (repos_filter or "").split(",")
+            if r.strip()}
+    for n in nodes:
+        repo = (n or {}).get("repository") or {}
+        nwo = (repo.get("nameWithOwner") or "").lower()
+        if nwo.partition("/")[0] != (owner or "").lower():
+            continue
+        if want and (repo.get("name") or "").lower() not in want:
+            continue
+        return False
+    return len(nodes) >= total
+
+
 # ============================================================================
 # main sweep
 # ============================================================================
@@ -2145,6 +2286,12 @@ def sweep(repos_filter, state_path, gh_bin, owner=OWNER_DEFAULT):
         "--json", "repository,number,title,url,isDraft,labels,createdAt",
         "--limit", "100",
     ])
+    if found == [] and not empty_search_confirmed(gh_bin, owner, repos_filter):
+        # An empty list is NOT proof of an empty queue: a GitHub search
+        # incident returns `[]` for every query while the PRs are still open,
+        # and accepting it would report DRAINED. Unverified empty discovery
+        # takes the fetch-fail path below (PROGRESSING, prior counts carried).
+        found = None
     if found is None:
         # search itself FETCH_FAILed — emit valid JSON, do NOT auto-stop.
         prev = load_state(state_path)
