@@ -8,3 +8,4 @@ skills/assign/workstreams.db
 
 # deep-review: the cached copy of a COMMONLY_MISSED_SOURCE URL (hooks/commonly-missed.py).
 review/commonly-missed.md
+review/commonly-missed.md.source

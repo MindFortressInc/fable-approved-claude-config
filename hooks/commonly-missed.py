@@ -22,23 +22,29 @@ Configure it with COMMONLY_MISSED_SOURCE:
                               into every Step 3 agent prompt; always exit 0
 
 Content missing either required section is rejected, and a fetched copy that
-fails the check is never cached. If the source fails, an existing cached copy
-is used with an INFO line naming its age. With nothing usable, `prompt` prints
+fails the check is never cached. A fetch must stay on https (redirects
+included), carry no credentials in the URL, and finish within TIMEOUT seconds.
+If the source fails, a cached copy from the same URL is used with an INFO line
+naming its age; a copy cached from a different URL is never used. With nothing usable, `prompt` prints
 nothing on stdout and one INFO line on stderr, and the review continues with
 its built-in lenses. A missing lens file never blocks a review.
 """
 import datetime
+import http.client
 import os
 import re
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ENV = "COMMONLY_MISSED_SOURCE"
 INVARIANTS = "## Generic Review Invariants"
 CLASSES = "## Commonly Missed"
-TIMEOUT = 30
+TIMEOUT = 30          # whole fetch, not per socket read
 MAX_BYTES = 2 * 1024 * 1024
+CHUNK = 64 * 1024
 
 PREAMBLE = """\
 > "Check the diff against each Generic Review Invariant and each numbered
@@ -65,6 +71,19 @@ def _cache():
     return os.path.join(os.path.expanduser("~"), ".claude", "review", "commonly-missed.md")
 
 
+def _cache_source():
+    """Sidecar naming the URL the cached copy came from."""
+    return _cache() + ".source"
+
+
+def _display(path):
+    """`path` with the home directory shown as `~`: INFO lines may be published."""
+    home = os.path.expanduser("~")
+    if path == home or path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
 def _missing(text):
     """The required headings `text` lacks; [] means it is a usable lens file."""
     present = {line.rstrip() for line in (text or "").splitlines()}
@@ -80,7 +99,20 @@ def _read_file(path):
         with open(path, encoding="utf-8") as fh:
             return fh.read(), None
     except (OSError, UnicodeDecodeError) as exc:
-        return None, "cannot read %s (%s)" % (path, getattr(exc, "strerror", None) or type(exc).__name__)
+        return None, "cannot read %s (%s)" % (_display(path), getattr(exc, "strerror", None) or type(exc).__name__)
+
+
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only while it stays on https."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise urllib.error.HTTPError(req.full_url, code, "redirect leaves https", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open(url):
+    return urllib.request.build_opener(_HttpsOnlyRedirects).open(url, timeout=TIMEOUT)
 
 
 def _fetch(url):
@@ -93,11 +125,30 @@ def _fetch(url):
     if not url.lower().startswith("https://"):
         return None, "only https:// URLs are fetched"
     try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
-            body = resp.read(MAX_BYTES + 1)
+        parts = urllib.parse.urlsplit(url)
+        has_userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        return None, "the URL does not parse"
+    if has_userinfo:
+        return None, "a URL with credentials in it is refused"
+    deadline = time.monotonic() + TIMEOUT
+    try:
+        with _open(url) as resp:
+            if not resp.geturl().lower().startswith("https://"):
+                return None, "the fetch left https"
+            chunks, size = [], 0
+            while size <= MAX_BYTES:
+                if time.monotonic() > deadline:
+                    return None, "fetch timed out after %ds" % TIMEOUT
+                chunk = resp.read(CHUNK)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            body = b"".join(chunks)
     except urllib.error.HTTPError as exc:
         return None, "fetch failed (HTTP %d)" % exc.code
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         return None, "fetch failed (%s)" % type(exc).__name__
     if len(body) > MAX_BYTES:
         return None, "fetched file is over %d bytes" % MAX_BYTES
@@ -119,7 +170,7 @@ def _write(dest, text):
             os.unlink(tmp)
         except OSError:
             pass
-        return "cannot write %s (%s)" % (dest, exc.strerror or type(exc).__name__)
+        return "cannot write %s (%s)" % (_display(dest), exc.strerror or type(exc).__name__)
     return None
 
 
@@ -137,25 +188,35 @@ def sync():
         path = os.path.expanduser(src)
         text, err = _read_file(path)
         if err is None and _missing(text):
-            err = "%s: %s" % (path, _missing_msg(text))
+            err = "%s: %s" % (_display(path), _missing_msg(text))
         if err:
             _info("lens file unavailable (%s); continuing with the built-in lenses only" % err)
             return None, None, False
-        return text, path, True
+        return text, _display(path), True
+    origin = _origin(src)
     text, err = _fetch(src)
     if err is None and _missing(text):
         err = _missing_msg(text)
     if err is None:
-        write_err = _write(_cache(), text)
+        # Unclaim the cache, write it, then claim it: a failure part-way leaves
+        # a copy no source claims, never one claimed by the wrong URL.
+        try:
+            os.unlink(_cache_source())
+        except OSError:
+            pass
+        write_err = _write(_cache(), text) or _write(_cache_source(), origin + "\n")
         if write_err:
             _info("fetched but not cached (%s); using the fetched copy" % write_err)
-        return text, _origin(src), True
+        return text, origin, True
     dest = _cache()
-    cached, _ = _read_file(dest) if os.path.exists(dest) else (None, None)
+    cached_from, _ = _read_file(_cache_source()) if os.path.exists(_cache_source()) else (None, None)
+    cached = None
+    if (cached_from or "").strip() == origin and os.path.exists(dest):
+        cached, _ = _read_file(dest)
     if cached is not None and not _missing(cached):
         age = datetime.datetime.fromtimestamp(os.path.getmtime(dest)).isoformat(timespec="minutes")
         _info("not refreshed (%s); using the copy cached %s" % (err, age))
-        return cached, "cached copy from %s" % age, False
+        return cached, "cached copy of %s from %s" % (origin, age), False
     _info("lens file unavailable (%s); continuing with the built-in lenses only" % err)
     return None, None, False
 
@@ -183,7 +244,11 @@ def prompt():
 
 def main(argv):
     if argv[1:] == ["sync"]:
-        text, source, fresh = sync()
+        try:
+            text, source, fresh = sync()
+        except Exception as exc:
+            _info("loader failed (%s)" % type(exc).__name__)
+            return 1
         if text is not None:
             print("lens file <- %s" % source)
         return 0 if fresh else 1

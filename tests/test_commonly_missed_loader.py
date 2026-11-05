@@ -7,6 +7,7 @@ an https:// URL). These tests pin that the unset path does nothing at all, that
 every invariant and class in the lens file reaches the assembled prompt, and
 the fallback order for a URL source: fetch, else cached copy, else nothing.
 """
+import http.client
 import importlib.util
 import io
 import os
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import unittest
 import urllib.error
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -73,6 +75,13 @@ def _load_module():
 
 
 class _Resp(io.BytesIO):
+    def __init__(self, body, url=URL):
+        super().__init__(body)
+        self.url = url
+
+    def geturl(self):
+        return self.url
+
     def __enter__(self):
         return self
 
@@ -177,6 +186,11 @@ class LocalFileSourceTest(SubprocessTestBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("18. **Sibling-appended class.**", out)
 
+    def test_info_lines_show_the_home_directory_as_tilde(self):
+        _, _, err = self.run_loader("prompt", source="~/nope.md")
+        self.assertIn("cannot read ~/nope.md", err)
+        self.assertNotIn(self.sb.home, err)
+
     def test_a_missing_file_is_one_info_line_and_an_empty_prompt(self):
         rc, out, err = self.run_loader("prompt", source=os.path.join(self.sb.dir, "nope.md"))
         self.assertEqual((rc, out), (0, ""))
@@ -207,7 +221,7 @@ class LocalFileSourceTest(SubprocessTestBase):
 
 
 class UrlSourceTest(unittest.TestCase):
-    """In-process, with urlopen patched: no network, no real HOME."""
+    """In-process, with the opener patched: no network, no real HOME."""
 
     def setUp(self):
         self.sb = HookSandbox()
@@ -220,25 +234,27 @@ class UrlSourceTest(unittest.TestCase):
         self.env.stop()
         self.sb.close()
 
-    def run_main(self, cmd, urlopen):
+    def run_main(self, cmd, opener):
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(self.mod.urllib.request, "urlopen", urlopen), \
+        with mock.patch.object(self.mod, "_open", opener), \
                 redirect_stdout(out), redirect_stderr(err):
             rc = self.mod.main(["commonly-missed.py", cmd])
         return rc, out.getvalue(), err.getvalue()
 
-    def seed_cache(self, text=FIXTURE):
+    def seed_cache(self, text=FIXTURE, source=URL):
         os.makedirs(os.path.dirname(self.cache))
         with open(self.cache, "w", encoding="utf-8") as fh:
             fh.write(text)
+        with open(self.cache + ".source", "w", encoding="utf-8") as fh:
+            fh.write(source + "\n")
 
     @staticmethod
-    def serves(text):
-        return lambda url, timeout: _Resp(text.encode("utf-8"))
+    def serves(text, final_url=URL):
+        return lambda url: _Resp(text.encode("utf-8"), final_url)
 
     @staticmethod
     def fails(exc):
-        def _open(url, timeout):
+        def _open(url):
             raise exc
         return _open
 
@@ -298,6 +314,54 @@ class UrlSourceTest(unittest.TestCase):
         self.assertIn("18. **Sibling-appended class.**", out)
         self.assertEqual(len(_info_lines(err)), 1, err)
         self.assertIn("not cached", err)
+
+    def test_a_redirect_off_https_is_refused(self):
+        handler = self.mod._HttpsOnlyRedirects()
+        req = urllib.request.Request(URL)
+        with self.assertRaises(urllib.error.HTTPError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://evil.example.test/x.md")
+        self.assertIsNotNone(handler.redirect_request(req, None, 302, "Found", {}, URL + "?v=2"))
+
+    def test_a_response_that_ended_off_https_is_not_used(self):
+        rc, out, err = self.run_main("prompt", self.serves(FIXTURE, final_url="http://evil.example.test/x.md"))
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("left https", err)
+        self.assertFalse(os.path.exists(self.cache))
+
+    def test_a_url_with_credentials_is_refused_without_echoing_them(self):
+        os.environ["COMMONLY_MISSED_SOURCE"] = "https://alice:s3cret@lenses.example.test/x.md"
+        for cmd in ("prompt", "sync"):
+            rc, out, err = self.run_main(cmd, self.serves(FIXTURE))
+            self.assertEqual(out, "")
+            self.assertIn("credentials", err)
+            self.assertNotIn("s3cret", err)
+        self.assertEqual(rc, 1)
+
+    def test_an_http_protocol_error_still_falls_back_to_the_cache(self):
+        self.seed_cache()
+        rc, out, err = self.run_main("prompt", self.fails(http.client.IncompleteRead(b"partial")))
+        self.assertEqual(rc, 0)
+        self.assertIn("IncompleteRead", err)
+        self.assertIn("using the copy cached", err)
+        self.assertIn("### 1. Fail closed", out)
+
+    def test_a_copy_cached_from_another_url_is_never_used(self):
+        self.seed_cache(source="https://other.example.test/lens.md")
+        rc, out, err = self.run_main("prompt", self.fails(urllib.error.URLError("dns")))
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("built-in lenses", err)
+
+    def test_the_cached_source_line_names_the_url(self):
+        self.seed_cache()
+        rc, out, _ = self.run_main("prompt", self.fails(urllib.error.URLError("dns")))
+        self.assertIn("Source: `cached copy of %s from " % URL, out)
+
+    def test_a_slow_fetch_hits_the_overall_deadline(self):
+        clock = iter([0, 0, self.mod.TIMEOUT + 1])
+        with mock.patch.object(self.mod.time, "monotonic", lambda: next(clock)):
+            rc, out, err = self.run_main("prompt", self.serves(FIXTURE))
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("timed out", err)
 
     def test_an_unexpected_error_never_blocks_the_review(self):
         rc, out, err = self.run_main("prompt", self.fails(RuntimeError("boom")))
