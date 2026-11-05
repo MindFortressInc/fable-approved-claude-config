@@ -11,7 +11,7 @@ Configure it with COMMONLY_MISSED_SOURCE:
 
   unset or empty     off. Both commands print nothing and exit 0.
   /path/to/file.md   read the file in place (`~` is expanded).
-  https://host/x.md  fetch it, then cache it at
+  an https:// URL    fetch it, then cache it at
                      ~/.claude/review/commonly-missed.md so a later review
                      still has it when the fetch fails.
 

@@ -98,11 +98,12 @@ class DeepReviewRunsTheLoaderTest(unittest.TestCase):
         self.assertIn("COMMONLY_MISSED_SOURCE", self.step3)
         self.assertIn("Off by default", self.step3)
 
-    def test_no_private_source_is_named(self):
+    def test_the_only_source_is_the_configured_one(self):
+        # No built-in clone path, repo slug or URL: unset must mean off.
         with open(LOADER, encoding="utf-8") as fh:
             src = fh.read()
-        for text in (src, self.step3):
-            self.assertNotRegex(text, r"(?i)reeve|mindfortress|Coding_MM")
+        self.assertNotRegex(src, r"https://[\w.-]+/|gh api|repos/|git\b.*\bshow\b")
+        self.assertEqual(re.findall(r"os\.environ\.get\(([^)]*)\)", src), ["ENV"])
 
     def test_the_cached_copy_is_gitignored(self):
         proc = subprocess.run(["git", "-C", REPO_ROOT, "check-ignore", "-q", "review/commonly-missed.md"],

@@ -225,7 +225,7 @@ class CoreIsInlineTest(unittest.TestCase):
         self.assertIn("Skip this unless you turned it on", self.core)
         for text in [self.core, _refs()["codex-lane.md"]]:
             self.assertNotIn("ON by default", text)
-            self.assertNotRegex(text, r"(?i)gpt-\d|astra")
+            self.assertIn("CODEX_REVIEW_ENABLED=1", text)
         self.assertIn("Off unless you turn it on.", _refs()["codex-lane.md"])
 
     def test_test_vacuity_never_reverts_with_git_stash(self):
