@@ -53,8 +53,9 @@ Codex runs with no tracker or memory access of its own, so Claude does all disco
 2. Dispatch plain `codex exec` per lane — read-only is not a knob, and the `review` subcommand ignores `--output-schema`:
 
    ```bash
-   codex exec -s read-only -C /absolute/repo \
-     ${CODEX_REVIEW_MODEL:+-m "$CODEX_REVIEW_MODEL"} \
+   MODEL_FLAG=()   # an array: zsh does not word-split, so a string "-m x" would arrive as one argument
+   [ -n "${CODEX_REVIEW_MODEL:-}" ] && MODEL_FLAG=(-m "$CODEX_REVIEW_MODEL")
+   codex exec -s read-only -C /absolute/repo "${MODEL_FLAG[@]}" \
      --output-schema "$HOME/.claude/skills/ticket-review/references/codex-ticket-result.schema.json" \
      -o "$REVIEW_RUN/codex/r1_result.json" \
      - < "$REVIEW_RUN/briefs/r1_brief.txt" > "$REVIEW_RUN/codex/r1_stream.log" 2>&1
