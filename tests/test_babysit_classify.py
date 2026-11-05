@@ -25,6 +25,7 @@ Written as unittest.TestCase so it runs under pytest and unittest alike.
 import atexit
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1105,6 +1106,11 @@ class OwnerOnEveryActionTests(SweepCase):
                      "gh -R <owner>/<repo> pr comment <pr> --body \"@coderabbitai review\"",
                      "gh run list -R <owner>/<repo> --branch"):
             self.assertIn(call, doc)
+        # No per-PR `gh pr`/`gh run` command (one naming a `<pr>`/`<id>`/...
+        # placeholder) may lean on the cwd's repo either.
+        implicit = [m.group(0) for m in re.finditer(r"`gh (?:pr|run) [^`]*<[a-z_]+>[^`]*`", doc)
+                    if "-R <owner>/<repo>" not in m.group(0)]
+        self.assertEqual(implicit, [])
 
 
 # ===========================================================================
@@ -1163,6 +1169,24 @@ class EmptySearchCrossCheckTests(SweepCase):
                          "DRAINED")
         self.assertEqual(run_sweep(self.fx, self.state, repos="busy").get("error"),
                          "search_fetch_fail")
+
+    def test_an_unreadable_pr_store_answer_is_unverified(self):
+        """In-process: shapes the function cannot read never confirm a drain."""
+        def viewer(nodes, total):
+            return {"data": {"viewer": {"pullRequests": {"totalCount": total,
+                                                         "nodes": nodes}}}}
+        ok = {"repository": {"name": "x", "nameWithOwner": "other/x"}}
+        for name, payload, owner in (
+                ("non-dict node", viewer(["junk"], 1), OWNER),
+                ("null node", viewer([None], 1), OWNER),
+                ("non-dict repository", viewer([{"repository": "x"}], 1), OWNER),
+                ("bool total", viewer([], True), OWNER),
+                ("negative total", viewer([], -1), OWNER),
+                ("no owner", viewer([ok], 1), "")):
+            with self.subTest(name), mock.patch.object(bc, "gh_json", return_value=payload):
+                self.assertFalse(bc.empty_search_confirmed("gh", owner), name)
+        with mock.patch.object(bc, "gh_json", return_value=viewer([ok], 1)):
+            self.assertTrue(bc.empty_search_confirmed("gh", OWNER), "control")
 
     def test_a_non_empty_search_never_spends_the_cross_check(self):
         f = Fixtures(self.fx)
@@ -1311,6 +1335,52 @@ class AttestationCoverageTests(SweepCase):
         pr = self.pr(out, 1431)
         self.assertIsNotNone(pr["cli_findings_open"])
         self.assertFalse(pr["cli_attested_at_head"])
+        self.assertEqual(pr["tier"], "")
+
+    def test_a_dirty_harvest_at_head_vetoes_even_when_it_is_not_the_newest(self):
+        """Two CLI runs finished out of order: the harvest naming the live head
+        has an open major, a NEWER clean one names an older head."""
+        head = default_head(1436)
+        self._stacked(1436, statuses=[self.status()], commit_date=ago(60),
+                      issues=[cr_issue(STACKED_BODY, ago(300)),
+                              harvest(ago(20), head, unapplied=1, major=1),
+                              clean_harvest(ago(10), "d" * 40)])
+        pr = self.pr(self.sweep(), 1436)
+        self.assertIsNone(pr["cli_findings_open"])
+        self.assertFalse(pr["cli_attested_at_head"], pr)
+        self.assertEqual(pr["tier"], "")
+
+    def test_a_dirty_harvest_at_head_vetoes_when_it_predates_the_push(self):
+        """The ageing clock retires the harvest (cli_open stays None), but it
+        still names THIS head with findings, so it is not clean."""
+        head = default_head(1437)
+        self._stacked(1437, statuses=[self.status()], commit_date=ago(5),
+                      issues=[cr_issue(STACKED_BODY, ago(300)),
+                              harvest(ago(10), head, unapplied=1, critical=1)])
+        pr = self.pr(self.sweep(), 1437)
+        self.assertIsNone(pr["cli_findings_open"])
+        self.assertFalse(pr["cli_attested_at_head"], pr)
+        self.assertEqual(pr["tier"], "")
+
+    def test_open_findings_from_a_harvest_naming_an_older_head_veto(self):
+        self._stacked(1438, statuses=[self.status()], commit_date=ago(60),
+                      issues=[cr_issue(STACKED_BODY, ago(300)),
+                              harvest(ago(10), "d" * 40, unapplied=1, major=1)])
+        pr = self.pr(self.sweep(), 1438)
+        self.assertIsNotNone(pr["cli_findings_open"])
+        self.assertFalse(pr["cli_attested_at_head"], pr)
+        self.assertEqual(pr["tier"], "")
+
+    def test_cloud_review_still_in_flight_vetoes(self):
+        """CodeRabbit's own "reviewing now" placeholder: the cloud channel may
+        still have more to say, so a clean CLI pass must not wave it through."""
+        self.f.add_pr("acme-api", 1439, head_oid=default_head(1439), scr=[CR_CLI_OK],
+                      issues=[cr_issue(TRIGGERED_BODY, ago(5))])
+        _w(os.path.join(self.fx, f"api_repos_{OWNER}_acme-api_commits_{default_head(1439)}_statuses.json"),
+           [self.status()])
+        pr = self.pr(self.sweep(), 1439)
+        self.assertEqual(pr["state"], "TRIGGERED_WAITING")
+        self.assertFalse(pr["cli_attested_at_head"], pr)
         self.assertEqual(pr["tier"], "")
 
     def test_store_row_with_findings_at_this_head_vetoes(self):

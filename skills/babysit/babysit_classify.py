@@ -852,7 +852,7 @@ def _fetch_fail(repo, pr):
         "repo": repo, "number": pr["number"], "branch": "",
         # The PR's own owner, so every action planned off this entry can
         # address `gh -R <owner>/<repo>` without guessing an org.
-        "owner": pr.get("_owner") or OWNER_DEFAULT,
+        "owner": pr.get("_owner") or "",
         "state": "FETCH_FAIL", "mergeable": None, "mss": None,
         "failing_checks": [], "red_failing": [], "tier": "", "lane": "owner",
         "last_cr_activity": "", "base": "",
@@ -1339,6 +1339,21 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     # counts. Asked last, and only when the rollup shows the context `success`
     # and nothing else already answered, so a PR that is clean on babysit's
     # own sources spends no request here.
+    #
+    # "Sources naming THIS head" means EVERY trusted harvest, not only the
+    # newest: two CLI runs can finish out of order, leaving a dirty harvest at
+    # the live head buried under a newer clean one about an older head (and
+    # the store row naming that older head too). The newest harvest is the one
+    # the waiver machinery speaks for, so only its findings can be cleared by
+    # a ruling; an older dirty harvest at this head always vetoes.
+    def _dirty_at_head(c):
+        m = CLI_REVIEWED_HEAD_RE.search(_body(c))
+        if not (m and _sha_eq(m.group(1), head_oid)):
+            return False
+        if c is newest_harvest and _cli_open_cleared_by_waiver:
+            return False
+        return _findings_left(_body(c)) != 0
+
     _cr_cli_rollup = next(
         ((c.get("state") or "").upper() for c in scr
          if (c.get("context") or "") == CR_CLI_CONTEXT), "")
@@ -1348,9 +1363,7 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
             and head_oid
             and cli_open is None
             and state not in ("HAS_ACTIONABLE", "TRIGGERED_WAITING")
-            and not (_hm and _sha_eq(_hm.group(1), head_oid)
-                     and _findings_left(_body(newest_harvest)) != 0
-                     and not _cli_open_cleared_by_waiver)
+            and not any(_dirty_at_head(c) for c in cli_harvests)
             and not (_sha_eq(rec.get("head") or "", head_oid) and rec.get("total"))):
         _att = fetch_cr_cli_attestation(gh_bin, owner, repo, head_oid) or {}
         cli_attested_at_head = bool(
@@ -1888,7 +1901,7 @@ def build_actions(entries, now, quiet):
                 continue
             actions.append({
                 "type": "fix", "repo": e["repo"], "pr": e["number"],
-                "owner": e.get("owner") or OWNER_DEFAULT,
+                "owner": e.get("owner"),
                 "why": "CR left actionable inline comment(s) newer than last push",
                 "verify_open": True,
             })
@@ -1898,7 +1911,7 @@ def build_actions(entries, now, quiet):
     for e in bumps:
         actions.append({
             "type": "bump", "repo": e["repo"], "pr": e["number"],
-            "owner": e.get("owner") or OWNER_DEFAULT,
+            "owner": e.get("owner"),
             "why": f"{e['state']}: consume this hour's CR refill "
                    f"(last CR activity {e['last_cr_activity'] or 'none'})",
             "verify_open": True, "comments": "@coderabbitai review",
@@ -1927,7 +1940,7 @@ def build_actions(entries, now, quiet):
                 and (e.get("base") or "") not in DEFAULT_BRANCHES):
             actions.append({
                 "type": "retarget", "repo": e["repo"], "pr": e["number"],
-                "owner": e.get("owner") or OWNER_DEFAULT,
+                "owner": e.get("owner"),
                 "why": f"parent PR #{e.get('parent_pr')} merged — retarget to the "
                        f"default branch if the files do not overlap",
                 "verify_open": True, "mode": "retarget",
@@ -1936,7 +1949,7 @@ def build_actions(entries, now, quiet):
             continue
         actions.append({
             "type": "rebase", "repo": e["repo"], "pr": e["number"],
-            "owner": e.get("owner") or OWNER_DEFAULT,
+            "owner": e.get("owner"),
             "why": f"{e['mss']} — bring branch current with {e['base'] or 'base'} "
                    f"(mechanical, in-lane)",
             "verify_open": True, "mode": "update-branch",
@@ -1949,7 +1962,7 @@ def build_actions(entries, now, quiet):
     for e in triage[:CI_TRIAGE_CAP]:
         actions.append({
             "type": "ci_triage", "repo": e["repo"], "pr": e["number"],
-            "owner": e.get("owner") or OWNER_DEFAULT,
+            "owner": e.get("owner"),
             "why": f"CR-clean+mergeable but {e['mss']} on real check(s): "
                    f"{','.join(e['red_failing'])}",
             "verify_open": True,
@@ -1967,7 +1980,7 @@ def build_actions(entries, now, quiet):
         for e in cli[:CLI_CAP]:
             actions.append({
                 "type": "cli_launch", "repo": e["repo"], "pr": e["number"],
-                "owner": e.get("owner") or OWNER_DEFAULT,
+                "owner": e.get("owner"),
                 "why": f"stacked PR (base {e['base']}) — cloud CR auto-disabled; "
                        f"run CR CLI locally (owner quiet)",
                 "verify_open": True, "mode": "stacked",
@@ -2258,21 +2271,28 @@ def empty_search_confirmed(gh_bin, owner, repos_filter=""):
                          "query=" + VIEWER_OPEN_PRS_QUERY])
     try:
         conn = d["data"]["viewer"]["pullRequests"]
+        if isinstance(conn["totalCount"], bool):
+            return False
         total = int(conn["totalCount"])
         nodes = list(conn["nodes"] or [])
     except (TypeError, KeyError, ValueError):
         return False
+    if not owner:
+        return False
     want = {r.strip().lower() for r in (repos_filter or "").split(",")
             if r.strip()}
     for n in nodes:
-        repo = (n or {}).get("repository") or {}
+        # A node this function cannot read is a PR it cannot rule out.
+        repo = n.get("repository") if isinstance(n, dict) else None
+        if not isinstance(repo, dict):
+            return False
         nwo = (repo.get("nameWithOwner") or "").lower()
-        if nwo.partition("/")[0] != (owner or "").lower():
+        if nwo.partition("/")[0] != owner.lower():
             continue
         if want and (repo.get("name") or "").lower() not in want:
             continue
         return False
-    return len(nodes) >= total
+    return total >= 0 and len(nodes) >= total
 
 
 # ============================================================================
