@@ -1,6 +1,6 @@
 # Deep review reference: empirical validation
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** depth is Standard or Deep (5a, 5c); the diff touches a charge, reservation, hold or save path (5c); or depth is Deep or the diff touches a migration, deploy config, env var, router or new file, rate limit, background task, database query or external service (5d).
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** depth is Standard or Deep (5a, 5c); the diff touches a charge, reservation, hold or save path (5c); depth is Deep or the diff touches a migration, deploy config, env var, router or new file, rate limit, background task, database query or external service (5d).
 
 ## 5. Empirical Validation
 

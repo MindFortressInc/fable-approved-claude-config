@@ -1,6 +1,6 @@
 # Deep review reference: mechanical passes
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** every review, at Steps 1.5 and 1.6. This repo publishes no scripted detector or caller enumerator yet, so the tables and recipe below are what you run.
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** every review, at Steps 1.5 and 1.6: it holds the detector checklist and the caller-enumeration recipe (this repo publishes no scripted version of either yet). This repo publishes no scripted detector or caller enumerator yet, so the tables and recipe below are what you run.
 
 ## 1.5. AI-Cheat Mechanical Pass (v7.2)
 
@@ -47,7 +47,7 @@ The table below IS the checklist: run each detector by reading the diff (`git di
 
 ## 1.6. Changed-Surface Enumeration (v7.3)
 
-Diff-scoped review has a documented recall gap: independent 2026 benchmarking puts Greptile (which indexes the whole codebase before reviewing the diff) at 82% bug-catch vs CodeRabbit's 44%, and the canonical miss is "a function returns a new type that breaks three callers in files you didn't touch." Nothing in Steps 1-1.5 enumerates callers of a changed signature — this step does, mechanically, like the file-size threshold check above it.
+Diff-scoped review has a documented recall gap: independent 2026 benchmarking puts Greptile (which indexes the whole codebase before reviewing the diff) at 82% bug-catch vs CodeRabbit's 44%, and the canonical miss is "a function returns a new type that breaks three callers in files you didn't touch." Nothing in Steps 1-1.5 enumerates callers of a changed signature — this step does, mechanically, like the core's file-size threshold check.
 
 **Noise budget is the constraint, not the reach.** The same benchmark that gives Greptile 82% recall charges it 11 false positives per run against CodeRabbit's 2 — reach without a filter imports that number. This step stays quiet by only ever asserting "broken" when it's mechanically certain (a renamed symbol's old name no longer resolves anywhere in its own file); everything short of that certainty is handed to Step 3's signature-compatibility lens as a candidate, never printed as a finding on its own.
 

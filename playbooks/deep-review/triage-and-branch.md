@@ -1,6 +1,6 @@
 # Deep review reference: triage and branch alignment
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you are reviewing a PR rather than your own local diff, this is a re-review, CI is red, the diff is over 10K lines, other open PRs may share these files, or the core's Step 2 check shows the branch is behind its base.
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you are reviewing a PR rather than your own local diff, this is a re-review or a paired multi-repo review, CI is red, the diff is over 10K lines, or Step 2 below shows the branch is behind its base.
 
 ## 0. Input
 

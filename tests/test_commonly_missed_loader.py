@@ -57,6 +57,7 @@ Intro line.
 
 Must not be pasted.
 """
+TRAILING_H1 = FIXTURE.replace("## Trailing section\n\nMust not be pasted.\n", "") + "# Appendix\n\nPrivate notes.\n"
 
 
 def _markers(content):
@@ -173,6 +174,12 @@ class LocalFileSourceTest(SubprocessTestBase):
         self.assertNotIn("Must not be pasted", out)
         self.assertEqual(err, "")
 
+    def test_a_top_level_heading_ends_the_classes_section(self):
+        rc, out, err = self.run_loader("prompt", source=self.write("lens.md", TRAILING_H1))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("18. **Sibling-appended class.**", out)
+        self.assertNotIn("Private notes", out)
+
     def test_a_local_file_is_read_in_place_never_cached(self):
         rc, out, _ = self.run_loader("sync", source=self.write("lens.md", FIXTURE))
         self.assertEqual(rc, 0)
@@ -246,7 +253,7 @@ class UrlSourceTest(unittest.TestCase):
         with open(self.cache, "w", encoding="utf-8") as fh:
             fh.write(text)
         with open(self.cache + ".source", "w", encoding="utf-8") as fh:
-            fh.write(source + "\n")
+            fh.write(self.mod._source_key(source) + "\n")
 
     @staticmethod
     def serves(text, final_url=URL):
@@ -350,6 +357,19 @@ class UrlSourceTest(unittest.TestCase):
         rc, out, err = self.run_main("prompt", self.fails(urllib.error.URLError("dns")))
         self.assertEqual((rc, out), (0, ""))
         self.assertIn("built-in lenses", err)
+
+    def test_a_url_differing_only_by_query_has_its_own_cache(self):
+        self.seed_cache()
+        os.environ["COMMONLY_MISSED_SOURCE"] = URL + "?ref=team-b"
+        rc, out, err = self.run_main("prompt", self.fails(urllib.error.URLError("dns")))
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("built-in lenses", err)
+
+    def test_the_cache_key_never_stores_the_query_string(self):
+        os.environ["COMMONLY_MISSED_SOURCE"] = URL + "?token=s3cret"
+        self.run_main("sync", self.serves(FIXTURE))
+        with open(self.cache + ".source", encoding="utf-8") as fh:
+            self.assertNotIn("s3cret", fh.read())
 
     def test_the_cached_source_line_names_the_url(self):
         self.seed_cache()

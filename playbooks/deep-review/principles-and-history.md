@@ -1,6 +1,6 @@
 # Deep review reference: principles and version history
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you are deciding whether a step applies to this review, or you are changing this process.
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you approve a PR, decide whether a step applies, or change this process.
 
 ## Principles
 

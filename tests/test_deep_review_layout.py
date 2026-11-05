@@ -6,6 +6,7 @@ it. The core that runs on every review now sits between markers in PRlaunch
 section 1, and everything else moved unchanged to playbooks/deep-review/.
 These tests pin that nothing fell out of reach.
 """
+import collections
 import glob
 import os
 import re
@@ -49,92 +50,99 @@ MOVED_RULES = {
 HEADING_RE = re.compile(r"(#+)\s+(.*?)\s*$")
 
 # Every heading of commands/deep-review.md at v7.7, the last commit before the
-# split, minus "#" level and the version number on the title. Deleting one
-# from here is deleting a section.
-OLD_HEADINGS = [
-    'Deep Review Process',
-    '0. Input',
-    'Determine review iteration',
-    'Re-review process (2nd+ iteration)',
-    'Key differences from first review',
-    'Ticket resolution (v7.4)',
-    '1. Triage',
-    'Gather context',
-    'CI / Checks status',
-    'Classify depth',
-    'File-size threshold (mechanical, v6.8)',
-    'Large PRs (>10K lines)',
-    'Check cross-PR conflicts',
-    'Generated-code exclusions (v7.1)',
-    '1.5. AI-Cheat Mechanical Pass (v7.2)',
-    '1.6. Changed-Surface Enumeration (v7.3)',
-    '2. Branch Alignment (mandatory)',
-    'Process',
-    'Multi-repo reviews: directory verification',
-    'Squash-merge ancestry',
-    'Orthogonal divergence',
-    'Why this step exists',
-    '3. Static Analysis (parallel agents)',
-    'Severity criteria (include in every prompt)',
-    'Required finding format (v6.9, include in every prompt)',
-    'Repo invariants (v7.0, mandatory)',
-    'Commonly missed (mandatory, every repo)',
-    'Agent types',
-    'Quality reviewer: detection prompts',
-    'Ticket-compliance agent (v7.4)',
-    'Multi-PR same-repo: branch contamination',
-    'Diff format for agent prompts (v7.1)',
-    'Codex second-opinion lane (optional, OFF by default, v7.5)',
-    '3.5 Adversarial refute pass (before consolidation)',
-    'Diff format for refuter prompts (v7.1)',
-    'Precedent ledger loader (v7.1)',
-    '4. Consolidation',
-    'Severity decision table (v6.9)',
-    'Ticket-compliance severity mapping (v7.4)',
-    'Classify finding origin',
-    'Codex second-opinion divergence (v7.5)',
-    'Structural severity calibration (v6.8)',
-    'The code-judo question (v6.8)',
-    '5. Empirical Validation',
-    '5a. Setup',
-    '5b. Code validation',
-    '5c. Runtime validation',
-    '5d. Infrastructure validation',
-    'Migrations (Alembic or equivalent)',
-    'Docker / Deployment',
-    'Environment & Config',
-    'Integration Point Registration',
-    'Rate Limiting',
-    'Background Tasks (Celery or equivalent)',
-    'Database',
-    'External Services',
-    '5e. Update document',
-    '5f. Test-vacuity check (v7.0)',
-    '6. Plan Mode (deep review only)',
-    '7. LT Review',
-    '8. Publish',
-    'GitHub reviews',
-    'Ticket-compliance publish block (v7.4)',
-    'Codex-origin findings: publish gate (v7.5)',
-    'Multi-repo publish discipline',
-    'Communication',
-    '9. Re-review',
-    '10. LT Direct Fix (optional)',
-    'When to use',
-    'When NOT to use',
-    'Process',
-    'Key rules',
-    'Principles',
-    'On judgment',
-    'On evidence',
-    'On collaboration',
-    'On safety',
-    'Review Precedents (v7.1)',
-    'Corpus-derived (our own dispositions)',
-    'Adopted (curated from external precedent)',
-    'Rejected — do not re-add',
-    'Begin',
-]
+# split, minus "#" level and the version number on the title, mapped to its
+# non-blank body lines summed over every occurrence (fences counted, `---` and
+# HTML comments not). Every section moved unchanged, so the new layout carries
+# at least this many, less one line where a cross-reference was folded into
+# another section. The title's body moved
+# under principles-and-history.md's "## Version history".
+OLD_BODY_LINES = {
+    'Deep Review Process': 10,
+    '0. Input': 1,
+    'Determine review iteration': 4,
+    'Re-review process (2nd+ iteration)': 14,
+    'Key differences from first review': 4,
+    'Ticket resolution (v7.4)': 15,
+    '1. Triage': 0,
+    'Gather context': 3,
+    'CI / Checks status': 11,
+    'Classify depth': 5,
+    'File-size threshold (mechanical, v6.8)': 9,
+    'Large PRs (>10K lines)': 8,
+    'Check cross-PR conflicts': 3,
+    'Generated-code exclusions (v7.1)': 9,
+    '1.5. AI-Cheat Mechanical Pass (v7.2)': 30,
+    '1.6. Changed-Surface Enumeration (v7.3)': 20,
+    '2. Branch Alignment (mandatory)': 2,
+    'Process': 47,
+    'Multi-repo reviews: directory verification': 3,
+    'Squash-merge ancestry': 3,
+    'Orthogonal divergence': 12,
+    'Why this step exists': 2,
+    '3. Static Analysis (parallel agents)': 1,
+    'Severity criteria (include in every prompt)': 5,
+    'Required finding format (v6.9, include in every prompt)': 7,
+    'Repo invariants (v7.0, mandatory)': 16,
+    'Commonly missed (mandatory, every repo)': 8,
+    'Agent types': 3,
+    'Quality reviewer: detection prompts': 46,
+    'Ticket-compliance agent (v7.4)': 10,
+    'Multi-PR same-repo: branch contamination': 6,
+    'Diff format for agent prompts (v7.1)': 9,
+    'Codex second-opinion lane (optional, OFF by default, v7.5)': 17,
+    '3.5 Adversarial refute pass (before consolidation)': 7,
+    'Diff format for refuter prompts (v7.1)': 1,
+    'Precedent ledger loader (v7.1)': 7,
+    '4. Consolidation': 7,
+    'Severity decision table (v6.9)': 21,
+    'Ticket-compliance severity mapping (v7.4)': 7,
+    'Classify finding origin': 7,
+    'Codex second-opinion divergence (v7.5)': 10,
+    'Structural severity calibration (v6.8)': 5,
+    'The code-judo question (v6.8)': 1,
+    '5. Empirical Validation': 0,
+    '5a. Setup': 4,
+    '5b. Code validation': 5,
+    '5c. Runtime validation': 7,
+    '5d. Infrastructure validation': 1,
+    'Migrations (Alembic or equivalent)': 6,
+    'Docker / Deployment': 4,
+    'Environment & Config': 5,
+    'Integration Point Registration': 5,
+    'Rate Limiting': 4,
+    'Background Tasks (Celery or equivalent)': 4,
+    'Database': 5,
+    'External Services': 4,
+    '5e. Update document': 2,
+    '5f. Test-vacuity check (v7.0)': 23,
+    '6. Plan Mode (deep review only)': 3,
+    '7. LT Review': 4,
+    '8. Publish': 0,
+    'GitHub reviews': 11,
+    'Ticket-compliance publish block (v7.4)': 16,
+    'Codex-origin findings: publish gate (v7.5)': 3,
+    'Multi-repo publish discipline': 7,
+    'Communication': 2,
+    '9. Re-review': 12,
+    '10. LT Direct Fix (optional)': 1,
+    'When to use': 6,
+    'When NOT to use': 3,
+    'Key rules': 4,
+    'Principles': 0,
+    'On judgment': 3,
+    'On evidence': 4,
+    'On collaboration': 3,
+    'On safety': 5,
+    'Review Precedents (v7.1)': 3,
+    'Corpus-derived (our own dispositions)': 36,
+    'Adopted (curated from external precedent)': 16,
+    'Rejected — do not re-add': 3,
+    'Begin': 1,
+}
+BODY_SLACK = 1
+# How often each heading occurred. Deleting one from here is deleting a section.
+OLD_HEADINGS = collections.Counter({h: 1 for h in OLD_BODY_LINES})
+OLD_HEADINGS["Process"] = 2  # Step 2's and Step 10's
 
 
 def _read(path):
@@ -151,16 +159,35 @@ def _refs():
     return {os.path.basename(p): _read(p) for p in sorted(glob.glob(os.path.join(REF_DIR, "*.md")))}
 
 
-def _headings(text):
-    out, fence = set(), False
+def _sections(text):
+    """(heading text -> occurrences, heading text -> non-blank body lines)."""
+    heads, body, cur, fence = collections.Counter(), collections.Counter(), None, False
     for line in text.splitlines():
         if line.lstrip().startswith("```"):
             fence = not fence
+            if cur is not None:
+                body[cur] += 1
             continue
         m = None if fence else HEADING_RE.match(line)
         if m:
-            out.add(m.group(2))
-    return out
+            cur = m.group(2)
+            heads[cur] += 1
+        elif cur is not None and line.strip() and line.strip() != "---" and not line.startswith("<!--"):
+            body[cur] += 1
+    return heads, body
+
+
+def _headings(text):
+    return set(_sections(text)[0])
+
+
+def _layout_sections():
+    heads, body = collections.Counter(), collections.Counter()
+    for text in [_core(), _read(ROUTER)] + list(_refs().values()):
+        h, b = _sections(text)
+        heads += h
+        body += b
+    return heads, body
 
 
 class CoreIsInlineTest(unittest.TestCase):
@@ -249,12 +276,17 @@ class NothingFellOutOfReachTest(unittest.TestCase):
         self.refs = _refs()
         self.router = _read(ROUTER)
 
-    def test_every_old_heading_survives_in_the_core_a_reference_or_the_map(self):
-        have = _headings(self.core) | _headings(self.router)
-        for text in self.refs.values():
-            have |= _headings(text)
-        missing = [h for h in OLD_HEADINGS if h not in have]
-        self.assertEqual(missing, [])
+    def test_every_old_heading_survives_as_often_as_it_occurred(self):
+        heads, _ = _layout_sections()
+        missing = {h: n for h, n in OLD_HEADINGS.items() if heads[h] < n}
+        self.assertEqual(missing, {})
+
+    def test_every_old_section_body_moved_with_its_heading(self):
+        # A heading kept over an emptied body is a deleted section too.
+        _, body = _layout_sections()
+        short = {h: (n, body[h]) for h, n in OLD_BODY_LINES.items()
+                 if h != "Deep Review Process" and body[h] < n - BODY_SLACK}
+        self.assertEqual(short, {})
 
     def test_every_reference_is_reachable_from_the_core_and_the_map(self):
         self.assertEqual(len(self.refs), 9, sorted(self.refs))
@@ -276,6 +308,12 @@ class NothingFellOutOfReachTest(unittest.TestCase):
         rows = [ln for ln in self.core.splitlines() if ln.startswith("| `")]
         for name in self.refs:
             self.assertTrue([r for r in rows if r.startswith("| `%s` |" % name)], name)
+
+    def test_each_reference_header_repeats_its_core_row(self):
+        rows = dict(re.findall(r"^\| `([a-z-]+\.md)` \| (.*?) \|$", self.core, re.M))
+        for name, text in self.refs.items():
+            when = re.search(r"\*\*Read this file when:\*\* (.*)$", text, re.M).group(1)
+            self.assertEqual(when[:len(rows[name])].lower(), rows[name].lower(), name)
 
     def test_references_resolve_from_the_live_config_not_the_reviewed_repo(self):
         self.assertIn("~/.claude/playbooks/deep-review/", self.core)

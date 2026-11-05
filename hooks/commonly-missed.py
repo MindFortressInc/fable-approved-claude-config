@@ -30,6 +30,7 @@ nothing on stdout and one INFO line on stderr, and the review continues with
 its built-in lenses. A missing lens file never blocks a review.
 """
 import datetime
+import hashlib
 import http.client
 import os
 import re
@@ -72,8 +73,17 @@ def _cache():
 
 
 def _cache_source():
-    """Sidecar naming the URL the cached copy came from."""
+    """Sidecar holding a hash of the full URL the cached copy came from.
+
+    The full URL, query included, keys the cache (two sources that differ only
+    by `?ref=` must not share it), but it is hashed so a token in the query
+    string never lands on disk.
+    """
     return _cache() + ".source"
+
+
+def _source_key(url):
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
 def _display(path):
@@ -204,14 +214,14 @@ def sync():
             os.unlink(_cache_source())
         except OSError:
             pass
-        write_err = _write(_cache(), text) or _write(_cache_source(), origin + "\n")
+        write_err = _write(_cache(), text) or _write(_cache_source(), _source_key(src) + "\n")
         if write_err:
             _info("fetched but not cached (%s); using the fetched copy" % write_err)
         return text, origin, True
     dest = _cache()
     cached_from, _ = _read_file(_cache_source()) if os.path.exists(_cache_source()) else (None, None)
     cached = None
-    if (cached_from or "").strip() == origin and os.path.exists(dest):
+    if (cached_from or "").strip() == _source_key(src) and os.path.exists(dest):
         cached, _ = _read_file(dest)
     if cached is not None and not _missing(cached):
         age = datetime.datetime.fromtimestamp(os.path.getmtime(dest)).isoformat(timespec="minutes")
@@ -224,7 +234,7 @@ def sync():
 def _section(lines, heading):
     out, on = [], False
     for line in lines:
-        if line.startswith("## "):
+        if re.match(r"#{1,2} ", line):  # a `# ` heading ends a section too
             on = line.rstrip() == heading
         if on:
             out.append(line)

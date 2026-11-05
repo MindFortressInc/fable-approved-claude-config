@@ -1,6 +1,6 @@
 # Deep review reference: reviewer prompts
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** depth is Standard or Deep, before you write a reviewer prompt. Everything marked "include in every prompt" goes into every prompt.
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** depth is Standard or Deep, or the branch, title or body carries a ticket id: read it before you write a reviewer prompt. Everything marked "include in every prompt" goes into every prompt.
 
 ## 3. Static Analysis (parallel agents)
 
@@ -177,7 +177,7 @@ If you have a formatter that converts a diff to `The-PR-Agent/pr-agent`'s `__new
 git diff --no-textconv -U5 origin/develop...HEAD -- <paths>
 ```
 
-This applies wherever the process prefers diff text over a repo pointer: this rule (Option 1) and the Step 3.5 refuter prompts below.
+This applies wherever the process prefers diff text over a repo pointer: this rule (Option 1) and the Step 3.5 refuter prompts (`refute-and-precedents.md`).
 
 **Two anti-hallucination rules — include in every agent prompt that receives diff text instead of the whole file:**
 

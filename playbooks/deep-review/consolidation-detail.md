@@ -1,6 +1,6 @@
 # Deep review reference: consolidation detail
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** every review, at Step 4.
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** every review, at Step 4: effort axis, ticket-compliance mapping, structural calibration, the code-judo question.
 
 ## 4. Consolidation
 

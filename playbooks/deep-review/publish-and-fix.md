@@ -1,6 +1,6 @@
 # Deep review reference: plan mode, LT review, publish, re-review, LT direct fix
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you post a review on GitHub, plan a Deep review with an LT, handle a re-review round, or apply an LT direct fix (Steps 6-10).
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you post a review on GitHub, or Steps 6-10 apply.
 
 ## 6. Plan Mode (deep review only)
 

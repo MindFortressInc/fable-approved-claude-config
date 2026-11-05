@@ -1,6 +1,6 @@
 # Deep review reference: refuter prompts and the precedent ledger
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** Step 3 produced a CRITICAL/HIGH candidate, before you spawn a refuter.
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** step 3 produced a CRITICAL/HIGH candidate, before you spawn a refuter.
 
 ## 3.5 Adversarial refute pass (before consolidation)
 

@@ -1,10 +1,10 @@
 # Deep review reference: Codex second-opinion lane
 
-Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you turned the optional lane on and the core's Codex run wrote a result file, or you need the lane's model setting, rate-limit notes or exit behaviour. The run command is in the core. This file also holds the Codex-origin confirmation rule (Step 5b) and publish gate (Step 8).
+Part of the deep-review process. The core that runs on every review is section 1 of `~/.claude/commands/PRlaunch.md`; `~/.claude/commands/deep-review.md` maps every step to its file. **Read this file when:** you turned the optional Codex lane on and its run wrote a result file, or you want to change its model. The run command is in the core. This file also holds the lane's model setting, rate-limit notes and exit behaviour, the Codex-origin confirmation rule (Step 5b) and the publish gate (Step 8).
 
 ### Codex second-opinion lane (optional, OFF by default, v7.5)
 
-A second, independent model family (Codex, via a `~/.claude/hooks/codex-review.sh` wrapper) can run **in parallel** with the Step 3 agents above, reviewing the same diff read-only and reporting its own `findings[]` as structured JSON (`{file, line, severity, claim, evidence}` per entry). It is **never blocking**.
+A second, independent model family (Codex, via a `~/.claude/hooks/codex-review.sh` wrapper) can run **in parallel** with the Step 3 agents (core, Step 3), reviewing the same diff read-only and reporting its own `findings[]` as structured JSON (`{file, line, severity, claim, evidence}` per entry). It is **never blocking**.
 
 **Off unless you turn it on.** The lane runs only when **both** `CODEX_REVIEW_ENABLED=1` is set **and** the wrapper is installed. This repo does not ship the wrapper or its result schema yet; without it, or with the flag unset, skip the lane — Step 3 and everything after runs exactly as before. Enablement lives in configuration, never in the tool: a wrapper must exit non-zero (no dispatch) unless `CODEX_REVIEW_ENABLED=1`, so it stays safe for anyone who runs it with a clean environment. If you export the flag from `settings.json`'s `env` block, remember every shell Claude Code spawns inherits it — a test that needs the disabled path must unset it explicitly.
 
