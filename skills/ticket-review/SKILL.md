@@ -52,7 +52,7 @@ Re-read every posted comment from the tracker and compare its body and id with t
 
 ## 4. Report and resume
 
-Return the full ordered list with links and a concise verdict per ticket, totals reviewed / uncertain / commented, the most consequential conclusions and any runtime limits. Link commented entries to their comments. Record rejected disagreements internally rather than publishing them. If a memory store is configured, persist a concise memory with the durable conclusions and evidence links. Update the coverage ledger, so `next` advances without erasing history or repeating agreement-only reviews.
+Return the full ordered list with links and a concise verdict per ticket, totals reviewed / uncertain / commented, the most consequential conclusions and any runtime limits. Link commented entries to their comments. Record rejected disagreements internally rather than publishing them. If a memory store is configured and the run is not `--report-only`, persist a concise memory with the durable conclusions and evidence links; a report-only run keeps them in its local run record instead. Update the coverage ledger, so `next` advances without erasing history or repeating agreement-only reviews.
 
 ## Codex mode (optional, off by default)
 

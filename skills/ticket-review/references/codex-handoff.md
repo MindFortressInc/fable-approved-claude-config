@@ -21,7 +21,7 @@ Before dispatch, store `handoff.json` in the durable run directory:
 - `discovery`: pertinent tracker, memory and prior-art findings with their sources, including ratified decisions that constrain the design.
 - `runtime_evidence`: timestamped observations and explicit unknowns, kept separate from code defaults.
 
-For epic mode, resolve the open leaf descendants once and include the exact resulting IDs. For ticket-list mode, use exactly the supplied IDs. Priority and the default batch size do not drop newly created Normal/Low tickets. A missing ticket or an empty description is an explicit unresolved item; never silently replace it with another ticket or invent a spec.
+For epic mode, resolve the open leaf descendants once, in their frozen order. For ticket-list mode, use exactly the supplied IDs, in the supplied order. An explicit `--limit N` then keeps the first N of those; freeze and hand off only the resulting IDs. Priority and the default batch size do not drop newly created Normal/Low tickets. A missing ticket or an empty description is an explicit unresolved item; never silently replace it with another ticket or invent a spec.
 
 Write one six-section **briefs** prompt per lane, with disjoint target IDs. Each prompt carries the epic goal and the full text of its own tickets. Carry every named epic and ticket description verbatim between fixed markers, and name all carried IDs in the prompt's own CONTEXT:
 
@@ -47,7 +47,7 @@ Use the **briefs** strictly read-only Git constraint, verbatim. Tell Codex to us
 
 ## Dispatch
 
-Codex runs with no tracker or memory access of its own, so Claude does all discovery and carries the snapshots in the brief. Context the brief lacks comes back as uncertainty, not invented facts.
+Codex gets no tracker or memory access, so Claude does all discovery and carries the snapshots in the brief. Context the brief lacks comes back as uncertainty, not invented facts.
 
 1. Put lane prompts at `<run>/briefs/r1_brief.txt`, and so on. Check exact ID and body coverage yourself: every requested ID carried once, every body identical to the tracker snapshot.
 2. Dispatch plain `codex exec` per lane — read-only is not a knob, and the `review` subcommand ignores `--output-schema`:
@@ -56,14 +56,15 @@ Codex runs with no tracker or memory access of its own, so Claude does all disco
    MODEL_FLAG=()   # an array: zsh does not word-split, so a string "-m x" would arrive as one argument;
                   # the ${…+…} form keeps an empty array safe under bash 3.2 `set -u`
    [ -n "${CODEX_REVIEW_MODEL:-}" ] && MODEL_FLAG=(-m "$CODEX_REVIEW_MODEL")
-   codex exec -s read-only -C /absolute/repo ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} \
+   mkdir -p "$REVIEW_RUN/codex"
+   codex exec -s read-only -C /absolute/repo --ignore-user-config ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} \
      --output-schema "$HOME/.claude/skills/ticket-review/references/codex-ticket-result.schema.json" \
      -o "$REVIEW_RUN/codex/r1_result.json" \
      - < "$REVIEW_RUN/briefs/r1_brief.txt" > "$REVIEW_RUN/codex/r1_stream.log" 2>&1
    echo "exit=$?"
    ```
 
-   Use real resolved paths and IDs. Keep each lane's exit status; do not mask it with a pipe. Record the model that actually ran next to the result. The checkout Codex reads can differ from the handoff's pinned refs: keep the pins and the refs Codex actually cited as review evidence.
+   `-s read-only` constrains only the shell sandbox; it does not remove the MCP servers configured in `$CODEX_HOME/config.toml`, and a tracker server there could write. `--ignore-user-config` keeps that file, and its MCP servers, out of the run; never drop it. Use real resolved paths and IDs. Keep each lane's exit status; do not mask it with a pipe. Record the model that actually ran next to the result. The checkout Codex reads can differ from the handoff's pinned refs: keep the pins and the refs Codex actually cited as review evidence.
 3. Parse each `r1_result.json` against [codex-ticket-result.schema.json](codex-ticket-result.schema.json).
 4. Compare each lane's result IDs with its expected ID set: exact equality, no extras, no missing IDs, no duplicates. Check the verdict vocabulary (`agree`, `revise`, `superseded`, `uncertain`) and nonempty literal evidence behind every supported conclusion. The schema uses strings for optional prose: normalize an empty `proposed_comment`, `uncertainty` or `memory_handoff` to null in the review records. A missing result, an invalid payload or a failed lane is missing coverage, never a clean review. Inspect failure or refusal output; never reword a brief to get past a refusal, and never silently substitute a reviewer.
 
