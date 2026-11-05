@@ -49,6 +49,7 @@ skills/scorecard/                #    weekly fleet quality report off the automa
 hooks/cr-parity.py               #    the escape-rate scoreboard: deep-review → CodeRabbit misses per week and per repo × class
 skills/flushdeployed/            # 6. AUDIT — is each "Deployed" ticket REALLY live? validate against main + the deploy box
 skills/done-without-evidence/    #    standing sweep: tickets marked Done with no started state, PR, or commit (report-only)
+skills/ticket-review/            #    review open tickets or a fresh epic against code + goals; comment only on material disagreements
 skills/assign/                   # 7. STAFF — roster-driven ticket discovery + assignment for a team (local SQLite + roster)
 skills/linear-gardener/          # standing board-hygiene pass — inventory/promote/re-chunk/sweep/apply, config-driven
 hooks/pr-gate.sh                 # enforcement: blocks `gh pr create` unless every gate is recorded at the current HEAD
@@ -212,6 +213,8 @@ The classifier also closes several ways a PR could read as reviewed when it wasn
 ## 6. Audit shipped work — flushdeployed
 
 [`skills/flushdeployed/SKILL.md`](skills/flushdeployed/SKILL.md) (`/flushdeployed <project>`) treats a tracker's "Deployed" column as **a claim to verify, not trust** — the same stance `/execute` opens with, applied to the other end of the pipeline. Trackers auto-advance a ticket to Deployed on PR merge, but merged ≠ live: a service that ships manually can lag its merge by hours, tickets get marked Deployed when only *part* of their scope shipped, and some get reverted. It fans out one read-only validator per ticket — confirm the merge is in `main`, confirm the actual change is present (not just a merge commit, which is what catches reverts and scope-gaps), and for manually-deployed services confirm the merge is an ancestor of the live box's HEAD — then moves the truly-live to Done with an evidence note, splits partials into a Done plus a fresh Todo for the unshipped remainder, and bounces the never-shipped back to Todo. An audit you can re-run, that leaves the tracker matching reality.
+
+[`skills/ticket-review/SKILL.md`](skills/ticket-review/SKILL.md) (`/ticket-review <project> | epic <ID> | tickets <ID>,<ID>`) reviews tickets *before* or *while* they're built: does the premise still hold, does the proposed solution fit the architecture and the epic's goal, can the acceptance test actually prove it. Fresh read-only agents, briefed per `briefs`, return evidence-backed verdicts (`agree` / `revise` / `superseded` / `uncertain`); the orchestrator re-opens every cited source, tries to refute each disagreement, and alone posts a comment — only on material disagreements, never on agreement. A JSON coverage ledger (`$TICKET_REVIEW_HOME`, default `~/.claude/ticket-reviews`) makes `next` resume without re-reviewing the same tickets. An optional Codex mode (`--via codex`, off unless `CODEX_REVIEW_ENABLED=1`, same switch as deep-review's lane) sends the review to a second model family read-only; Claude still verifies and writes.
 
 ---
 

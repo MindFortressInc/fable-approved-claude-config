@@ -1,0 +1,70 @@
+{
+  "type": "object",
+  "properties": {
+    "requested_ticket_ids": {"type": "array", "items": {"type": "string"}},
+    "epic_assessment": {"type": "string"},
+    "reviews": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ticket": {"type": "string"},
+          "verdict": {"type": "string"},
+          "conclusion": {"type": "string"},
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "repo": {"type": "string"},
+                "sha": {"type": "string"},
+                "path": {"type": "string"},
+                "line": {"type": "integer"},
+                "excerpt": {"type": "string", "minLength": 1},
+                "command": {"type": "string"},
+                "source_url": {"type": "string"}
+              },
+              "required": ["repo", "sha", "path", "line", "excerpt", "command", "source_url"],
+              "additionalProperties": false
+            }
+          },
+          "decision_sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "url": {"type": "string"},
+                "observed_at": {"type": "string"},
+                "excerpt": {"type": "string"}
+              },
+              "required": ["url", "observed_at", "excerpt"],
+              "additionalProperties": false
+            }
+          },
+          "runtime_evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "command": {"type": "string"},
+                "output": {"type": "string"},
+                "observed_at": {"type": "string"}
+              },
+              "required": ["command", "output", "observed_at"],
+              "additionalProperties": false
+            }
+          },
+          "remaining_acceptance": {"type": "string"},
+          "proposed_comment": {"type": "string"},
+          "uncertainty": {"type": "string"},
+          "memory_handoff": {"type": "string"}
+        },
+        "required": ["ticket", "verdict", "conclusion", "evidence", "decision_sources", "runtime_evidence", "remaining_acceptance", "proposed_comment", "uncertainty", "memory_handoff"],
+        "additionalProperties": false
+      }
+    },
+    "unverified_claims": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["requested_ticket_ids", "epic_assessment", "reviews", "unverified_claims"],
+  "additionalProperties": false
+}

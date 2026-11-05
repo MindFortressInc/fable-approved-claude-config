@@ -172,11 +172,22 @@ class CodexLaneOffByDefaultTest(unittest.TestCase):
         self.assertIn("CODEX_REVIEW_ENABLED=1", lane)
         self.assertIn("unset means the Codex account default", lane)
 
+    def test_ticket_review_codex_mode_gates_on_explicit_opt_in(self):
+        with open(os.path.join(REPO_ROOT, "skills", "ticket-review", "SKILL.md")) as fh:
+            text = fh.read()
+        m = re.search(r"## Codex mode[^\n]*\n(.*)", text, re.S)
+        self.assertIsNotNone(m, "Codex mode section not found")
+        section = m.group(0)
+        self.assertIn("off by default", section)
+        self.assertIn("CODEX_REVIEW_ENABLED=1", section)
+        self.assertIn("unset means the Codex account default", section)
+        self.assertIn("`--via native` (the default)", text)
+
     def test_no_model_id_is_defaulted_anywhere(self):
         pat = re.compile(r"CODEX_REVIEW_MODEL=[\w.-]+|\bgpt-\d")
         hits = []
-        for rel in ("commands/*.md", "playbooks/*/*.md", "hooks/*", "README.md"):
-            for path in glob.glob(os.path.join(REPO_ROOT, rel)):
+        for rel in ("commands/*.md", "playbooks/*/*.md", "hooks/*", "README.md", "skills/ticket-review/**/*"):
+            for path in glob.glob(os.path.join(REPO_ROOT, rel), recursive=True):
                 if not os.path.isfile(path):
                     continue
                 with open(path, errors="replace") as fh:
