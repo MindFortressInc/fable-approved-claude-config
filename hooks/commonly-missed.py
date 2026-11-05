@@ -25,7 +25,8 @@ Content missing either required section is rejected, and a fetched copy that
 fails the check is never cached. A fetch must stay on https (redirects
 included), carry no credentials in the URL, and finish within TIMEOUT seconds.
 If the source fails, a cached copy from the same URL is used with an INFO line
-naming its age; a copy cached from a different URL is never used. With nothing usable, `prompt` prints
+naming its age; a copy cached from a different URL is never used. With
+nothing usable, `prompt` prints
 nothing on stdout and one INFO line on stderr, and the review continues with
 its built-in lenses. A missing lens file never blocks a review.
 """
