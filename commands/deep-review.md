@@ -1,9 +1,9 @@
 ---
-description: Standardized PR review with empirical validation (Deep Review Process v7.5)
+description: Standardized PR review with empirical validation (Deep Review Process v7.7)
 argument-hint: <pr-url-or-number> [paired-pr-url-or-number]
 ---
 
-# Deep Review Process v7.5
+# Deep Review Process v7.7
 
 Standardized process for PR reviews with empirical validation. Calibrated over dozens of real reviews; the case references (PR #66, #101, #113/#80, …) are the actual incidents that produced each rule.
 
@@ -16,6 +16,10 @@ Standardized process for PR reviews with empirical validation. Calibrated over d
 **v7.0 → v7.4:** generated-code exclusions, self-reported confidence with a consolidation threshold, absolute-line-number diff format, a zero-score drop-list and a Review Precedents ledger loaded into every refuter (v7.1); an AI-cheat mechanical pass (Step 1.5) plus two semantic detectors (v7.2); changed-surface enumeration (Step 1.6) plus a signature-compatibility lens (v7.3); ticket resolution, a ticket-compliance agent, its severity mapping and a publish block (v7.4).
 
 **v7.4 → v7.5:** optional Codex cross-family second-opinion lane, **off by default** (Step 3), three-bucket divergence reporting at consolidation with agreement reported as a count, never re-rendered (Step 4), routing every Codex-only candidate through the same evidence-based confirmation as any other finding before it may be promoted (Step 5b), and an explicit publish gate (Step 8). Core stance: **a second model family's disagreement is signal, not a verdict — Codex's own findings are claims, and nothing from this lane reaches a PR comment, a tracker comment, or a memory write until Claude has independently confirmed it against the actual code.**
+
+**v7.5 → v7.7:** effort-weighted severity (Step 4 effort axis) and three named noise-suppression classes (Step 8), derived from a corpus of about 4,000 CodeRabbit review threads (65% baseline resolution): CR severity is **inversely** correlated with getting fixed (Critical 60%, Major 62%, Minor 68%, Trivial 75%) while effort predicts it strongly (quick-win 68%, heavy-lift 45%) — the binding variable is cost-to-fix, not importance. So a heavy-lift CRITICAL/HIGH is merge-blocking or waived with a reason + filed ticket, never silently deferred. **This direction is deliberately counterintuitive: do not "fix" it back to escalate-by-severity, which is the policy that produced the 60%-for-Critical row.** Suppression classes (18% of CR output): model-id currency (39% resolved), lint/typing (63%, only 23% crit+major), shared-client convention (51%).
+
+**Also in v7.7:** a twelfth Step 1.5 detector, `workflow-trust` (an untrusted-code CI trigger on a persistent runner); an optional commonly-missed lens loader (Step 3, off until you point it at a lens file); a provenance step in the tenancy pass (Step 3: where did the scope value come from?); and an executed overlap run in 5c on charge, reservation, hold and save paths. (The private line's v7.6 turned the Codex lane on by default. This copy skips that: the lane stays off unless you enable it.)
 
 **Terminology:** "LT" = the lead/tech reviewer running this process (you, or the agent acting for you). Target branch examples use `develop`; substitute `main` if that's your trunk. The infra checklists reflect one real stack (FastAPI + Alembic + Celery + Docker + Vercel/Railway + Auth0/Stripe) — adapt the specifics to yours; the *categories* are the point.
 
@@ -169,7 +173,7 @@ Machine-generated files get skipped by review agents — no human wrote them, an
 
 Test-vacuity (Step 5f) covers exactly one AI-cheat failure mode out of roughly a dozen ways an AI-authored diff fakes success. When agents author most of your PRs, these are your own failure modes, not hypotheticals — a diff that looks like a fix but isn't is exactly the shape a normal reviewer misses, because the code *reads* fine.
 
-This step runs **11 structural detectors** mechanically — pattern checks over the diff, no LLM judgment, no sandbox — *before* Step 3's agents are even launched. Two companion **semantic** detectors (`goal-not-fixed`, `cheat-mock-mutation`) that need judgment rather than pattern-matching are folded into the Step 3 quality-reviewer prompt instead (see Step 3 § AI-cheat semantic pass); this step covers only the mechanical eleven. Ported from `moonrunnerkc/swarm-orchestrator`'s cheat-detector suite (303/325, 93.2% recall across 13 categories on their defect-injection oracle; 0.11 findings/PR false-alarm rate on an 18-PR pilot — the bar this pass should stay under; tighten a detector rather than ship it noisy).
+This step runs **12 structural detectors** mechanically — pattern checks over the diff, no LLM judgment, no sandbox — *before* Step 3's agents are even launched. Two companion **semantic** detectors (`goal-not-fixed`, `cheat-mock-mutation`) that need judgment rather than pattern-matching are folded into the Step 3 quality-reviewer prompt instead (see Step 3 § AI-cheat semantic pass); this step covers only the mechanical twelve. The first eleven are ported from `moonrunnerkc/swarm-orchestrator`'s cheat-detector suite (303/325, 93.2% recall across 13 categories on their defect-injection oracle; 0.11 findings/PR false-alarm rate on an 18-PR pilot — the bar this pass should stay under; tighten a detector rather than ship it noisy).
 
 **Non-goal:** detectors only, not a second gate. PRlaunch already gates; `swarm-orchestrator`'s sandbox-provisioning/restoration-proof gate mode is explicitly out of scope.
 
@@ -188,6 +192,15 @@ The table below IS the checklist: run each detector by reading the diff (`git di
 | `comment-only-fix` | Every changed line in a source file is a comment or blank |
 | `exception-rethrow-lost-context` | A bare rethrow/`raise` is replaced by a new exception with no `cause`/`from` chaining |
 | `dead-branch-insertion` | A branch guarded by a literal-false condition is added |
+| `workflow-trust` | A touched `.github/workflows/*.yml` pairs an untrusted-code trigger (`pull_request_target`, `workflow_run`, `issue_comment`, a `pull_request`/`pull_request_review`/`pull_request_review_comment` job with no fork guard in its job-level `if:`, a `deployment`/`deployment_status` job with no creator check) with a persistent runner: any `runs-on` that is not a GitHub-hosted `ubuntu-*`/`windows-*`/`macos-*` image, including custom labels and expressions. Read the whole post-image workflow file from the PR branch, not just the hunk, because the trigger and the `runs-on` are rarely in the same hunk. **Candidate only**, see below |
+
+**Running `workflow-trust` by hand.** These are the rules a scripted version has to get right, so apply them when you read the file:
+
+* **Triggers are event keys under `on:` only.** A branch filter or an input that happens to be named `deployment` is not a trigger. Quoted keys count (`'pull_request_target':`, and the quoted `'on':` or YAML-1.1 `true:` forms of `on`).
+* **A runner is persistent unless it is a whole GitHub-hosted image name.** `self-hosted`, any custom label (including look-alikes such as `ubuntu-gpu-selfhosted`), any runner `group:`, and any `${{ }}` expression count as persistent. A `runs-on` block list counts too, wherever its `- ` entries are indented.
+* **Guards are per job, and only a job-level `if:` counts.** A guard on one job does not clear another job in the same workflow. The same expression in a step's `if:`, a `run:` string, `env:` or `with:` is not a guard. A folded multi-line job-level `if:` still counts.
+* **A guard counts only when it excludes untrusted actors.** A fork guard (`github.event.pull_request.head.repo.full_name == github.repository`, or `...head.repo.fork == false`) clears only the `pull_request` family. A creator check clears only the `deployment` family, and only as an equality on the creator's `login` or `id` (a `creator.type == 'Bot'` check admits every app). A check that selects forks (`...repo.fork`, `full_name != github.repository`) or a negated creator check is not a guard. A job-level `if:` that holds `||` or a negated `!( ... == ... )` group can re-admit untrusted actors, so its guard does not count.
+* **Only touched workflow files are read**, and a deleted workflow is skipped.
 
 **Turning a hit into a finding:** each detector hit becomes a Step 3-style finding, using the standard required format (Step 3 § Required finding format):
 
@@ -195,6 +208,7 @@ The table below IS the checklist: run each detector by reading the diff (`git di
 * **Confidence:** mechanical hits are deterministic; default `Confidence: 8` unless file-specific context makes the match doubtful (e.g. a `no-op-fix`/`coverage-erosion` hit on a file the PR's own description says is deliberately test-free).
 * **Severity:** assigned via the *existing* Step 4 decision table — default MEDIUM (the same row as any other real, undemonstrated-CRITICAL/HIGH finding), escalating to HIGH only when Step 4's HIGH criteria are met, which for a cheat detector means the cheat masks a finding the PR itself claims to fix (e.g. an `error-swallow` hit swallowing the exact exception the PR's description says it now handles). This is not a new severity axis — do not invent one.
 * A detector hit is a candidate, not an automatic finding: it still goes through the Step 3.5 refuter pass and the Review Precedents ledger like any other candidate before it survives to Step 4 consolidation.
+* **`workflow-trust` hits are never findings on their own.** A trigger plus a persistent runner is only dangerous when nothing gates who chooses the code. Hand each hit, verbatim, to the Step 3 quality reviewer with the workflow file. It becomes a finding only when the reviewer cannot quote the actor, creator or fork check that gates the job, and its severity then comes from the Step 4 table like any other finding. A quoted gate dismisses the candidate only when it actually excludes untrusted actors: an equality or allowlist check passes, but a check that mentions the actor without excluding forks (for example `github.actor != 'dependabot[bot]'`) does not. Record the quote, and why it excludes them, as the dismissal reason.
 
 ---
 
@@ -369,6 +383,19 @@ Also check `AGENTS.md` if the repo has one, and `.coderabbit.yaml`
 * When a reviewer (bot or human) later catches something these invariants should
   have caught, the fix is a line appended to CLAUDE.md, not a special case here.
 
+### Commonly missed (mandatory, every repo)
+
+If you keep a shared lens file, a markdown file with a `## Generic Review Invariants` section and a numbered `## Commonly Missed` section listing the defect classes external reviewers most often catch after this process has passed a PR, paste both sections verbatim into every agent prompt. The loader reads it and prints the block to paste, with its instruction line and source:
+
+```bash
+python3 ~/.claude/hooks/commonly-missed.py prompt
+```
+
+* **Off by default.** Set `COMMONLY_MISSED_SOURCE` to a local file path or an `https://` URL to turn it on. Unset, the loader prints nothing on either stream, exits 0, and the review runs with the built-in lenses only.
+* Paste stdout verbatim. It already carries the instruction to check every invariant and every numbered class explicitly, reporting a finding or one line on why the diff is clean of it.
+* If stdout is empty while `COMMONLY_MISSED_SOURCE` is set, the lens file could not be loaded from the source or from an earlier copy. Record the one `INFO: commonly-missed:` line from stderr in the review document and continue with the built-in lenses below. This never blocks a review.
+* To add or change a lens, edit the lens file at its source. Do not copy a lens into this document; the detection prompts below predate the shared list.
+
 ### Agent types
 
 * **Security reviewer** — Vulnerabilities, auth, data exposure, input validation, OWASP
@@ -400,6 +427,24 @@ Include these instructions in every quality reviewer prompt:
 > any unbound scope column as a finding. A parameter that is accepted by the
 > function but never reaches the WHERE clause is the same finding as omitting it.
 > This applies to counts, aggregates, and analytics queries, not only row reads.
+>
+> A bound column is not a pass until you know where its value came from. For
+> each identity, org, owner, role, capability or scope value the diff uses in
+> an authz decision or a scoped query, quote the line that reads it and
+> classify that source as verified principal, server lookup keyed by a
+> verified value, caller-supplied (body, query string, path, form, header,
+> editable props, or a file, env var, queue message or row that a less trusted
+> party can write) or unsigned claim. Caller-supplied or unsigned claim is a
+> finding at HIGH or above unless you quote the line that makes it safe: a
+> check of the value against the principal (before or after it is read), or a
+> binding of the same query or action to a scope value from a trusted source.
+> Headers such as X-Org-Id, X-Tenant and
+> X-Host-* count as verified only when you quote the middleware line that
+> binds it to the authenticated principal. Then, for each path the diff adds
+> to a guarded action, quote the check that runs before it. A path that
+> reaches the action without that check is the same finding: a direct call
+> around the gated wrapper, or a side effect (a reservation, a write, a grant)
+> that runs before the check.
 >
 > Severity HIGH when the query can return or mutate rows across a tenant or
 > product boundary. Evidence line must quote both the model definition and the
@@ -562,6 +607,19 @@ Severity is assigned mechanically from this table, not from agent-reported label
 * **A downstream catch exists ⇒ drop one level** (this absorbs principle #7, technical severity ≠ impact severity).
 * **LT judgment may move severities DOWN, never UP without evidence.** Escalating a finding above MEDIUM requires an executed check demonstrating the failure.
 
+**Effort axis for CRITICAL/HIGH (v7.7):** every CRITICAL/HIGH finding carries `Effort: quick-win | heavy-lift` plus a one-line reason. **quick-win** = the fix is local to this PR's diff, needs no design decision, and the author can land it in this PR. **heavy-lift** = the fix needs a redesign, a migration, a cross-module/cross-repo change, or a decision the PR author can't make alone. Disposition comes from severity × effort:
+
+| Severity | Effort | Disposition |
+| -- | -- | -- |
+| **CRITICAL** | quick-win | Fix in this PR before merge. |
+| **CRITICAL** | heavy-lift | **Merge-blocking**, or explicitly **waived** with a written reason **and** a filed follow-up ticket linked from the review. Never silently deferred. |
+| **HIGH** | quick-win | Fix in this PR before merge. |
+| **HIGH** | heavy-lift | **Merge-blocking**, or explicitly **waived** with a written reason **and** a filed follow-up ticket linked from the review. Never silently deferred. |
+
+* **Effort changes disposition, never severity.** Do not downgrade a heavy-lift finding to make it non-blocking, and do not upgrade a quick-win to force it.
+* **"We'll do it later" is not a disposition.** A heavy-lift finding raised at merge time with neither a block nor a waiver+ticket becomes an unresolved thread — post-hoc review records heavy things, it doesn't get them fixed. The waiver ticket follows the follow-up filing buckets in `CLAUDE.md` § Work Taxonomy (bucket 2, same epic, for IN-SCOPE findings); an OUT-OF-SCOPE finding's separate tracking issue (§ Classify finding origin) already satisfies the ticket half. A waiver+ticket is the one sanctioned exception to that table's IN-SCOPE "must fix if MEDIUM+" — and only for heavy-lift CRITICAL/HIGH.
+* **This is deliberately counterintuitive** — see the v7.7 header line. Escalate-by-severity is the policy that left Criticals the *least* resolved row; do not "fix" this table back to it.
+
 ### Ticket-compliance severity mapping (v7.4)
 
 Feeds the table above — not a parallel severity axis. Applies only to Step 3's ticket-compliance agent output:
@@ -638,7 +696,7 @@ After consolidating findings, ask once, explicitly: **is there a reframing of th
 
 * **API endpoints:** `curl` to test auth, error handling, status codes, edge cases
 * **Frontend UI:** Playwright (or similar) to test navigation, auth bypass, rendering, user flows
-* **Concurrency:** Parallel requests to test blocking, race conditions, idempotency
+* **Concurrency (executed check):** When the diff touches a charge, reservation, hold or save path (code that debits money or credits, holds a resource, or persists a user's edit), run it. Fire two overlapping requests at it, or force an older-completes-last ordering (delay the first request's response until a second one has finished). Where the path has no server (a worker, a job, a library call), a script that drives the real code path twice at once counts; a mocked unit test does not. Record the command and the final state it observed: the balance, the reservation or hold row, the saved value, the error the UI shows. PASS means the state matches what one request, or the newer request, should leave. A ticked box does not count, and neither does reasoning that the code "looks atomic". Off those paths, parallel requests still probe blocking, races and idempotency. PRlaunch's outcome eval carries this run as a scenario (`~/.claude/commands/PRlaunch.md` §3).
 * **Failure scenarios:** Missing env vars, service down, invalid input
 * **Happy path E2E** (if applicable): Full user flow from start to finish
 * **Security fixes:** Validate the vulnerability is closed with before/after comparison (e.g., endpoint returned 200 before fix, returns 401 after). Test against a running instance, not just code reading. Lesson: a header-trust auth bypass (`X-User-ID` honored without verification) was in one codebase for months — only confirmed exploitable when tested against production with `curl`.
@@ -774,6 +832,11 @@ identical-answer shape.
 * Verdict: REQUEST CHANGES / APPROVE WITH CHANGES / APPROVE
 * **Anti-nit-flooding (v6.8):** prefer a small number of high-conviction comments over a long cosmetic list. If structural or functional issues exist, don't bury them under LOW/style nits — fold nits into one collapsed section or drop them.
 * **Zero-score drop-list (v7.1):** the following categories are zero-conviction by convention and never surface as standalone comments — drop them outright rather than folding into a collapsed section: docstrings/type hints/comments, unused-import removal, missing imports, more-specific exception types, and questioning entities that may be defined elsewhere in the codebase. **Evidence overrides this list**, consistent with Step 4's confidence-threshold rule: this drop applies to style-only, no-evidence comments in these categories — a missing-import or exception-type finding backed by an *executed* check (a failing import, a traced compile/runtime error) is a demonstrated defect, not a nit, and must still surface with its evidence line.
+* **Heavy-lift disposition is published (v7.7):** every heavy-lift CRITICAL/HIGH (Step 4 § effort axis) publishes with its disposition on the finding itself — `BLOCKING`, or `WAIVED: <reason> → <follow-up ticket URL>`. A heavy-lift finding published with neither, or with "follow-up later", is a process defect; fix the review before posting it.
+* **Noise-suppression classes (v7.7):** extends anti-nit-flooding with three named classes that make up ~18% of CodeRabbit's output and resolve at or below the 65% baseline. Do not mirror them:
+  * **model-id currency** — do not flag a model identifier as nonexistent, deprecated, or outdated against the reviewer's own memorized (training-data) model catalog; that list is stale in both directions (a reviewer has called a live model nonexistent and recommended one already retired). The only reference is the repo's own authoritative model catalog (e.g. the module or config file where the repo defines its model ids). This suppresses the *memorized-catalog* check, not model ids: an id that contradicts the repo's authoritative model catalog — absent from it, or behind the tier it marks current — is still a valid finding; cite the catalog line as its evidence.
+  * **lint / typing** — do not publish what the repo's CI linter/type-checker already enforces (ruff/mypy/eslint/tsc-class findings). Exception: a type error demonstrated by an executed check, or a rule the repo's CI config does not actually run, is not suppressed.
+  * **shared-client convention** — do not publish "use the shared client/wrapper" as a general finding. Where it is a real rule, the repo writes it down as an invariant and Step 3's loader supplies it; publish it only citing that loaded invariant. A rule that is real in one repo and merely conventional elsewhere is repo-level by definition, never a general lens.
 
 ### Ticket-compliance publish block (v7.4)
 
@@ -1009,7 +1072,7 @@ A finding whose only content is a prose/documentation change in a `.md` file (no
 *Case:* adopted from `anthropics/claude-code-security-review`'s markdown-file exclusion. Corroboration: our CR-CLI store's ~400 `markdown`-tagged findings are overwhelmingly style nitpicks (fenced-code language tags, internal narrative consistency).
 
 **20. Test-only files get a relaxed severity cap, never a waiver.**
-A finding whose only impact is inside a `test_*`/`*.test.ts`/`conftest.py` file (never shipped to production) is capped at MEDIUM even when the equivalent finding in production code would be HIGH. **This caps severity — it does not exclude the finding.** A test that doesn't actually exercise its own claim is exactly the TEST-VACUITY class Step 5f exists to catch (14 of the 246 escapes in our corpus were TEST-VACUITY).
+A finding whose only impact is inside a `test_*`/`*.test.ts`/`conftest.py` file (never shipped to production) is capped at MEDIUM even when the equivalent finding in production code would be HIGH. **This caps severity — it does not exclude the finding.** A test that doesn't actually exercise its own claim is exactly the TEST-VACUITY class Step 5f exists to catch (14 of the 246 escapes in our corpus were TEST-VACUITY). **Step 5f takes precedence over this cap:** a cited test still green against the reverted implementation stays HIGH, because the impact is production behavior left untested.
 *Case:* adopted from `anthropics/claude-code-security-review`'s test-only-file exclusion, deliberately narrowed against our own test-vacuity lesson before inclusion — do not read this precedent as license to skip test files.
 
 ### Rejected — do not re-add
