@@ -182,6 +182,19 @@ class LocalFileSourceTest(SubprocessTestBase):
         self.assertIn("18. **Sibling-appended class.**", out)
         self.assertNotIn("Private notes", out)
 
+    def test_a_heading_inside_a_code_fence_does_not_end_the_section(self):
+        fenced = FIXTURE.replace(
+            "Body two.\n",
+            "Body two.\n\n```bash\n# not a heading\n## nor this\n```\n\nAfter the fence.\n\n"
+            "~~~~\n```\n# still fenced\n~~~~\n\nAfter the tilde fence.\n",
+        )
+        rc, out, err = self.run_loader("prompt", source=self.write("lens.md", fenced))
+        self.assertEqual(rc, 0, err)
+        for text in ("# not a heading", "## nor this", "After the fence.",
+                     "# still fenced", "After the tilde fence.", "18. **Sibling-appended class.**"):
+            self.assertIn(text, out)
+        self.assertNotIn("Must not be pasted", out)
+
     def test_a_local_file_is_read_in_place_never_cached(self):
         rc, out, _ = self.run_loader("sync", source=self.write("lens.md", FIXTURE))
         self.assertEqual(rc, 0)

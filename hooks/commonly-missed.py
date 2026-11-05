@@ -247,10 +247,20 @@ def sync():
     return None, None, False
 
 
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+
+
 def _section(lines, heading):
-    out, on = [], False
+    out, on, fence = [], False, ""
     for line in lines:
-        if re.match(r"#{1,2} ", line):  # a `# ` heading ends a section too
+        m = FENCE.match(line)
+        if fence:  # a `# comment` in a fenced example is not a heading
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                    and not line[m.end():].strip():
+                fence = ""
+        elif m:
+            fence = m.group(1)
+        elif re.match(r"#{1,2} ", line):  # a `# ` heading ends a section too
             on = line.rstrip() == heading
         if on:
             out.append(line)
