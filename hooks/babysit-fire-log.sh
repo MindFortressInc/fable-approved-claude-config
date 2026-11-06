@@ -3,9 +3,9 @@
 # single-turn forfeit.
 #
 # `fire`/`exit` write a plain audit trail to ~/.claude/logs/headless-babysit.log
-# — there is no downstream consumer parsing that log in this repo (adapt one if
-# you build a stall detector against it); they exist so a headless sweep leaves
-# a human-readable record of when it started and how it ended. `verdict` is the
+# — a human-readable record of when a headless sweep started and how it ended,
+# which skills/babysit/babysit_digest.py also folds into its `stall`/`coverage`
+# sections. `verdict` is the
 # load-bearing subcommand: it is what launchd/babysit-hourly-gate.sh calls to
 # decide whether a sweep that exited "successfully" actually did anything.
 #
@@ -84,9 +84,13 @@ set -euo pipefail
 LOG="${BABYSIT_LOG:-$HOME/.claude/logs/headless-babysit.log}"
 mkdir -p "$(dirname "$LOG")"
 
+# Stamp FORMAT is load-bearing: `date '+%F %T %z'`, local time plus the offset
+# in force, the same as launchd/headless-skill.sh and babysit-hourly-gate.sh.
+# skills/babysit/babysit_digest.py reads this log, and a naive local stamp names
+# two instants in the repeated fall-back hour; the offset says which.
 case "${1:-}" in
   fire)
-    printf '=== %s [babysit] fire: %s\n' "$(date '+%F %T')" "${2:-/babysit-prs no-loop}" >>"$LOG"
+    printf '=== %s [babysit] fire: %s\n' "$(date '+%F %T %z')" "${2:-/babysit-prs no-loop}" >>"$LOG"
     ;;
   exit)
     # Validate EXACTLY what a reader's `exit=(-?\d+)` regex can parse. A value
@@ -98,7 +102,7 @@ case "${1:-}" in
     case "$digits" in
       ''|*[!0-9]*) echo "usage: babysit-fire-log.sh exit <rc>" >&2; exit 2 ;;
     esac
-    printf '=== %s [babysit] exit=%s\n' "$(date '+%F %T')" "$rc" >>"$LOG"
+    printf '=== %s [babysit] exit=%s\n' "$(date '+%F %T %z')" "$rc" >>"$LOG"
     ;;
   verdict)
     start="${2:-}"; rc="${3:-}"; dur="${4:-}"; lock_outcome="unknown"

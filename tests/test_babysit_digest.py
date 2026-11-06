@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -58,14 +59,14 @@ def sweep_row(minutes_ago, pending=10, bumps=0, fixes=0, red_ci=0, decision="PRO
 
 def _local_line(dt_utc, text):
     """Render a UTC instant the way headless-skill.sh / babysit-fire-log.sh
-    write it (`date '+%F %T'`, LOCAL time, `=== ` prefix), so the fixture
-    matches production regardless of which timezone the test runs in."""
-    return "=== %s [babysit] %s" % (dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S"), text)
+    write it (`date '+%F %T %z'`, local time plus offset, `=== ` prefix), so
+    the fixture matches production regardless of the test's timezone."""
+    return "=== %s [babysit] %s" % (dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S %z"), text)
 
 
 def _gate_line(dt_utc, text):
-    """launchd/babysit-hourly-gate.sh's shape: LOCAL time, NO `=== ` prefix."""
-    return "%s [babysit] %s" % (dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S"), text)
+    """launchd/babysit-hourly-gate.sh's shape: same stamp, NO `=== ` prefix."""
+    return "%s [babysit] %s" % (dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S %z"), text)
 
 
 def _skip(dt_utc, age_s=300):
@@ -233,9 +234,11 @@ class StallDetectionTests(TmpDirCase):
         """Log timestamps are LOCAL; everything else in the fold is UTC. The
         parsed instant must round-trip to the UTC instant it came from."""
         target = ago(45)
-        parsed = bd._local_naive_to_utc(target.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-        self.assertIsNotNone(parsed)
-        self.assertLess(abs((parsed - target).total_seconds()), 1.0)
+        # Both row shapes: offset-stamped, and the legacy naive stamp.
+        for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S"):
+            parsed = bd._log_ts_to_utc(target.astimezone().strftime(fmt))
+            self.assertIsNotNone(parsed)
+            self.assertLess(abs((parsed - target).total_seconds()), 1.0)
 
     def test_missing_log_is_empty_not_a_crash(self):
         self.assertEqual(bd.read_log_events(os.path.join(self.tmp, "nope.log")), [])
@@ -529,6 +532,228 @@ class GateSkipTests(TmpDirCase):
             m = re.search(r"(?m)^STALE_S=(\d+)", fh.read())
         self.assertIsNotNone(m)
         self.assertEqual(bd.GATE_STALE_S, int(m.group(1)))
+
+
+# ---------------------------------------------------------------------------
+# The fall-back hour repeats, so a naive local stamp is ambiguous. mktime()
+# resolved it to standard time, landing a row written at 01:14 PDT an hour in
+# the FUTURE of its own digest: out of window, so a false `unobserved_sweeps`
+# and `gate.no_data` beside a healthy sweep. Writers now stamp the offset;
+# legacy naive rows are dated from the log's own order.
+# ---------------------------------------------------------------------------
+class DstTransitionTests(TmpDirCase):
+    # 2026-11-01 01:16 PDT, one minute after a sweep in the repeated hour.
+    FALL_BACK_NOW = datetime(2026, 11, 1, 8, 16, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        saved = os.environ.get("TZ")
+
+        def restore():
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+
+        self.addCleanup(restore)
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+
+    def _utc(self, *hm):
+        return datetime(2026, 11, 1, *hm, tzinfo=timezone.utc)
+
+    def test_an_offset_stamp_is_its_own_instant_on_both_sides_of_the_repeat(self):
+        self.assertEqual(bd._log_ts_to_utc("2026-11-01 01:30:00 -0700"), self._utc(8, 30))
+        self.assertEqual(bd._log_ts_to_utc("2026-11-01 01:30:00 -0800"), self._utc(9, 30))
+
+    def test_a_legacy_naive_stamp_in_the_repeated_hour_is_the_first_instant(self):
+        """Rows already on disk carry no offset. The first occurrence can only
+        err into the past, never past `now` and out of every window."""
+        self.assertEqual(bd._log_ts_to_utc("2026-11-01 01:30:00"), self._utc(8, 30))
+
+    def test_log_order_dates_a_legacy_row_to_the_second_occurrence(self):
+        """The clock stepping back in the append-only log proves the rows after
+        it are 01:xx PST, so a window wholly inside that hour observes them."""
+        w(self.ledger, json.dumps({
+            "ts": iso(self._utc(9, 25)), "event": "sweep", "skill": "babysit",
+        }) + "\n")
+        w(self.log, "\n".join((
+            "=== 2026-11-01 01:50:00 [babysit] fire: /babysit-prs no-loop",
+            "=== 2026-11-01 01:51:00 [babysit] exit=0",
+            # 09:10Z, proved by the step back above: before `since`, so excluded.
+            "=== 2026-11-01 01:10:00 [babysit] fire: /babysit-prs no-loop",
+            "=== 2026-11-01 01:11:00 [babysit] exit=0",
+            "2026-11-01 01:28:00 [babysit] SKIP: interactive babysit alive "
+            "(heartbeat age 180s < 4200s)",
+            "=== 2026-11-01 01:30:00 [babysit] fire: /babysit-prs no-loop",
+            "=== 2026-11-01 01:32:00 [babysit] exit=0",
+        )) + "\n")
+        out = self._fold(since_dt=self._utc(9, 20), now_dt=self._utc(9, 40))
+        self.assertEqual(out["coverage"]["fire_rows"], 1, out["coverage"])
+        self.assertEqual(out["coverage"]["fire_exit_rows"], 2, out["coverage"])
+        self.assertFalse(out["coverage"]["unobserved_sweeps"], out["coverage"])
+        self.assertEqual(out["stall"], [])
+        self.assertEqual(out["gate"]["skipped"], 1, out["gate"])
+        self.assertFalse(out["gate"]["suppressed_backstop"], out["gate"])
+
+    def test_a_legacy_stall_reports_the_instant_log_order_proved(self):
+        w(self.log, "=== 2026-11-01 01:50:00 [babysit] fire: /babysit-prs no-loop\n"
+                    "=== 2026-11-01 01:51:00 [babysit] exit=0\n"
+                    "=== 2026-11-01 01:30:00 [babysit] fire: /babysit-prs no-loop\n")
+        out = self._fold(since_dt=self._utc(9, 20), now_dt=self._utc(9, 40))
+        self.assertEqual([s["fired_at"] for s in out["stall"]], [iso(self._utc(9, 30))])
+
+    def test_a_repeated_hour_log_dates_every_row_from_its_step_back(self):
+        """Rows past `now` must not undo the step back's proof."""
+        skip = "[babysit] SKIP: interactive babysit alive (heartbeat age 700s < 4200s)"
+        w(self.log, "\n".join((
+            f"2026-11-01 01:07:05 {skip}",
+            "=== 2026-11-01 01:14:12 [babysit] fire: /babysit-prs no-loop",
+            "=== 2026-11-01 01:15:32 [babysit] exit=0",
+            f"2026-11-01 01:27:05 {skip}",
+            "=== 2026-11-01 01:34:13 [babysit] fire: /babysit-prs no-loop",
+            "=== 2026-11-01 01:35:06 [babysit] exit=0",
+            f"2026-11-01 01:47:05 {skip}",
+            f"2026-11-01 01:07:05 {skip}",
+            "=== 2026-11-01 01:09:14 [babysit] fire: /babysit-prs no-loop",
+            "=== 2026-11-01 01:10:05 [babysit] exit=0",
+            f"2026-11-01 01:27:05 {skip}",
+            f"2026-11-01 01:47:05 {skip}",
+        )) + "\n")
+        for since, now, fires, gates in (((8, 0), (8, 50), 2, 3),
+                                         ((9, 0), (9, 20), 1, 1),
+                                         ((9, 20), (9, 40), 0, 1),
+                                         ((8, 0), (10, 0), 3, 6)):
+            out = self._fold(since_dt=self._utc(*since), now_dt=self._utc(*now))
+            with self.subTest(since=since, now=now):
+                self.assertEqual(out["coverage"]["fire_rows"], fires, out["coverage"])
+                self.assertEqual(out["coverage"]["occurrence_unknown_rows"], 0, out["coverage"])
+                self.assertEqual(out["gate"]["decisions"], gates, out["gate"])
+
+    def test_window_membership_alone_does_not_make_a_legacy_row_current(self):
+        """Only 01:xx rows and no step back: nothing says they are not the first
+        hour's, so a 01:00-01:20 PST window must not report them as observed."""
+        w(self.log, "=== 2026-11-01 01:10:00 [babysit] fire: /babysit-prs no-loop\n"
+                    "=== 2026-11-01 01:11:00 [babysit] exit=0\n"
+                    "2026-11-01 01:12:00 [babysit] no heartbeat -> running backup\n")
+        out = self._fold(since_dt=self._utc(9, 0), now_dt=self._utc(9, 20))
+        self.assertEqual(out["coverage"]["fire_exit_rows"], 0, out["coverage"])
+        self.assertEqual(out["coverage"]["occurrence_unknown_rows"], 2, out["coverage"])
+        self.assertTrue(out["coverage"]["stall_no_data"], out["coverage"])
+        self.assertEqual(out["stall"], [])
+        self.assertEqual(out["gate"]["decisions"], 0, out["gate"])
+        self.assertTrue(out["gate"]["no_data"], out["gate"])
+
+    def test_an_unknown_occurrence_is_not_a_blind_launcher_alarm(self):
+        """Those same rows may be the sweep the ledger recorded, so `unknown`
+        must not harden into `unobserved_sweeps`/`partially_observed` either."""
+        w(self.ledger, json.dumps({
+            "ts": iso(self._utc(9, 25)), "event": "sweep", "skill": "babysit",
+        }) + "\n")
+        w(self.log, "=== 2026-11-01 01:30:00 [babysit] fire: /babysit-prs no-loop\n"
+                    "=== 2026-11-01 01:32:00 [babysit] exit=0\n")
+        cov = self._fold(since_dt=self._utc(9, 20), now_dt=self._utc(9, 40))["coverage"]
+        self.assertTrue(cov["stall_no_data"], cov)
+        self.assertFalse(cov["unobserved_sweeps"], cov)
+        self.assertFalse(cov["partially_observed"], cov)
+
+    def test_a_later_offset_row_proves_a_legacy_row_is_the_first_occurrence(self):
+        """01:05 -0800 is 09:05Z, so a 01:10 written above it cannot be 09:10Z."""
+        w(self.log, "=== 2026-11-01 01:10:00 [babysit] fire: /babysit-prs no-loop\n"
+                    "=== 2026-11-01 01:05:00 -0800 [babysit] exit=0\n")
+        cov = self._fold(since_dt=self._utc(9, 0), now_dt=self._utc(9, 20))["coverage"]
+        self.assertEqual(cov["fire_rows"], 0, cov)
+        self.assertEqual(cov["fire_exit_rows"], 1, cov)
+        self.assertEqual(cov["occurrence_unknown_rows"], 0, cov)
+
+    def test_gate_rows_and_fire_rows_date_each_other(self):
+        """Both shapes share one file: a gate row's step back proves a fire row."""
+        w(self.log, "2026-11-01 01:47:00 [babysit] no heartbeat -> running backup\n"
+                    "=== 2026-11-01 01:05:00 [babysit] fire: /babysit-prs no-loop\n"
+                    "=== 2026-11-01 01:06:00 [babysit] exit=0\n")
+        cov = self._fold(since_dt=self._utc(9, 0), now_dt=self._utc(9, 20))["coverage"]
+        self.assertEqual(cov["fire_rows"], 1, cov)
+        self.assertEqual(cov["occurrence_unknown_rows"], 0, cov)
+
+    def test_a_row_in_window_on_both_readings_counts_without_its_occurrence(self):
+        w(self.log, "=== 2026-11-01 01:30:00 [babysit] fire: /babysit-prs no-loop\n"
+                    "=== 2026-11-01 01:32:00 [babysit] exit=0\n")
+        cov = self._fold(since_dt=self._utc(8, 0), now_dt=self._utc(9, 40))["coverage"]
+        self.assertEqual(cov["fire_rows"], 1, cov)
+        self.assertEqual(cov["occurrence_unknown_rows"], 0, cov)
+
+    def test_an_unconvertible_stamp_is_dropped_not_raised(self):
+        for bad in ("2026-11-01 01:30:00 +9999", "0001-01-01 00:00:00 +1200",
+                    "9999-12-31 23:59:59 -1200"):
+            self.assertIsNone(bd._log_ts_to_utc(bad), bad)
+
+    def _assert_observed_at_fall_back(self, suffix):
+        w(self.ledger, json.dumps({
+            "ts": iso(self.FALL_BACK_NOW - timedelta(minutes=1)),
+            "event": "sweep", "skill": "babysit",
+        }) + "\n")
+        w(self.log, "\n".join((
+            f"2026-11-01 01:07:05{suffix} [babysit] SKIP: interactive babysit alive "
+            "(heartbeat age 507s < 4200s)",
+            f"=== 2026-11-01 01:14:12{suffix} [babysit] fire: /babysit-prs no-loop",
+            f"=== 2026-11-01 01:15:32{suffix} [babysit] exit=0",
+        )) + "\n")
+        out = self._fold(since_dt=self.FALL_BACK_NOW - timedelta(minutes=30),
+                         now_dt=self.FALL_BACK_NOW)
+        self.assertEqual(out["coverage"]["fire_rows"], 1, out["coverage"])
+        self.assertEqual(out["coverage"]["fire_exit_rows"], 2, out["coverage"])
+        self.assertFalse(out["coverage"]["unobserved_sweeps"], out["coverage"])
+        self.assertFalse(out["coverage"]["stall_no_data"], out["coverage"])
+        self.assertFalse(out["gate"]["no_data"], out["gate"])
+        self.assertEqual(out["stall"], [])
+
+    def test_a_fall_back_digest_with_offset_rows_raises_no_alarm(self):
+        self._assert_observed_at_fall_back(" -0700")
+
+    def test_a_fall_back_digest_with_legacy_rows_raises_no_alarm(self):
+        self._assert_observed_at_fall_back("")
+
+    def test_a_sweep_spanning_spring_forward_pairs_and_stays_in_window(self):
+        now = datetime(2027, 3, 14, 10, 30, tzinfo=timezone.utc)  # 03:30 PDT
+        w(self.ledger, json.dumps({
+            "ts": iso(now - timedelta(minutes=1)), "event": "sweep", "skill": "babysit",
+        }) + "\n")
+        w(self.log, "=== 2027-03-14 01:59:00 -0800 [babysit] fire: /babysit-prs no-loop\n"
+                    "=== 2027-03-14 03:01:00 -0700 [babysit] exit=0\n")
+        out = self._fold(since_dt=now - timedelta(minutes=60), now_dt=now)
+        self.assertEqual(out["coverage"]["fire_exit_rows"], 2, out["coverage"])
+        self.assertFalse(out["coverage"]["unobserved_sweeps"], out["coverage"])
+        self.assertEqual(out["stall"], [])
+
+    def test_the_real_gate_script_writes_a_stamp_the_reader_dates(self):
+        """Drive the gate's SKIP path (fresh heartbeat, exits before any sweep)
+        rather than trusting its source. Its log path is $HOME-rooted."""
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(home, ".claude"))
+        w(os.path.join(home, ".claude", "babysit-heartbeat"), "")
+        gate = os.path.join(REPO_ROOT, "launchd", "babysit-hourly-gate.sh")
+        p = subprocess.run(["zsh", gate, "babysit", "60", "/babysit-prs no-loop"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, HOME=home), timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        log = os.path.join(home, ".claude", "logs", "headless-babysit.log")
+        with open(log) as fh:
+            self.assertRegex(fh.read(), r"^\S+ \S+ [+-]\d{4} \[babysit\] SKIP: ")
+        events = bd.read_gate_events(log)
+        self.assertEqual([e["kind"] for e in events], ["skip"])
+        self.assertLess(abs(events[0]["ts"].timestamp() - time.time()), 120)
+
+    def test_every_writer_of_the_log_stamps_an_offset(self):
+        """The reader's fix is only as good as its writers; a bare stamp left
+        in any one of them reopens the ambiguity for that row shape."""
+        for rel in ("launchd/headless-skill.sh", "launchd/babysit-hourly-gate.sh",
+                    "hooks/babysit-fire-log.sh"):
+            with open(os.path.join(REPO_ROOT, rel)) as fh:
+                code = [ln for ln in fh if not ln.lstrip().startswith("#")]
+            stamps = re.findall(r"date '\+%F %T[^']*'", "".join(code))
+            self.assertTrue(stamps, rel)
+            self.assertEqual(set(stamps), {"date '+%F %T %z'"}, rel)
 
 
 # ---------------------------------------------------------------------------

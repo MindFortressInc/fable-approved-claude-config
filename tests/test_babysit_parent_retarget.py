@@ -410,7 +410,7 @@ class RetargetRungDocContractTests(unittest.TestCase):
         self.assertIn("origin/<default>...HEAD", text)
         self.assertIn("never two-dot", text)
         self.assertIn("No cleverness on overlap", text)
-        self.assertIn("gh pr edit <pr> --base <default>", text)
+        self.assertIn("gh -R <owner>/<repo> pr edit <pr> --base <default>", text)
         self.assertIn("No merge, no push, no conflict resolution", text)
         self.assertIn("couldn't find remote ref", text)
 
