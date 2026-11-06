@@ -20,6 +20,7 @@
 #   skills/babysit/   the auto-merge/deploy classifier
 #   skills/done-without-evidence/, skills/bulldozer-reconcile/,
 #   skills/scorecard/, skills/titles/   batch-2A ports, clean on arrival
+#   skills/execute/   trial_merge.py, clean on arrival
 #
 # This list is a RATCHET, not a permanent boundary: `skills/assign/` and
 # `skills/resume-fleet/` still carry pre-existing findings (29 between them at
@@ -33,6 +34,7 @@ include = [
     "skills/babysit/**/*.py",
     "skills/done-without-evidence/**/*.py",
     "skills/bulldozer-reconcile/**/*.py",
+    "skills/execute/**/*.py",
     "skills/scorecard/**/*.py",
     "skills/titles/**/*.py",
 ]

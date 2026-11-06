@@ -11,8 +11,13 @@ prior equal window:
   * babysit    — sweeps + bumps + fixes + red_ci (from its `sweep` events).
   * prlaunch   — gate integrity: cr_cli skips / outcome_eval N/A / PRLAUNCH_SKIP
     uses (from its `unit` events).
-  * housekeeping — cleanup-queue depth now (cleanup-sweep.py --count) and the
-    count of prlaunch-ok orphan ledgers/markers older than 7 days.
+  * /execute   — PRlaunch units whose `driver` is execute, plus the split across
+    every driver. Rows written before the driver field existed count as untagged.
+  * escapes    — deep-review → CodeRabbit CLI escape rate for branches first
+    deep-reviewed in each window, with CR coverage stated (hooks/cr-parity.py).
+  * housekeeping — cleanup-queue depth now (cleanup-sweep.py --count), the
+    count of prlaunch-ok orphan ledgers/markers older than 7 days, and the count
+    of open `Ops:` Linear tickets with no update in 14 days (skip with --no-gh).
 
 Output: a compact markdown table + a one-paragraph verdict that flags any metric
 that regressed >20% window-over-window. Degrades gracefully — an absent/partial
@@ -24,6 +29,7 @@ fixture ledger. Live enrichment (gh, cleanup-sweep, orphan scan) lives in main()
 and is skippable via --no-gh, so tests never touch the network.
 """
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -35,6 +41,24 @@ HOME = os.path.expanduser("~")
 LEDGER = os.path.join(HOME, ".claude", "automation-ledger.jsonl")
 PRLAUNCH_OK = os.path.join(HOME, ".claude", "prlaunch-ok")
 CLEANUP_SWEEP = os.path.join(HOME, ".claude", "hooks", "cleanup-sweep.py")
+CR_PARITY = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "hooks", "cr-parity.py")
+LINEAR_CLIENT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "done-without-evidence",
+                             "done_without_evidence.py")
+DRIVERS = ("execute", "orchestrate", "bulldozer", "manual")
+STALE_OPS_DAYS = 14
+STALE_OPS_MAX_PAGES = 20
+STALE_OPS_QUERY = """
+query($cutoff: DateTimeOrDuration!, $after: String) {
+  issues(first: 250, after: $after, filter: {
+    title: {startsWith: "Ops:"},
+    state: {type: {nin: ["completed", "canceled", "duplicate"]}},
+    updatedAt: {lt: $cutoff}
+  }) {
+    nodes { id }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
 
 
 # --------------------------------------------------------------------------
@@ -133,7 +157,11 @@ def aggregate(records):
         "bulldozer": {"shipped": 0, "resolved": 0, "failed": 0, "shipped_prs": []},
         "babysit": {"sweeps": 0, "bumps": 0, "fixes": 0, "red_ci": 0},
         "prlaunch": {"units": 0, "cr_cli_skipped": 0, "outcome_na": 0, "prlaunch_skip": 0},
+        "drivers": dict.fromkeys(DRIVERS + ("untagged",), 0),
         "wrapup": {"events": 0, "cleanup_depths": []},
+        # Filled by escape_windows(): escapes bucket by a branch's FIRST
+        # deep-review, which needs the whole ledger, not one window's records.
+        "escapes": empty_escapes(),
     }
     for r in records:
         kind = classify(r)
@@ -159,6 +187,8 @@ def aggregate(records):
                 if not isinstance(gates, dict):
                     continue  # malformed unit record — skip, keep scoring the rest
                 agg["prlaunch"]["units"] += 1
+                driver = r.get("driver")
+                agg["drivers"][driver if driver in DRIVERS else "untagged"] += 1
                 cr = gates.get("cr_cli")
                 if isinstance(cr, str) and cr not in ("clean", ""):
                     agg["prlaunch"]["cr_cli_skipped"] += 1
@@ -174,6 +204,59 @@ def aggregate(records):
     return agg
 
 
+ESCAPE_KEYS = ("deep_reviewed", "covered", "coverage_pct", "escape_branch_pct", "major_per_100",
+               "other")
+
+
+def empty_escapes(error=None):
+    """Zeroed escape metrics; `error` set means cr-parity failed, not an empty ledger."""
+    return dict({k: 0 for k in ESCAPE_KEYS}, classes={}, error=error)
+
+
+def escape_windows(records, now, days):
+    """(current, prior) deep-review escape metrics, as ints for flag_regressions.
+
+    Branches are bucketed by their first deep-review. Each window is computed
+    from the ledger as it stood at that window's end, so both windows get the
+    same observation lag for CR to run; otherwise the prior window would see a
+    full extra window of late CR runs and the current one would always look
+    less covered. Rates are over CR-covered branches; a deep-reviewed branch CR
+    never ran on is unknown (cr-parity.py's coverage discipline), hence
+    coverage is a metric.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location("cr_parity", CR_PARITY)
+        cp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cp)
+        stamped = [(parse_ts(r), r) for r in records if isinstance(r, dict)]
+        windows = []
+        for s, e in ((now - timedelta(days=days), now),
+                     (now - timedelta(days=2 * days), now - timedelta(days=days))):
+            seen = [r for ts, r in stamped if ts is not None and ts <= e]
+            windows.append(cp.window(cp.branches(seen), s, e))
+    except Exception as e:  # a missing/broken cr-parity.py or malformed row must not sink the whole scorecard
+        print("scorecard: escapes section skipped (%s): %s" % (CR_PARITY, e), file=sys.stderr)
+        err = " ".join(("%s: %s" % (type(e).__name__, e)).split()).replace("|", "/")
+        return empty_escapes(err), empty_escapes(err)
+
+    def pct(x):
+        return 0 if x is None else int(round(x * 100))
+
+    out = []
+    for w in windows:
+        classes = w["classes"]
+        out.append({
+            "deep_reviewed": w["deep_reviewed"],
+            "covered": w["covered"],
+            "coverage_pct": pct(w["coverage_pct"]),
+            "escape_branch_pct": pct(w["with_escape_pct"]),
+            "major_per_100": pct(w["major_per_branch"]),
+            "other": classes.pop("other", 0),
+            "classes": dict(classes),
+        })
+    return out[0], out[1]
+
+
 # 'up' = higher is better (regress when it drops >20%);
 # 'down' = higher is worse (regress when it rises >20%).
 REGRESSION_CHECKS = [
@@ -183,17 +266,22 @@ REGRESSION_CHECKS = [
     ("babysit red_ci", ("babysit", "red_ci"), "down"),
     ("prlaunch cr_cli skips", ("prlaunch", "cr_cli_skipped"), "down"),
     ("prlaunch PRLAUNCH_SKIP", ("prlaunch", "prlaunch_skip"), "down"),
+    ("CR coverage of deep-reviewed branches %", ("escapes", "coverage_pct"), "up"),
+    ("deep-review branches w/ escape %", ("escapes", "escape_branch_pct"), "down"),
+    ("deep-review major+ escapes per 100 branches", ("escapes", "major_per_100"), "down"),
 ]
 
 
 def flag_regressions(cur_agg, prev_agg):
     """Return human strings for metrics that regressed >20% window-over-window.
 
-    A metric with no prior baseline (prev == 0) is never flagged.
+    A metric with no prior baseline (prev == 0, or the section absent) is never
+    flagged.
     """
     flags = []
     for name, (section, key), better in REGRESSION_CHECKS:
-        cur, prev = cur_agg[section][key], prev_agg[section][key]
+        cur = cur_agg.get(section, {}).get(key, 0)
+        prev = prev_agg.get(section, {}).get(key, 0)
         if prev == 0:
             continue
         change = (cur - prev) / prev * 100.0
@@ -271,6 +359,32 @@ def cleanup_depth():
         return None
 
 
+def stale_ops_count(now, gql=None):
+    """Open `Ops:` tickets with no update in STALE_OPS_DAYS, or None if unknown.
+
+    A failed query is None, never 0: a Linear outage must not read as a clean
+    board. done_without_evidence.gql() die()s on any Linear error, hence SystemExit.
+    """
+    cutoff = (now - timedelta(days=STALE_OPS_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        if gql is None:
+            spec = importlib.util.spec_from_file_location("done_without_evidence", LINEAR_CLIENT)
+            client = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(client)
+            gql = client.gql
+        total, after = 0, None
+        for _ in range(STALE_OPS_MAX_PAGES):
+            issues = gql(STALE_OPS_QUERY, {"cutoff": cutoff, "after": after})["issues"]
+            total += len(issues["nodes"])
+            if not issues["pageInfo"]["hasNextPage"]:
+                return total
+            after = issues["pageInfo"]["endCursor"]
+        print("scorecard: stale Ops count gave up after %d pages" % STALE_OPS_MAX_PAGES, file=sys.stderr)
+    except (Exception, SystemExit) as e:
+        print("scorecard: stale Ops count unavailable: %r" % (e,), file=sys.stderr)
+    return None
+
+
 def orphan_markers(now, older_than_days=7):
     """Count prlaunch-ok ledgers/markers whose mtime is older than N days."""
     if not os.path.isdir(PRLAUNCH_OK):
@@ -303,8 +417,8 @@ def _delta(prev, cur, better):
     return "%s%.0f%%%s" % (sign, change, warn)
 
 
-def render(cur_agg, prev_agg, pr_states, cleanup, orphans, days, flags, now):
-    """Render the full markdown report."""
+def render(cur_agg, prev_agg, pr_states, cleanup, orphans, days, flags, now, stale_ops="_skipped (--no-gh)_"):
+    """Render the full markdown report. `stale_ops` None means the count is unknown."""
     out = []
     out.append("## Automation scorecard — last %dd vs prior %dd" % (days, days))
     out.append("_generated %s_" % now.strftime("%Y-%m-%d %H:%MZ"))
@@ -350,15 +464,44 @@ def render(cur_agg, prev_agg, pr_states, cleanup, orphans, days, flags, now):
     else:
         note("PRlaunch", "_no data yet — ledger empty_")
 
+    # /execute ------------------------------------------------------------
+    if section_has_data(cur_agg, prev_agg, "drivers", DRIVERS + ("untagged",)):
+        row("/execute", "units shipped (driver=execute)", "drivers", "execute", "flat")
+        d = cur_agg["drivers"]
+        note("/execute", "PRlaunch units by driver: %s. Untagged rows predate the driver field or named none, "
+             "so the /execute count is a floor while untagged is above 0"
+             % " · ".join("%s %d" % (k, d[k]) for k in DRIVERS + ("untagged",)))
+    else:
+        note("/execute", "_no data yet — ledger empty_")
+
+    # Deep-review escapes -------------------------------------------------
+    if cur_agg["escapes"].get("error"):
+        note("Deep-review escapes", "_skipped — cr-parity.py failed: %s_" % cur_agg["escapes"]["error"])
+    elif section_has_data(cur_agg, prev_agg, "escapes", ("deep_reviewed",)):
+        e = cur_agg["escapes"]
+        row("Deep-review escapes", "CR coverage of deep-reviewed branches %", "escapes", "coverage_pct", "up")
+        row("Deep-review escapes", "branches w/ escape %", "escapes", "escape_branch_pct", "down")
+        row("Deep-review escapes", "major+ escapes per 100 branches", "escapes", "major_per_100", "down")
+        note("Deep-review escapes", "%d of %d deep-reviewed branches CR-covered; %d unknown (no CR run, excluded)"
+             % (e["covered"], e["deep_reviewed"], e["deep_reviewed"] - e["covered"]))
+        top = sorted(e["classes"].items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        note("Deep-review escapes", "major+ miss classes: %s · other %d — full table: `hooks/cr-parity.py`"
+             % (", ".join("%s %d" % kv for kv in top) or "none", e["other"]))
+    else:
+        note("Deep-review escapes", "_no data yet — ledger empty_")
+
     # Housekeeping --------------------------------------------------------
     note("Housekeeping", "cleanup queue depth now: %s" % ("n/a" if cleanup is None else cleanup))
     note("Housekeeping", "prlaunch-ok orphans >7d: %d" % orphans)
+    note("Housekeeping", "stale open Ops tickets (no update in %dd): %s"
+         % (STALE_OPS_DAYS, "n/a" if stale_ops is None else stale_ops))
 
     # Verdict -------------------------------------------------------------
     any_data = (
         section_has_data(cur_agg, prev_agg, "bulldozer", ("shipped", "resolved", "failed"))
         or section_has_data(cur_agg, prev_agg, "babysit", ("sweeps", "bumps", "fixes", "red_ci"))
         or section_has_data(cur_agg, prev_agg, "prlaunch", ("units", "cr_cli_skipped", "outcome_na", "prlaunch_skip"))
+        or section_has_data(cur_agg, prev_agg, "escapes", ("deep_reviewed",))
     )
     out.append("")
     if not any_data:
@@ -366,8 +509,7 @@ def render(cur_agg, prev_agg, pr_states, cleanup, orphans, days, flags, now):
                    "The fleet either hasn't run or predates the ledger; nothing to grade.")
     elif flags:
         out.append("**Verdict:** ⚠ %d metric(s) regressed >20%% window-over-window: %s. "
-                   "Investigate before the next batch — if the driver model changed this window, "
-                   "that is the prime suspect."
+                   "Investigate before the next batch."
                    % (len(flags), "; ".join(flags)))
     else:
         out.append("**Verdict:** fleet healthy — no tracked metric regressed >20% window-over-window. "
@@ -381,7 +523,8 @@ def render(cur_agg, prev_agg, pr_states, cleanup, orphans, days, flags, now):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Automation fleet scorecard.")
     ap.add_argument("--days", type=int, default=7, help="window size in days (default 7)")
-    ap.add_argument("--no-gh", action="store_true", help="skip live gh PR-state enrichment")
+    ap.add_argument("--no-gh", action="store_true",
+                    help="skip live gh PR-state enrichment and the Linear stale-Ops count")
     ap.add_argument("--gh-owner", default=os.environ.get("SCORECARD_GH_OWNER"),
                     help="GitHub owner for ledger rows that record a bare repo name "
                          "(default $SCORECARD_GH_OWNER; unset → those PRs count as unknown)")
@@ -398,6 +541,7 @@ def main(argv=None):
     records = parse_ledger(args.ledger)
     cur, prev = split_windows(records, now, args.days)
     cur_agg, prev_agg = aggregate(cur), aggregate(prev)
+    cur_agg["escapes"], prev_agg["escapes"] = escape_windows(records, now, args.days)
 
     pr_states = None
     if not args.no_gh:
@@ -410,7 +554,8 @@ def main(argv=None):
     orphans = orphan_markers(now)
     flags = flag_regressions(cur_agg, prev_agg)
 
-    print(render(cur_agg, prev_agg, pr_states, cleanup, orphans, args.days, flags, now))
+    kwargs = {} if args.no_gh else {"stale_ops": stale_ops_count(now)}
+    print(render(cur_agg, prev_agg, pr_states, cleanup, orphans, args.days, flags, now, **kwargs))
     return 0
 
 

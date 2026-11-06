@@ -36,7 +36,7 @@ Collect ALL true forks across all units (plus any group tiebreak) into a single 
 
 ### 5. Build — resume the same worker
 - For each surviving unit, `SendMessage` to that unit's worker (by its agent id): `BUILD` + the owner's answers to its forks + any orchestrator corrections to its plan. It keeps its validate-phase context and proceeds straight to build. Do not spawn a fresh builder unless the worker is dead (recovery table).
-- The worker brief's CONSTRAINTS carry the gotcha pack below **verbatim**, from spawn — so it's already in context when BUILD arrives.
+- The worker brief's CONSTRAINTS carry the gotcha pack below **verbatim**, from spawn — so it's already in context when BUILD arrives. They also name the PRlaunch driver: "Your driver is `orchestrate`: `LEDGER_DRIVER=orchestrate` inline on PRlaunch's ledger-writing calls". It stays out of the pack because /execute pastes the same pack.
 - Independent units → build in parallel. Same-file/dependent units → send BUILD sequentially, stacked PRs, each pinned to the previous branch's tip SHA (say the new base in the BUILD message).
 - In the build phase the worker owns the whole unit: worktree + `me/dev-NNNN-slug` branch, TDD build, real tests (including the repo's ratchet tests, not just its targeted paths — the bake-off's Sonnet arm broke an allowlist ratchet test by skipping them), full `/PRlaunch`, tracker update. It returns a JSON contract (ticket, status, pr_url, test_cmd, test_result, notes).
 - **The orchestrator never builds inline.** Sole exception: finishing a dead worker's work (recovery table below).
@@ -45,6 +45,7 @@ Collect ALL true forks across all units (plus any group tiebreak) into a single 
 A worker's "shipped" is a claim, not a fact. Before accepting each return: `gh pr view` the PR exists and diff scope matches the ticket, spot-check the claimed test evidence (re-run its `test_cmd` on the worktree tip, or read the PRlaunch gate ledger). Claim without evidence → SendMessage the worker to produce it, or finish/verify it yourself.
 
 ### 7. Report + persist
+- First run `/execute` phase 9 (`skills/execute/trial_merge.py`) for each repo with 2+ open PRs from this group, and put its table in the report. Conflicts and failures are reported, never auto-resolved.
 - Per-unit table: `unit → PR link / closed:<evidence> / halted:<reason> / failed:<reason>`, plus merge-order notes for stacks and any post-merge ops steps for the owner. **TEAM MERGES — never self-merge.**
 - If you maintain a session-memory store (this repo's own convention — see "Cross-cutting: how we do memory" in the README, `memory_write`), persist the batch record (units→PRs, premise corrections, new gotchas, ops steps) — every past run did; it's how the next run gets smarter. If you don't run one, the per-unit report table above is the persisted record. Sweep any tracker stragglers the workers missed.
 
@@ -64,6 +65,11 @@ A worker's "shipped" is a claim, not a fact. Before accepting each return: `gh p
   provider bug; remove any stale .next first.
 - NEVER broad-kill processes (pkill -f 'next dev' etc.) — parallel sibling
   workers share this machine. Kill by specific PID/port only.
+- Tests: run your targeted files + the repo's ratchet tests at MAX `-n 2`.
+  NEVER `-n auto`, and never the full suite — that is CI's job. One machine
+  hosts every worker, and parallel full `-n auto` runs swap it into reds that
+  are only thrash. `hooks/test-admission.py` denies `-n` > 2 and a second
+  concurrent full suite; its message gives the fix.
 - CR CLI rate-limited (shared plan quota, parallel workers): take PRlaunch's
   authorized skip-with-ledger-note; cloud CodeRabbit is the backstop. Do NOT
   sit waiting for the quota window.

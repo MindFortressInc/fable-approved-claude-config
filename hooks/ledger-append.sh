@@ -51,7 +51,19 @@ fi
 # a hand-run invocation gets no key at all, never a `skill: null`. Ledger readers
 # should access rows through .get()-style lookups with no key whitelist, so a new
 # key cannot break them.
+#
+# driver ($LEDGER_DRIVER) answers "which skill sent this PRlaunch unit
+# here", because every gate and unit row says skill:"prlaunch" whoever drove it.
+# Only prlaunch rows get it: a `claude -p` worker can hold the variable in its env
+# while writing rows of another kind. Unset stays unset, never a default `manual`,
+# so a worker that dropped the prefix reads as untagged and not as a human. A typo
+# warns and is dropped rather than losing the row or adding a scorecard bucket.
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+driver="${LEDGER_DRIVER:-}"
+case "$driver" in
+  ""|execute|orchestrate|bulldozer|manual) ;;
+  *) echo "ledger-append: ignoring unknown LEDGER_DRIVER '$driver'" >&2; driver="" ;;
+esac
 # The launch_id is sanitised to [A-Za-z0-9._-]. A launcher that stamps the same id
 # into its own log must apply the SAME class, or the two stores hold different
 # keys for one run and the join silently resolves to nothing -- worse than no
@@ -60,11 +72,13 @@ ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 line="$(printf '%s' "$payload" | jq -c \
   --arg ts "$ts" \
   --arg launch_id "${BABYSIT_LAUNCH_ID:-}" \
-  --arg skill "${LEDGER_SKILL:-}" '
+  --arg skill "${LEDGER_SKILL:-}" \
+  --arg driver "$driver" '
     ($launch_id | gsub("[^A-Za-z0-9._-]"; "")) as $lid
   | (if has("ts")        then . else . + {ts: $ts}               end)
   | (if $lid   == "" or has("launch_id") then . else . + {launch_id: $lid}     end)
   | (if $skill == "" or has("skill")     then . else . + {skill: $skill}       end)
+  | (if $driver == "" or has("driver") or .skill != "prlaunch" then . else . + {driver: $driver} end)
 ')"
 
 ledger="$HOME/.claude/automation-ledger.jsonl"
