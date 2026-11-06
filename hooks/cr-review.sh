@@ -9,7 +9,9 @@
 # ~/.claude/cr-seats, or CR_SEATS_DIR pointing at an empty dir) this runs the
 # CLI ONCE under your own HOME/login, exactly like bare `coderabbit review`,
 # and only adds the exit-code contract: 70/71 below, and 75 when that single
-# account reports a rate limit (so PRlaunch can record its authorized skip).
+# account reports a rate limit or a spent monthly cap (so PRlaunch can record
+# its authorized skip). Only a failed run that names the cap ever triggers a
+# `coderabbit usage` call to confirm it.
 #
 # Why a pool exists at all: CodeRabbit rate-limits per developer. Parallel agent
 # workers on one box all authenticate as one identity, so they burn one seat's
@@ -52,7 +54,8 @@
 #       reproduces that exactly without this code.
 #   75  every seat is rate-limited/at cap, or still busy after CR_SEAT_WAIT_MAX
 #       -- or, with no pool registered, the one default account reported a rate
-#       limit -> PRlaunch records the authorized skip
+#       limit -- or the account's monthly spend cap refused the review
+#       -> PRlaunch records the authorized skip
 #   *   the underlying coderabbit exit code for a non-limit failure
 #
 # 0 and 75 are the ONLY two codes that satisfy the cr_cli gate, so every path
@@ -254,6 +257,78 @@ run_cli() { # run_cli <home|""> <out> <err> [cli args...]
   CLI_PID=""
 }
 
+# The monthly spend cap. Distinct from the hourly seat limit: once a shared
+# CodeRabbit subscription reaches its review cap, EVERY seat fails with
+# "Review failed: Failed to start review. Please try again." and exit 1 -- no
+# limit phrase, so `limited` misses it, the wrapper used to pass the 1 through,
+# and every PRlaunch blocked on cr_cli until the billing period reset. A spent
+# cap is a limit like any other -> exit 75, the authorized skip.
+#
+# Triggered ONLY by that failure line on a failed run, then CONFIRMED against
+# `coderabbit usage`. Never pre-checked from usage alone: usage has been seen to
+# read "Your spend : $50.00 / Review cap : $50.00" while reviews on two seats
+# still ran and exited 0, so spend >= cap by itself does not mean "blocked".
+# Usage is probed per identity because an API-key seat cannot see billing
+# ("Billing-period usage isn't available with API-key authentication"); the
+# first identity that reports a cap decides.
+#
+# Stricter stream discipline than `limited`: stdout carries review FINDINGS,
+# which can quote this phrase (a review of this very file does), and usage reads
+# spend >= cap even while reviews run. So on stdout only a line that IS the
+# failure message counts, or an --agent status/error event whose message value
+# is exactly it -- anchored at both ends, so a finding that merely starts with
+# the phrase ("- Failed to start review errors fall through ...") stays a verdict.
+SPEND_FAIL_RE='failed to start review'
+SPEND_FAIL_MSG='(error:?[[:space:]]*)?(review failed:?[[:space:]]*)?failed to start review([.!]([[:space:]]*please try again[.!]?)?)?[[:space:]]*'
+SPEND_FAIL_LINE_RE="^[^[:alnum:]]*${SPEND_FAIL_MSG}\$"
+# An `--agent` JSON status/error event (one object per line) whose message field
+# is exactly that failure.
+AGENT_EVENT_RE='^[[:space:]]*\{.*"type"[[:space:]]*:[[:space:]]*"(status|error)"'
+SPEND_FAIL_AGENT_RE="\"(message|error|status|detail)\"[[:space:]]*:[[:space:]]*\"${SPEND_FAIL_MSG}\""
+# `coderabbit usage` is a network call made while holding a seat lock, so it is
+# bounded; perl's alarm is the portable timeout (macOS ships no `timeout`).
+# CR_USAGE_TIMEOUT is ONE deadline across every identity probed, not per probe:
+# a network outage must not cost (seats + 1) x the timeout under the lock.
+USAGE_TIMEOUT=$(num_or "${CR_USAGE_TIMEOUT:-}" 30)
+spend_capped() { # spend_capped <rc> <out> <err> <home|"">... -> 0 + prints "$S of $C, resets D"
+  local rc="$1" out="$2" err="$3" h u spend cap left t_end; shift 3
+  (( rc != 0 )) || return 1
+  grep -qiE "$SPEND_FAIL_RE" "$err" 2>/dev/null \
+    || grep -qiE "$SPEND_FAIL_LINE_RE" "$out" 2>/dev/null \
+    || grep -iE "$AGENT_EVENT_RE" "$out" 2>/dev/null | grep -qiE "$SPEND_FAIL_AGENT_RE" \
+    || return 1
+  t_end=$(( $(now) + USAGE_TIMEOUT ))
+  for h in "$@"; do
+    left=$(( t_end - $(now) ))
+    (( left > 0 )) || break
+    if [[ -n "$h" ]]; then
+      u=$(HOME="$h" perl -e 'alarm shift; exec @ARGV' "$left" coderabbit usage 2>/dev/null)
+    else
+      u=$(perl -e 'alarm shift; exec @ARGV' "$left" coderabbit usage 2>/dev/null)
+    fi
+    spend=$(awk -F'$' '/^[[:space:]]*Your spend/ {split($2,a," "); gsub(/,/,"",a[1]); print a[1]; exit}' <<<"$u")
+    cap=$(awk -F'$' '/^[[:space:]]*Review cap/ {split($2,a," "); gsub(/,/,"",a[1]); print a[1]; exit}' <<<"$u")
+    [[ -n "$spend" && -n "$cap" ]] || continue
+    awk -v s="$spend" -v c="$cap" 'BEGIN { exit !(c + 0 > 0 && s + 0 >= c + 0) }' || return 1
+    printf '$%s of $%s, resets %s' "$spend" "$cap" \
+      "$(awk -F': *' '/^[[:space:]]*Period resets/ {print $2; exit}' <<<"$u")"
+    return 0
+  done
+  return 1
+}
+
+# The cap is spent for the month: no seat can help, so stop without rotating.
+die_spend_cap() { # die_spend_cap <detail> [pool]
+  if [[ "${2:-}" == pool ]]; then
+    log "MONTHLY SPEND CAP REACHED ($1) run=$CR_RUN_ID -- every seat shares it, not rotating."
+    log "ALL SEATS EXHAUSTED (monthly spend cap) -- record the authorized cr_cli skip"
+  else
+    log "MONTHLY SPEND CAP REACHED ($1) run=$CR_RUN_ID -- the default identity's cap is spent and no seat pool is registered -- record the authorized cr_cli skip"
+  fi
+  finished=1
+  exit 75
+}
+
 reserve_codes() { # reserve_codes <rc> -> rc, with 70/71 collapsed to 1
   case "$1" in
     70|71) log "the CLI exited $1, which this wrapper reserves for its own verdicts -- reporting 1"
@@ -297,6 +372,10 @@ if (( ${#SEATS[@]} == 0 )); then
     log "the default identity is rate-limited and no seat pool is registered -- record the authorized cr_cli skip (run=$CR_RUN_ID)"
     finished=1
     exit 75
+  fi
+  if capped=$(spend_capped "$rc" "$out" "$err" ""); then
+    rm -f "$out" "$err"
+    die_spend_cap "$capped"
   fi
   rm -f "$out" "$err"
   rc=$(reserve_codes "$rc")
@@ -562,6 +641,16 @@ while :; do
       continue
     fi
 
+    # Monthly spend cap: shared by every seat, so rotating would only replay
+    # the failure. No review ran -> no `.uses` line, no cooldown.
+    probe=("$seat")
+    for s in "${SEATS[@]}"; do [[ "$s" == "$seat" ]] || probe+=("$s"); done
+    if capped=$(spend_capped "$rc" "$out" "$err" "${probe[@]}" ""); then
+      cat "$out"; cat "$err" >&2
+      rm -f "$out" "$err"; release "$seat"; held=""
+      die_spend_cap "$capped" pool
+    fi
+
     cat "$out"; cat "$err" >&2
     now >> "$seat/.uses"
     rm -f "$seat/.limited_until" "$out" "$err"
@@ -615,7 +704,9 @@ while :; do
 done
 
 log "ALL SEATS EXHAUSTED (${skipped:- none available}) run=$CR_RUN_ID -- record the authorized cr_cli skip"
-# Every seat was looked at and every one was genuinely spent or busy. This is the
-# ONE path allowed to authorize a skip, which is why nothing else may reach 75.
+# Every seat was looked at and every one was genuinely spent or busy. This, the
+# no-pool single-account limit above, and die_spend_cap (a usage-confirmed spend
+# cap) are the ONLY paths allowed to authorize a skip, which is why nothing else
+# may reach 75.
 finished=1
 exit 75
