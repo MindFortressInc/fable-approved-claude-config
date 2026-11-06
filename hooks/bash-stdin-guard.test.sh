@@ -173,12 +173,12 @@ if printf '%s' "$r" | grep -qF '${A}:src/x' && printf '%s' "$r" | grep -qF '${B}
 # Keep the table honest: the verdict must match what real zsh does to the value,
 # and the corrected form must be what restores it.  No `:W` token whose expansion
 # varies between runs belongs here: real zsh printed either the literal or stray
-# bytes for `$B:wWeb/x`, and `$B:Web/x` is stray bytes nearly every run.
+# bytes for `$B:wWeb/x`, `$B:fWork/x` and `$B:gWork/x`, and `$B:Web/x` is stray
+# bytes nearly every run (zsh 5.9 reads past an unterminated `:W` delimiter).
 if command -v zsh >/dev/null 2>&1; then
   for path in tests/x src/x api/x hooks/x lib/x e2e/x run/x util/x cmd/x query/x AGENTS.md Pods/x Queries/x \
               frontend/x features/x web/x \
-              docs/x packages/x bin/x github/x workflows/x jobs/x models/x .github/x README.md \
-              fWork/x gWork/x; do
+              docs/x packages/x bin/x github/x workflows/x jobs/x models/x .github/x README.md; do
     if [ "$(zsh -f -c "B=abc; print -r -- \"\$B:$path\"" 2>/dev/null)" = "abc:$path" ]; then want=EMPTY; else want="git show \${B}:$path"; fi
     check_modifier "matches zsh: $path" "git show \$B:$path" "$want"
     got=$(zsh -f -c "B=abc; print -r -- \"\${B}:$path\"")
