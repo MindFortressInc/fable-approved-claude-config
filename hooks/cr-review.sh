@@ -64,6 +64,9 @@
 # nothing". "Could not check" must never pass as "checked and clear". Hence
 # the fail-closed trap below -- see `cleanup`/`die_internal`.
 #
+# Pool file: <seat dir>/.default_bills_pool declares that your own login bills
+# the pool's subscription, so its `coderabbit usage` may confirm the pool's spend
+# cap. Without it only the seats' own usage counts (see spend_capped()).
 # Env knobs: CR_SEAT_WAIT_MAX (default 1200s, 0 = fail fast), CR_SEAT_POLL (20s)
 # CR_RUN_ID: pin the run id surfaced on stderr (default: auto-generated) so a
 # caller can correlate this run with prlaunch-gate.sh's `record cr_cli --run-id`
