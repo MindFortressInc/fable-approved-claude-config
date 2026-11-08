@@ -272,6 +272,19 @@ run_cli() { # run_cli <home|""> <out> <err> [cli args...]
 # ("Billing-period usage isn't available with API-key authentication"); the
 # first identity that reports a cap decides.
 #
+# Only identities known to bill the failing review are probed. With a pool, that
+# is the pool's own seats -- NOT the default login, which may sit on a different
+# subscription: an API-key-only pool whose default login happens to be capped
+# would otherwise exit 75, authorizing a skip for a cap the pool never hit. The
+# default login joins the pool's probe only when the operator declares it bills
+# the pool with a `.default_bills_pool` file in the seat dir. Unconfirmed, the
+# failure stays the CLI's own non-75 exit -- "could not confirm" is never a skip.
+#
+# The probe is called in the WRAPPER shell (result in SPEND_DETAIL), never inside
+# $(...), and each `coderabbit usage` runs as the tracked background CLI_PID --
+# the same reason as run_cli(): a TERM during a foreground probe would wait out
+# the whole probe before cleanup() could release the seat lock.
+#
 # Stricter stream discipline than `limited`: stdout carries review FINDINGS,
 # which can quote this phrase (a review of this very file does), and usage reads
 # spend >= cap even while reviews run. So on stdout only a line that IS the
@@ -288,32 +301,44 @@ SPEND_FAIL_AGENT_RE="\"(message|error|status|detail)\"[[:space:]]*:[[:space:]]*\
 # `coderabbit usage` is a network call made while holding a seat lock, so it is
 # bounded; perl's alarm is the portable timeout (macOS ships no `timeout`).
 # CR_USAGE_TIMEOUT is ONE deadline across every identity probed, not per probe:
-# a network outage must not cost (seats + 1) x the timeout under the lock.
+# a network outage must not cost (identities probed) x the timeout under the lock.
 USAGE_TIMEOUT=$(num_or "${CR_USAGE_TIMEOUT:-}" 30)
-spend_capped() { # spend_capped <rc> <out> <err> <home|"">... -> 0 + prints "$S of $C, resets D"
-  local rc="$1" out="$2" err="$3" h u spend cap left t_end; shift 3
+SPEND_DETAIL=""
+spend_capped() { # spend_capped <rc> <out> <err> <home|"">... -> 0 + SPEND_DETAIL="$S of $C, resets D"
+  local rc="$1" out="$2" err="$3" h u uf spend cap left t_end; shift 3
+  SPEND_DETAIL=""
   (( rc != 0 )) || return 1
   grep -qiE "$SPEND_FAIL_RE" "$err" 2>/dev/null \
     || grep -qiE "$SPEND_FAIL_LINE_RE" "$out" 2>/dev/null \
     || grep -iE "$AGENT_EVENT_RE" "$out" 2>/dev/null | grep -qiE "$SPEND_FAIL_AGENT_RE" \
     || return 1
+  uf=$(mktemp "${TMPDIR:-/tmp}/cr-review-usage.XXXXXX")
   t_end=$(( $(now) + USAGE_TIMEOUT ))
   for h in "$@"; do
     left=$(( t_end - $(now) ))
     (( left > 0 )) || break
     if [[ -n "$h" ]]; then
-      u=$(HOME="$h" perl -e 'alarm shift; exec @ARGV' "$left" coderabbit usage 2>/dev/null)
+      HOME="$h" perl -e 'alarm shift; exec @ARGV' "$left" coderabbit usage >"$uf" 2>/dev/null &
     else
-      u=$(perl -e 'alarm shift; exec @ARGV' "$left" coderabbit usage 2>/dev/null)
+      perl -e 'alarm shift; exec @ARGV' "$left" coderabbit usage >"$uf" 2>/dev/null &
     fi
+    CLI_PID=$!
+    # 2>/dev/null: a probe the alarm kills is an expected outcome, and bash would
+    # otherwise print an "Alarm clock" job notice into the wrapper's stderr.
+    wait "$CLI_PID" 2>/dev/null
+    CLI_PID=""
+    u=$(cat "$uf")
     spend=$(awk -F'$' '/^[[:space:]]*Your spend/ {split($2,a," "); gsub(/,/,"",a[1]); print a[1]; exit}' <<<"$u")
     cap=$(awk -F'$' '/^[[:space:]]*Review cap/ {split($2,a," "); gsub(/,/,"",a[1]); print a[1]; exit}' <<<"$u")
     [[ -n "$spend" && -n "$cap" ]] || continue
+    rm -f "$uf"
     awk -v s="$spend" -v c="$cap" 'BEGIN { exit !(c + 0 > 0 && s + 0 >= c + 0) }' || return 1
-    printf '$%s of $%s, resets %s' "$spend" "$cap" \
-      "$(awk -F': *' '/^[[:space:]]*Period resets/ {print $2; exit}' <<<"$u")"
+    SPEND_DETAIL=$(printf '$%s of $%s, resets %s' "$spend" "$cap" \
+      "$(awk -F': *' '/^[[:space:]]*Period resets/ {print $2; exit}' <<<"$u")")
     return 0
   done
+  rm -f "$uf"
+  log "'Failed to start review' but no identity known to bill this review reported a spent cap -- not a skip (run=$CR_RUN_ID)"
   return 1
 }
 
@@ -373,9 +398,9 @@ if (( ${#SEATS[@]} == 0 )); then
     finished=1
     exit 75
   fi
-  if capped=$(spend_capped "$rc" "$out" "$err" ""); then
+  if spend_capped "$rc" "$out" "$err" ""; then
     rm -f "$out" "$err"
-    die_spend_cap "$capped"
+    die_spend_cap "$SPEND_DETAIL"
   fi
   rm -f "$out" "$err"
   rc=$(reserve_codes "$rc")
@@ -642,13 +667,15 @@ while :; do
     fi
 
     # Monthly spend cap: shared by every seat, so rotating would only replay
-    # the failure. No review ran -> no `.uses` line, no cooldown.
+    # the failure. No review ran -> no `.uses` line, no cooldown. The default
+    # login is probed only when declared to bill the pool -- see spend_capped().
     probe=("$seat")
     for s in "${SEATS[@]}"; do [[ "$s" == "$seat" ]] || probe+=("$s"); done
-    if capped=$(spend_capped "$rc" "$out" "$err" "${probe[@]}" ""); then
+    [[ -f "$SEATS_DIR/.default_bills_pool" ]] && probe+=("")
+    if spend_capped "$rc" "$out" "$err" "${probe[@]}"; then
       cat "$out"; cat "$err" >&2
       rm -f "$out" "$err"; release "$seat"; held=""
-      die_spend_cap "$capped" pool
+      die_spend_cap "$SPEND_DETAIL" pool
     fi
 
     cat "$out"; cat "$err" >&2
