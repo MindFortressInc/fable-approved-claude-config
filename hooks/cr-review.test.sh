@@ -543,7 +543,7 @@ seat=$(basename "$HOME")
 if [[ "${1:-}" = usage ]]; then
   echo "usage probe seat=$seat" >> "$CALLS"
   echo "Billing period"
-  if [[ "$seat" = charlie ]]; then
+  if [[ "$seat" = "${BILLED:-charlie}" ]]; then
     echo "Organization  : example-org"
     echo "Your spend    : \$${SPEND:-50.00}"
     echo "Review cap    : \$${CAP:-50.00} per billing month (shared subscription; inactive)"
@@ -638,8 +638,27 @@ for m in status agent; do
   [[ $rc -eq 75 ]] && { echo "  PASS: $m -> exit 75"; pass=$((pass+1)); } || { echo "  FAIL: $m -> exit $rc (want 75)"; fail=$((fail+1)); }
 done
 
+echo "T30b: an API-key-only pool never borrows a DIFFERENT login's spent cap for its 75"
+# Every seat is API-key (no billing visible); only the default login -- which may
+# be on another subscription -- reports a spent cap. Its cap is not the pool's,
+# so the failure stays the CLI's own exit 1, and its usage is never consulted.
+# Declaring `.default_bills_pool` is what makes that login's cap admissible.
+reset25; mkdir -p "$SCRATCH/home/dflt"
+o=$(BILLED=dflt HOME="$SCRATCH/home/dflt" CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+[[ $rc -eq 1 ]] && { echo "  PASS: exit 1, not 75"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 1)"; fail=$((fail+1)); }
+if grep -qF "SPEND CAP" <<<"$o"; then echo "  FAIL: claimed a spend cap from the default login"; fail=$((fail+1));
+else echo "  PASS: no spend-cap claim"; pass=$((pass+1)); fi
+check "says the cap was unconfirmed" "no identity known to bill this review" "$o"
+check "default login's usage never probed" "0" "$(grep -c '^usage probe seat=dflt$' "$CALLS")"
+check "every pool seat probed" "3" "$(grep -c '^usage probe seat=' "$CALLS")"
+reset25; touch "$CR_SEATS_DIR/.default_bills_pool"
+o=$(BILLED=dflt HOME="$SCRATCH/home/dflt" CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
+rm -f "$CR_SEATS_DIR/.default_bills_pool"
+[[ $rc -eq 75 ]] && { echo "  PASS: declared default login -> exit 75"; pass=$((pass+1)); } || { echo "  FAIL: declared default login -> exit $rc (want 75)"; fail=$((fail+1)); }
+check "declared: names the spend cap" "MONTHLY SPEND CAP REACHED" "$o"
+
 echo "T31: a hung 'coderabbit usage' is bounded ONCE across all probes and falls back to the CLI's own exit"
-# 3 seats + the default identity: a per-probe bound would take >= 4 x 2s.
+# 3 seats probed: a per-probe bound would take >= 3 x 2s.
 cat > "$SCRATCH/bin/coderabbit" <<'STUB31'
 #!/usr/bin/env bash
 [[ "${1:-}" = usage ]] && exec sleep 30
@@ -651,6 +670,41 @@ o=$(CR_USAGE_TIMEOUT=2 CR_SEAT_WAIT_MAX=0 "$WRAP" --base main 2>&1); rc=$?
 el=$(( $(date +%s) - t0 ))
 [[ $rc -eq 1 ]] && { echo "  PASS: exit 1"; pass=$((pass+1)); } || { echo "  FAIL: exit $rc (want 1)"; fail=$((fail+1)); }
 (( el < 6 )) && { echo "  PASS: returned in ${el}s"; pass=$((pass+1)); } || { echo "  FAIL: took ${el}s"; fail=$((fail+1)); }
+
+echo "T32: a TERM during the usage probe releases the seat lock promptly"
+# The probe used to run inside $(spend_capped ...): a foreground subshell, so the
+# trap waited out the whole probe -- CR_USAGE_TIMEOUT, 30s by default -- with the
+# seat lock held. The probe is now a tracked background child like the CLI.
+export USAGE_PIDFILE="$SCRATCH/usage.pid"
+cat > "$SCRATCH/bin/coderabbit" <<'STUB33'
+#!/usr/bin/env bash
+if [[ "${1:-}" = usage ]]; then echo $$ > "$USAGE_PIDFILE"; exec sleep 25; fi
+echo "Review failed: Failed to start review. Please try again." >&2; exit 1
+STUB33
+chmod +x "$SCRATCH/bin/coderabbit"
+for path in seat fallback; do
+  if [[ $path == seat ]]; then seats="$CR_SEATS_DIR"; else seats="$SCRATCH/empty"; fi
+  reset25; rm -f "$USAGE_PIDFILE"
+  ( CR_USAGE_TIMEOUT=60 CR_SEAT_WAIT_MAX=0 CR_SEATS_DIR="$seats" "$WRAP" --base main >/dev/null 2>"$SCRATCH/probe.err" ) & victim=$!
+  for _ in $(seq 50); do [[ -s "$USAGE_PIDFILE" ]] && break; sleep 0.1; done
+  probe_pid=$(cat "$USAGE_PIDFILE" 2>/dev/null)
+  t0=$(date +%s); kill -TERM $victim 2>/dev/null; wait $victim 2>/dev/null; rc=$?
+  elapsed=$(( $(date +%s) - t0 ))
+  if [[ -z "$probe_pid" ]]; then
+    echo "  FAIL: $path path never reached the usage probe -- the assertion would be vacuous"; fail=$((fail+1)); continue
+  fi
+  (( elapsed < 10 )) && { echo "  PASS: $path path stopped promptly (${elapsed}s)"; pass=$((pass+1)); } \
+    || { echo "  FAIL: $path path waited out the probe (${elapsed}s)"; fail=$((fail+1)); }
+  [[ $rc -eq 70 ]] && { echo "  PASS: $path path exit 70"; pass=$((pass+1)); } || { echo "  FAIL: $path path exit $rc (want 70)"; fail=$((fail+1)); }
+  check "$path path announced the internal error" "INTERNAL ERROR" "$(cat "$SCRATCH/probe.err")"
+  if kill -0 "$probe_pid" 2>/dev/null; then
+    echo "  FAIL: $path path orphaned the usage probe (pid $probe_pid)"; fail=$((fail+1)); kill -9 "$probe_pid" 2>/dev/null
+  else echo "  PASS: $path path left no orphaned probe"; pass=$((pass+1)); fi
+done
+unset USAGE_PIDFILE
+if [[ -n "$(ls -d "$SCRATCH/seats"/*/.lock 2>/dev/null)" ]]; then
+  echo "  FAIL: left a seat lock held"; fail=$((fail+1)); rm -rf "$SCRATCH/seats"/*/.lock
+else echo "  PASS: released the seat lock"; pass=$((pass+1)); fi
 
 echo; echo "RESULT: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
