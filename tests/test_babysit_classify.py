@@ -270,7 +270,11 @@ def run_sweep(fxdir, state_path, *, repos="", quiet="no:test", progress=None,
         "BABYSIT_RULING_AUTHORS": AUTHOR,
         "BABYSIT_REPOS_ROOT": os.path.join(fxdir, "nonexistent-repos-root"),
     })
-    env.update(extra_env or {})
+    for k, v in (extra_env or {}).items():   # a None value UNSETS the var
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     args = [sys.executable, SCRIPT, "sweep", "--state", state_path,
             "--gh-bin", SHIM, "--owner", owner]
     if repos:
@@ -776,11 +780,21 @@ class RulingAuthorsTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"BABYSIT_RULING_AUTHORS": raw}):
                 self.assertEqual(bc._ruling_authors(), set(), repr(raw))
 
-    def test_unset_falls_back_to_default(self):
+    def test_unset_trusts_nobody(self):
+        """The shipped default is EMPTY: an install that never configured
+        BABYSIT_RULING_AUTHORS must not trust a placeholder login anyone could
+        register (it shipped as "your-github-login", an unclaimed account)."""
+        self.assertEqual(bc.RULING_AUTHORS_DEFAULT, "")
         with mock.patch.dict(os.environ):
             os.environ.pop("BABYSIT_RULING_AUTHORS", None)
-            self.assertEqual(bc._ruling_authors(),
-                             {bc.RULING_AUTHORS_DEFAULT.lower()})
+            self.assertEqual(bc._ruling_authors(), set())
+
+    def test_unset_disables_ruling_harvest(self):
+        cs = [ruling("src/a.py:R1", ago(5), authorized=True),
+              ruling("src/b.py:R2", ago(5), authorized=True, login="your-github-login")]
+        with mock.patch.dict(os.environ):
+            os.environ.pop("BABYSIT_RULING_AUTHORS", None)
+            self.assertEqual(bc.harvest_ruling_comments(cs), {})
 
     def test_list_is_trimmed_and_lowered(self):
         with mock.patch.dict(os.environ, {"BABYSIT_RULING_AUTHORS": " Alice-Bot , bob "}):
@@ -927,6 +941,30 @@ class TriggeredWaitingTests(SweepCase):
         f.add_pr("acme-api", 832, issues=[clean_harvest(ago(10), "1234567" + "f" * 33)])
         f.finalize()
         self.assertEqual(self.pr(run_sweep(self.fx, self.state), 832)["tier"], "")
+
+
+
+
+# ===========================================================================
+# an UNSET BABYSIT_RULING_AUTHORS trusts no CR-CLI harvest (fail closed)
+# ===========================================================================
+class UnsetRulingAuthorsSweepTests(SweepCase):
+    def test_unset_ruling_authors_trusts_no_harvest(self):
+        """With BABYSIT_RULING_AUTHORS unset, no clean CR-CLI harvest greens a
+        PR -- not even one from the old placeholder login."""
+        f = Fixtures(self.fx)
+        f.add_pr("acme-api", 833, issues=[clean_harvest(ago(10), default_head(833))])
+        f.add_pr("acme-api", 834, issues=[clean_harvest(ago(10), default_head(834),
+                                                        login="your-github-login")])
+        f.finalize()
+        out = run_sweep(self.fx, self.state, extra_env={"BABYSIT_RULING_AUTHORS": None})
+        for num in (833, 834):
+            with self.subTest(pr=num):
+                self.assertEqual((self.pr(out, num)["tier"], self.pr(out, num)["green_via"]),
+                                 ("", ""))
+        control = run_sweep(self.fx, self.state)          # AUTHOR trusted
+        self.assertEqual((self.pr(control, 833)["tier"], self.pr(control, 833)["green_via"]),
+                         ("strict", "cli"))
 
 
 # ===========================================================================
@@ -1311,6 +1349,17 @@ class AttestationCoverageTests(SweepCase):
         out = self.sweep()
         self.assert_not_attested(out, 1421)
         self.assert_not_attested(out, 1422)
+
+    def test_unset_ruling_authors_trusts_no_status(self):
+        """With BABYSIT_RULING_AUTHORS unset, no creator is trusted -- not even
+        the old placeholder login."""
+        self._stacked(1426, statuses=[self.status()])
+        self._stacked(1427, statuses=[self.status(login="your-github-login")])
+        out = self.sweep(extra_env={"BABYSIT_RULING_AUTHORS": None})
+        self.assert_not_attested(out, 1426)
+        self.assert_not_attested(out, 1427)
+        self.assertTrue(self.pr(run_sweep(self.fx, self.state, quiet="yes:test"),
+                                1426)["cli_attested_at_head"])   # control: AUTHOR set
 
     def test_a_non_success_rollup_or_fetched_state_does_not_count(self):
         pending = dict(CR_CLI_OK, state="PENDING")
