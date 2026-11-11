@@ -33,6 +33,22 @@ For a strictly read-only worker (a reviewer, classifier or validator), paste thi
   and evidence to the orchestrator instead.
 ```
 
+Every worker allowed to modify Git state or a worktree gets this one, verbatim, whatever else applies. `<scratchpad>/<unit>/` is the worker's own scratch directory for this one unit of work, never a path a parallel sibling also writes.
+
+```text
+- NEVER `git stash` (push/pop/apply/drop/save/clear, or bare). `refs/stash`
+  is ONE stack shared by every worktree of the repo: a pop takes whatever is
+  on top, routinely a parallel sibling's WIP, and a stash on a clean tree
+  saves nothing, so the pop after it is ALWAYS someone else's entry
+  (we measured 13+ cross-agent collisions). To set work aside or test the base,
+  use a scratch commit on your own branch (`git add -A && git commit -m wip`,
+  later `git reset --soft HEAD~1`), `git worktree add --detach
+  <scratchpad>/<unit>/base <base-sha>`, `git show <sha>:<path>`, or copy files to
+  your scratchpad. `git stash list`/`show` are fine. hooks/stash-guard.py
+  denies the rest in Claude Code; Codex runs no hooks, so there this line is
+  the only guard.
+```
+
 Include the discovery obligation **written out**, never as a pointer to a rule the worker has not read — a fresh subagent sees only this prompt, and a Codex delegate reads `AGENTS.md`, never `CLAUDE.md`, so "follow rule #6" arrives as a dead reference. The operative text to paste: *when you are about to spend real work establishing something that may already exist or have already been measured — proposing a new mechanism, concluding "X doesn't exist", or measuring/benchmarking a system that is already running — first run all three of: (1) search the tracker for the* concern *(product, SKU or epic names — not the ticket id); the tracker records what is already built, not just what is planned. (2) grep the ecosystem for the concern. (3)* `memory_search` *the FULL memory: an injected memory block is usually a truncated top-ranked slice, and a* `[+N more]` *marker means the rest was cut. Build or derive from scratch only after all three come back empty — and when you do build a cross-cutting step (parsing a file, sniffing a type, OCR, fetching a URL, storing an upload, auth, notify, job tracking), search for the step itself across the ecosystem rather than for your feature, at any size, even a few lines. Extend a shared one in place if it exists. If none exists, build it in the shared layer with your feature as its first caller. Never a feature-private copy. If no memory store is configured, say in your reply that memory search was unavailable and continue with (1) and (2); a missing store is not a reason to stop.* A question one file read settles does not trigger this. If a retrieval tool ranks hits, inspect several and verify each cited `file:line` against the source; the top-ranked hit is not ground truth.
 
 ### 4. RETURN CONTRACT
