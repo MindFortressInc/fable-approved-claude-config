@@ -40,6 +40,7 @@ GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
                        "--super-prefix", "--config-env"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
 ALTERNATIVES = (
@@ -236,9 +237,10 @@ def judge(cmd, cwd, env, depth=0):
             body = None
             if head == "eval":
                 body = " ".join(toks[1:])
-            elif "-c" in toks[1:]:
-                k = toks.index("-c")
-                body = toks[k + 1] if k + 1 < len(toks) else None
+            else:                         # -c, or a cluster like -lc / -ec
+                k = next((k for k, t in enumerate(toks[1:], 1)
+                          if SHELL_C.fullmatch(t)), None)
+                body = toks[k + 1] if k is not None and k + 1 < len(toks) else None
             if body:
                 reason = judge(body, cwd, dict(env), depth + 1)
                 if reason:

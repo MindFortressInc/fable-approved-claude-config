@@ -65,6 +65,9 @@ check "relative -C from parent"             "git -C main.wt stash"            "$
 check "-C via shell variable"               "W=$WT; git -C \"\$W\" stash pop" "$PLAIN" DENY
 check "-C via exported variable"            "export W=$WT && git -C \${W} stash" "$PLAIN" DENY
 check "bash -c wrapper"                     "bash -c 'git stash pop'"         "$WT" DENY
+check "bash -lc combined flags"             "bash -lc 'git stash pop'"        "$WT" DENY
+check "sh -ec combined flags"               "sh -ec 'git stash'"              "$WT" DENY
+check "bash -o opt then -c"                 "bash -o pipefail -c 'git stash'" "$WT" DENY
 check "command substitution"                "x=\$(git stash create); echo \$x" "$WT" DENY
 check "backslash-newline continuation"      $'git \\\n  stash pop'            "$WT" DENY
 check "cd - is untracked, fails closed"     "cd $SOLO && cd - && git stash"  "$WT" DENY "could not resolve"
