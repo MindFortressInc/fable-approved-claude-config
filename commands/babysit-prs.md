@@ -93,7 +93,7 @@ A human ruling = a ruling made INSIDE an agent session, never a human typing int
 
 `<finding-key>` must match the `<file>:<rule-id>` convention (never a line number or head SHA — both move on a push, and the point is the ruling survives a force-push/rebase). `<by>` is who ruled, never the session. Never do step 1 without step 2 or vice versa.
 
-**Configure the trusted-author allowlist once**: set `RULING_AUTHORS_DEFAULT` in `babysit_classify.py` (or export `BABYSIT_RULING_AUTHORS`) to the GitHub login(s) your sessions comment as. Both marker formats are public, so on a public repo anyone could post a marker-shaped comment — the classifier only ever parses ruling comments AND CR-CLI harvest comments authored by these logins, and an unconfigured/empty list disables comment harvesting entirely (fail closed).
+**Configure the trusted-author allowlist once**: set `RULING_AUTHORS_DEFAULT` in `babysit_classify.py` (or export `BABYSIT_RULING_AUTHORS`) to the GitHub login(s) your sessions comment and publish statuses as. Both marker formats are public, so on a public repo anyone could post a marker-shaped comment — the classifier only ever parses ruling comments AND CR-CLI harvest comments authored by these logins, and counts a `review-gate/cr-cli` status only when one of them created it. The shipped default is empty: an unconfigured/empty list trusts nobody, so comment harvesting and status attestations are disabled entirely (fail closed).
 
 ## Step 1 — Run the classifier/planner and read its JSON
 

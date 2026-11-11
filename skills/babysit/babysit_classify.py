@@ -27,8 +27,11 @@ Test/determinism env overrides (unset in production):
                           ~/.claude/babysit-progress.json)
   BABYSIT_WAIVE_BY        default `by` label for the ruling-comment subcommand
   BABYSIT_RULING_AUTHORS  comma-separated GitHub logins whose PR comments may
-                          carry rulings (overrides RULING_AUTHORS_DEFAULT;
-                          empty keeps the team-config default)
+                          carry rulings or CR-CLI harvests, and whose
+                          `review-gate/cr-cli` statuses count (overrides
+                          RULING_AUTHORS_DEFAULT, which ships EMPTY; set-but-
+                          blank is the empty set, never the default; empty
+                          trusts nobody -- fail closed)
   BABYSIT_WAIVE_AUTHORIZED_BY  set (to the human's name) when a HUMAN
                           authorized the ruling — read by BOTH the store write
                           (hooks/babysit-progress.sh waive) and the
@@ -62,8 +65,10 @@ OWNER_DEFAULT = "your-org"          # GitHub org swept by `gh search prs --owner
 # true`, or a spoofed "no findings" harvest that greens an unreviewed PR. The
 # author gate is what keeps both channels' provenance to YOUR account(s): a
 # comment from any other login is never parsed, however well-formed. An EMPTY
-# list disables comment harvesting entirely (fail closed).
-RULING_AUTHORS_DEFAULT = "your-github-login"
+# list disables comment harvesting entirely (fail closed) -- and it ships
+# empty: a placeholder login here would be trusted by every install that
+# never configured it, and anyone can register an unclaimed login.
+RULING_AUTHORS_DEFAULT = ""
 
 # ---- caps / limits (all lifted verbatim from the skill doc) ----------------
 STALL_LIMIT = 12       # consecutive frozen non-credit sweeps before STALLED
@@ -470,8 +475,9 @@ def _ruling_authors():
 
     $BABYSIT_RULING_AUTHORS (comma-separated) wins over the
     RULING_AUTHORS_DEFAULT team config. UNSET falls through to the default --
-    "no override" means "use the login(s) this install trusts". But a variable
-    that IS SET, however it resolves (blank, comma-only, garbage) -- including
+    "no override" means "use the login(s) this install trusts", and the
+    shipped default is empty, so an unconfigured install trusts nobody. But a
+    variable that IS SET, however it resolves (blank, comma-only, garbage) -- including
     literally `BABYSIT_RULING_AUTHORS=""` -- must NEVER fall back to the
     default: an operator who sets it to disable comment rulings must get the
     empty set, not a silent trust of the default login. The earlier `or`
