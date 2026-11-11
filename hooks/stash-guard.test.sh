@@ -69,6 +69,14 @@ check "bash -lc combined flags"             "bash -lc 'git stash pop'"        "$
 check "sh -ec combined flags"               "sh -ec 'git stash'"              "$WT" DENY
 check "bash -o opt then -c"                 "bash -o pipefail -c 'git stash'" "$WT" DENY
 check "command substitution"                "x=\$(git stash create); echo \$x" "$WT" DENY
+check "absolute shell path -c"              "/bin/bash -c 'git stash pop'"    "$WT" DENY
+check "absolute env(1) path"                "/usr/bin/env git stash"          "$WT" DENY
+check "unquoted \$(...) as -C fails closed" "git -C \$(git rev-parse --show-toplevel) stash pop" "$PLAIN" DENY "could not resolve"
+check "unquoted \$(...) as cd fails closed" "cd \$(git rev-parse --show-toplevel) && git stash" "$PLAIN" DENY "could not resolve"
+check "untracked \$1 as -C fails closed"    "git -C \$1 stash"                "$PLAIN" DENY "could not resolve"
+check "stash inside unquoted \$(...) arg"   "echo \$(git stash pop) done"     "$WT" DENY
+check "\$(...) arg does not hide later cmd" "echo \$(date) && git stash"      "$WT" DENY
+check "\$(...) with a ) in quotes"          "echo \$(echo ')') && git stash list" "$WT" ALLOW
 check "backslash-newline continuation"      $'git \\\n  stash pop'            "$WT" DENY
 check "cd - is untracked, fails closed"     "cd $SOLO && cd - && git stash"  "$WT" DENY "could not resolve"
 check "unresolvable -C fails closed"       "git -C \"\$NOPE_UNSET_VAR\" stash" "$PLAIN" DENY "could not resolve"

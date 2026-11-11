@@ -18,8 +18,9 @@ A repo with no other worktrees, and a non-repo, are left alone.
 The target is resolved per segment: the hook's cwd, then any `cd` earlier in
 the chain, then the invocation's own `-C` / `--git-dir`. Quote-, comment- and
 heredoc-aware, so "git stash" inside an echo/grep/commit message is not a
-stash. `bash -c` / `sh -c` / `eval` bodies and `$(...)` are scanned too. A
-mutating stash whose target cannot be resolved (an unknown $VAR) is denied.
+stash. `bash -c` / `sh -c` / `eval` bodies and `$(...)` are scanned too, and
+`env` / shells / `eval` match by basename like git. A mutating stash whose
+target cannot be resolved (an unknown $VAR, a `$(...)`) is denied.
 Known gaps: `$(git stash ...)` nested inside a double-quoted string, and git
 run under `timeout` / `nice` / `xargs`, are not seen. A crash exits non-zero,
 which Claude Code treats as a non-blocking error (fail open), like the other
@@ -42,6 +43,7 @@ ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
 SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+SUBST = "$(...)"                          # opaque stand-in for an unquoted $(...)
 
 ALTERNATIVES = (
     "refs/stash is ONE stack shared by every worktree of this repo, so a pop "
@@ -59,7 +61,31 @@ ALTERNATIVES = (
 
 
 class Unresolved(Exception):
-    pass
+    """The repo a stash targets cannot be determined statically."""
+
+
+def close_paren(s, i):
+    """Index of the `)` closing the `$(` whose body starts at `i` (quote- and
+    nesting-aware), or len(s) when it is never closed."""
+    depth, q, n = 1, None, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and q != "'":
+            i += 2
+            continue
+        if q:
+            if c == q:
+                q = None
+        elif c in ("'", '"'):
+            q = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
 
 
 def segments(s):
@@ -102,6 +128,12 @@ def segments(s):
                 buf.append(m.group(0))
                 i = m.end()
                 continue
+        if c == "$" and s.startswith("$(", i):
+            j = close_paren(s, i + 2)     # body runs first; outer sees a token
+            segs += segments(s[i + 2:j])
+            buf.append(SUBST)
+            i = j + 1
+            continue
         if c in ";&|()`\n":
             segs.append("".join(buf))
             buf = []
@@ -135,10 +167,13 @@ def expand(word, env):
 
     if "`" in word or "$(" in word:
         raise Unresolved(f"{word!r} is a command substitution")
+    if "$" in VAR.sub("", word):
+        raise Unresolved(f"{word!r} has an expansion that is not tracked")
     return VAR.sub(sub, word)
 
 
 def resolve(path, cwd, env):
+    """Absolute, normalised form of a path word relative to `cwd`."""
     path = expand(path, env)
     if os.path.isabs(path):
         return os.path.normpath(path)
@@ -148,6 +183,7 @@ def resolve(path, cwd, env):
 
 
 def git(args, git_env):
+    """stdout of `git <args>`, or None on any failure."""
     try:
         r = subprocess.run(["git", *args], capture_output=True, text=True,
                            timeout=5, env=git_env)
@@ -185,7 +221,7 @@ def strip_prefix(toks, env):
         t = toks[0]
         if t in PREFIX_WORDS:
             toks = toks[1:]
-        elif t == "env":
+        elif os.path.basename(t) == "env":
             toks = toks[1:]
             while toks and toks[0].startswith("-"):
                 toks = toks[2:] if toks[0] in ("-u", "--unset", "-C", "--chdir") else toks[1:]
@@ -233,9 +269,10 @@ def judge(cmd, cwd, env, depth=0):
             except Unresolved:
                 cwd = None
             continue
-        if depth < 3 and (head in SHELLS or head == "eval"):
+        name = os.path.basename(head)
+        if depth < 3 and (name in SHELLS or name == "eval"):
             body = None
-            if head == "eval":
+            if name == "eval":
                 body = " ".join(toks[1:])
             else:                         # -c, or a cluster like -lc / -ec
                 k = next((k for k, t in enumerate(toks[1:], 1)
@@ -246,7 +283,7 @@ def judge(cmd, cwd, env, depth=0):
                 if reason:
                     return reason
             continue
-        if os.path.basename(head) != "git":
+        if name != "git":
             continue
         reason = judge_git(toks[1:], cwd, {**env, **scoped})
         if reason:
@@ -255,6 +292,7 @@ def judge(cmd, cwd, env, depth=0):
 
 
 def judge_git(args, cwd, env):
+    """Deny reason for one git invocation's argv (after `git`), or None."""
     target, git_dir, i = cwd, None, 0
     pending_unresolved = None
     while i < len(args) and args[i].startswith("-"):
@@ -301,6 +339,7 @@ def judge_git(args, cwd, env):
 
 
 def main():
+    """Read a PreToolUse payload on stdin; print a deny decision if needed."""
     try:
         payload = json.load(sys.stdin)
     except Exception:
