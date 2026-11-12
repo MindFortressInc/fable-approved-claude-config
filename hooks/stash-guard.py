@@ -17,11 +17,13 @@ A repo with no other worktrees, and a non-repo, are left alone.
 
 The target is resolved per segment: the hook's cwd (or inherited GIT_DIR),
 then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` subshell),
-then `env -C`, then the invocation's own `-C` / `--git-dir`. Quote-, comment-
-and heredoc-aware, so "git stash" inside an echo/grep/commit message is not a
-stash. `bash -c` / `sh -c` / `eval` bodies and `$(...)` (also inside double
-quotes) are scanned too, and `env` / shells / `eval` match by basename like
-git. A mutating stash whose target cannot be resolved (an unknown $VAR, a
+then `env -C` (each relative to the last), then the invocation's own `-C` /
+`--git-dir`; VAR=val prefixes and `env -u` / `-i` shape the GIT_* vars the
+probe sees. Quote-, comment- and heredoc-aware, so "git stash" inside an
+echo/grep/commit message is not a stash. `bash -c` / `sh -c` bodies (with
+their prefix assignments), `eval` bodies (in the caller's scope, so their
+cd/exports carry on) and `$(...)` (also inside double quotes) are scanned
+too, and `env` / shells / `eval` match by basename like git. A mutating stash whose target cannot be resolved (an unknown $VAR, a
 `$(...)`, a `cd` into a missing directory, a failed worktree probe, shell
 bodies nested past the scan depth) is denied.
 Known gaps: git run under `timeout` / `nice` / `xargs` is not seen. A crash exits non-zero,
@@ -48,6 +50,7 @@ VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 SUBST = "$(...)"                          # opaque stand-in for a $(...)
 OPEN, CLOSE = "\0(", "\0)"                 # subshell scope markers from segments()
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
+GIT_TARGET = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
 ALTERNATIVES = (
     "refs/stash is ONE stack shared by every worktree of this repo, so a pop "
@@ -69,9 +72,9 @@ class Unresolved(Exception):
 
 
 def close_paren(s, i):
-    """Index of the `)` closing the `$(` whose body starts at `i` (quote- and
-    nesting-aware), or len(s) when it is never closed."""
-    depth, q, n = 1, None, len(s)
+    """Index of the `)` closing the `$(` whose body starts at `i` (quote-,
+    comment- and nesting-aware), or len(s) when it is never closed."""
+    depth, q, n, start = 1, None, len(s), i
     while i < n:
         c = s[i]
         if c == "\\" and q != "'":
@@ -82,6 +85,12 @@ def close_paren(s, i):
                 q = None
         elif c in ("'", '"'):
             q = c
+        elif c == "#" and (i == start or s[i - 1] in " \t\n;&|()"):
+            nl = s.find("\n", i)         # a comment's `)` closes nothing
+            if nl < 0:
+                return n
+            i = nl
+            continue
         elif c == "(":
             depth += 1
         elif c == ")":
@@ -231,9 +240,20 @@ def shared_reason(target, git_dir, git_env):
 
 def strip_prefix(toks, env):
     """Drop shell keywords, wrappers and VAR=val assignments before the
-    command word. Returns (remaining tokens, scoped assignments, the last
-    `env -C` / `--chdir` directory word or None)."""
-    scoped, chdir = {}, None
+    command word. Returns (remaining tokens, scoped assignments, the
+    `env -C` / `--chdir` directory words in order). A scoped value of None
+    means `env -u` / `env -i` removed that variable."""
+    scoped, chdirs = {}, []
+
+    def env_opt(opt, val):
+        if opt == "u":
+            scoped[val] = None
+        elif opt == "C":
+            chdirs.append(val)
+        else:                             # -i: nothing inherited survives
+            scoped.clear()
+            scoped.update(dict.fromkeys((*env, *GIT_TARGET)))
+
     while toks:
         t = toks[0]
         if t in PREFIX_WORDS:
@@ -241,27 +261,62 @@ def strip_prefix(toks, env):
         elif os.path.basename(t) == "env":
             toks = toks[1:]
             while toks and toks[0].startswith("-"):
-                o = toks[0]
-                if o in ("-C", "--chdir"):
-                    chdir = toks[1] if len(toks) > 1 else None
-                elif o.startswith("--chdir="):
-                    chdir = o.split("=", 1)[1]
-                elif o.startswith("-C"):
-                    chdir = o[2:]
-                toks = toks[2:] if o in ("-u", "--unset", "-C", "--chdir") else toks[1:]
+                o, toks = toks[0], toks[1:]
+                if o == "--":
+                    break
+                if o in ("-", "--ignore-environment"):
+                    env_opt("i", None)
+                elif o.startswith("--"):
+                    name, eq, val = o.partition("=")
+                    if name in ("--unset", "--chdir"):
+                        if not eq:
+                            val, toks = (toks[0], toks[1:]) if toks else ("", toks)
+                        env_opt("u" if name == "--unset" else "C", val)
+                    continue
+                for k in range(1, len(o)):        # a short cluster like -iu X
+                    if o[k] == "i":
+                        env_opt("i", None)
+                    elif o[k] in "uC":
+                        val = o[k + 1:]
+                        if not val:
+                            val, toks = (toks[0], toks[1:]) if toks else ("", toks)
+                        env_opt(o[k], val)
+                        break
         elif ASSIGN.match(t):
             k, v = t.split("=", 1)
             scoped[k] = v
             toks = toks[1:]
         else:
             break
-    return toks, scoped, chdir
+    return toks, scoped, chdirs
+
+
+def with_scoped(env, scoped):
+    """`env` as the command sees it once its VAR=val prefixes and env(1)
+    unsets apply. Raises Unresolved when a GIT_* target var cannot expand."""
+    out = dict(env)
+    for k, v in scoped.items():
+        if v is None:
+            out.pop(k, None)
+            continue
+        try:
+            out[k] = expand(v, env)
+        except Unresolved:
+            if k in GIT_TARGET:
+                raise
+            out.pop(k, None)
+    return out
 
 
 def judge(cmd, cwd, env, depth=0):
     """Return a deny reason for the first mutating shared-stack stash in
-    `cmd`, or None. Tracks cd and plain assignments across segments; a
-    subshell's are undone when it closes."""
+    `cmd`, or None."""
+    return scan(cmd, cwd, env, depth)[0]
+
+
+def scan(cmd, cwd, env, depth):
+    """(deny reason or None, cwd, env) after `cmd`. Tracks cd and plain
+    assignments across segments; a subshell's are undone when it closes."""
     scopes = []
     for seg in segments(cmd):
         if seg == OPEN:
@@ -275,9 +330,11 @@ def judge(cmd, cwd, env, depth=0):
             toks = shlex.split(seg, posix=True)
         except ValueError:
             toks = seg.split()
-        toks, scoped, chdir = strip_prefix(toks, env)
+        toks, scoped, chdirs = strip_prefix(toks, env)
         if not toks:
             for k, v in scoped.items():   # bare `A=b` sets shell state
+                if v is None:
+                    continue
                 try:
                     env[k] = expand(v, env)
                 except Unresolved:
@@ -305,11 +362,11 @@ def judge(cmd, cwd, env, depth=0):
                 cwd = None                # the cd fails; where the shell stays is untracked
             continue
         run_cwd = cwd
-        if chdir is not None:
-            try:
-                run_cwd = resolve(chdir, cwd, env)
-            except Unresolved:
-                run_cwd = None
+        try:
+            for d in chdirs:              # each env -C is relative to the last
+                run_cwd = resolve(d, run_cwd, env)
+        except Unresolved:
+            run_cwd = None
         name = os.path.basename(head)
         if name in SHELLS or name == "eval":
             if depth >= MAX_DEPTH:
@@ -317,7 +374,7 @@ def judge(cmd, cwd, env, depth=0):
                     return ("[stash-guard] Blocked a shell body that may run "
                             "`git stash`: it is nested too deeply to inspect, "
                             "and an uninspected mutating stash is denied by "
-                            "default. " + ALTERNATIVES)
+                            "default. " + ALTERNATIVES), cwd, env
                 continue
             body = None
             if name == "eval":
@@ -326,17 +383,40 @@ def judge(cmd, cwd, env, depth=0):
                 k = next((k for k, t in enumerate(toks[1:], 1)
                           if SHELL_C.fullmatch(t)), None)
                 body = toks[k + 1] if k is not None and k + 1 < len(toks) else None
-            if body:
-                reason = judge(body, run_cwd, dict(env), depth + 1)
+            if not body:
+                continue
+            try:
+                body_env = with_scoped(env, scoped)
+            except Unresolved as e:
+                if "stash" not in body:
+                    continue
+                return ("[stash-guard] Blocked a shell body that may run "
+                        f"`git stash`: could not resolve which repo it targets "
+                        f"({e}), and an unresolvable mutating stash is denied "
+                        "by default. " + ALTERNATIVES), cwd, env
+            if name != "eval":            # a child shell: its state is its own
+                reason = judge(body, run_cwd, body_env, depth + 1)
                 if reason:
-                    return reason
+                    return reason, cwd, env
+                continue
+            reason, cwd, after = scan(body, cwd, body_env, depth + 1)
+            if reason:
+                return reason, cwd, env
+            for k in scoped:              # `A=b eval ...` sets A only for the eval
+                if k in env:
+                    after[k] = env[k]
+                else:
+                    after.pop(k, None)
+            env = after                   # eval runs here: its cd/exports stay
             continue
         if name != "git":
             continue
         reason = judge_git(toks[1:], run_cwd, env, scoped)
         if reason:
-            return reason
-    return None
+            return reason, cwd, env
+    if scopes:                            # an unclosed ( ends with the command
+        cwd, env = scopes[0]
+    return None, cwd, env
 
 
 def judge_git(args, cwd, env, scoped=None):
@@ -377,16 +457,15 @@ def judge_git(args, cwd, env, scoped=None):
                 f"it targets ({why}), and an unresolvable mutating stash is "
                 f"denied by default. " + ALTERNATIVES)
     git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
-        if k in (scoped or {}):
-            try:
-                git_env[k] = expand(scoped[k], env)
-            except Unresolved as e:
-                return (f"[stash-guard] Blocked {label}: could not resolve which "
-                        f"repo it targets ({e}), and an unresolvable mutating "
-                        f"stash is denied by default. " + ALTERNATIVES)
-        elif k in env:
-            git_env[k] = env[k]
+    try:
+        seen = with_scoped(env, scoped or {})
+    except Unresolved as e:
+        return (f"[stash-guard] Blocked {label}: could not resolve which "
+                f"repo it targets ({e}), and an unresolvable mutating "
+                f"stash is denied by default. " + ALTERNATIVES)
+    for k in GIT_TARGET:
+        if k in seen:
+            git_env[k] = seen[k]
     if git_dir is None and "GIT_DIR" in git_env:
         git_dir = git_env.pop("GIT_DIR")
     reason = shared_reason(target, git_dir, git_env)

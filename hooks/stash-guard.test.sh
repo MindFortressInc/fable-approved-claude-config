@@ -94,6 +94,25 @@ check "\$(...) inside double quotes"        "echo \"\$(git stash pop)\""     "$W
 check "escaped \\\$( in double quotes is text" "echo \"\\\$(git stash pop)\"" "$WT" ALLOW
 GIT_DIR="$MAIN/.git/worktrees/main.wt" GIT_WORK_TREE="$WT" \
 check "inherited GIT_DIR names a linked wt" "git stash pop"                   "$PLAIN" DENY "linked worktree"
+check "comment ) inside \$(...) does not close it" $'echo "$( # )\ngit stash pop\n)"' "$WT" DENY
+check "\$# inside \$(...) is not a comment"   "echo \$(echo \$#) && git stash list" "$WT" ALLOW
+check "nested env -C applies in order"       "env -C $MAIN env -C . git stash clear" "$SOLO" DENY "other worktree"
+check "nested env -C relative to the last"   "env -C $T env -C main.wt git stash"  "$SOLO" DENY "linked worktree"
+GIT_DIR="$SOLO/.git" \
+check "env -u drops an inherited GIT_DIR"    "env -u GIT_DIR git stash clear"      "$WT" DENY "linked worktree"
+GIT_DIR="$SOLO/.git" \
+check "env --unset=GIT_DIR"                  "env --unset=GIT_DIR git stash"       "$WT" DENY "linked worktree"
+GIT_DIR="$SOLO/.git" \
+check "env -i drops an inherited GIT_DIR"    "env -i git stash clear"              "$WT" DENY "linked worktree"
+GIT_DIR="$SOLO/.git" \
+check "env -u GIT_DIR then reassigned"       "env -u GIT_DIR GIT_DIR=$SOLO/.git git stash" "$WT" ALLOW
+check "scoped GIT_DIR reaches bash -c"       "GIT_DIR=$MAIN/.git bash -c 'git stash clear'" "$SOLO" DENY "other worktree"
+check "unresolvable scoped GIT_DIR, bash -c" "GIT_DIR=\$NOPE_UNSET_VAR bash -c 'git stash'" "$SOLO" DENY "could not resolve"
+check "eval cd carries to the next segment"  "eval 'cd $MAIN'; git stash clear"   "$SOLO" DENY "other worktree"
+check "eval export carries on"               "eval 'export W=$WT'; git -C \"\$W\" stash" "$PLAIN" DENY "linked worktree"
+check "eval in a subshell does not leak"     "(eval 'cd $WT'); git stash pop"     "$SOLO" ALLOW
+check "A=b eval scopes A to the eval only"   "GIT_DIR=$SOLO/.git eval true; git stash pop" "$WT" DENY "linked worktree"
+check "bash -c cd does not leak out"         "bash -c 'cd $SOLO'; git stash pop"  "$WT" DENY "linked worktree"
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \
