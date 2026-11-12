@@ -19,6 +19,7 @@ g -C "$MAIN" worktree add "$WT" -b wt-branch
 j() { python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcript_path":"/x.jsonl","cwd":sys.argv[3],"hook_event_name":"PreToolUse","tool_name":sys.argv[1],"tool_input":{"command":sys.argv[2],"description":"d"}}))' "$@"; }
 
 # $1 name, $2 command, $3 cwd, $4 expect ALLOW|DENY, $5 optional substring the deny reason must contain
+# A VAR=val prefix on a check call reaches the hook process's environment
 check() {
   out=$(j Bash "$2" "$3" | python3 "$HOOK" 2>/dev/null); rc=$?
   if [ $rc -ne 0 ]; then fail=$((fail+1)); echo "FAIL: $1 (exit $rc)"; return; fi
@@ -80,6 +81,23 @@ check "\$(...) with a ) in quotes"          "echo \$(echo ')') && git stash list
 check "backslash-newline continuation"      $'git \\\n  stash pop'            "$WT" DENY
 check "cd - is untracked, fails closed"     "cd $SOLO && cd - && git stash"  "$WT" DENY "could not resolve"
 check "unresolvable -C fails closed"       "git -C \"\$NOPE_UNSET_VAR\" stash" "$PLAIN" DENY "could not resolve"
+
+check "nesting past the recursion bound"     "eval eval eval eval git stash pop" "$WT" DENY "nested too deeply"
+check "scoped VAR= does not retarget -C \$VAR" "W=$WT; W=$SOLO git -C \"\$W\" stash pop" "$PLAIN" DENY "linked worktree"
+check "subshell cd does not leak out"       "(cd $SOLO); git stash pop"       "$WT" DENY "linked worktree"
+check "\$(...) cd does not leak out"        "echo \$(cd $SOLO) && git stash pop" "$WT" DENY "linked worktree"
+check "subshell cd into wt stays inside"    "(cd $WT); git stash pop"         "$SOLO" ALLOW
+check "env -C retargets git"                "env -C $WT git stash pop"        "$SOLO" DENY "linked worktree"
+check "env --chdir= retargets git"          "env --chdir=$WT git stash"       "$SOLO" DENY "linked worktree"
+check "failed cd leaves cwd unknown"        "cd $T/nope || true; git stash pop" "$WT" DENY "could not resolve"
+check "\$(...) inside double quotes"        "echo \"\$(git stash pop)\""     "$WT" DENY
+check "escaped \\\$( in double quotes is text" "echo \"\\\$(git stash pop)\"" "$WT" ALLOW
+GIT_DIR="$MAIN/.git/worktrees/main.wt" GIT_WORK_TREE="$WT" \
+check "inherited GIT_DIR names a linked wt" "git stash pop"                   "$PLAIN" DENY "linked worktree"
+mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
+printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
+PATH="$T/bin:$PATH" \
+check "failed worktree probe fails closed"  "git stash"                       "$MAIN" DENY "could not list"
 
 # --- the main checkout is guarded too while other worktrees exist
 check "main tree with a linked wt attached" "git stash"                       "$MAIN" DENY "other worktree"

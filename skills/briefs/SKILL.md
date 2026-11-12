@@ -86,6 +86,17 @@ CONSTRAINTS:
 - Path allowlist: api/notify.py and tests/test_notify.py only.
 - Gotcha (verbatim): pytest here needs `ENV=test` or it hits prod Postgres —
   `ENV=test uv run pytest tests/test_notify.py`.
+- NEVER `git stash` (push/pop/apply/drop/save/clear, or bare). `refs/stash`
+  is ONE stack shared by every worktree of the repo: a pop takes whatever is
+  on top, routinely a parallel sibling's WIP, and a stash on a clean tree
+  saves nothing, so the pop after it is ALWAYS someone else's entry
+  (we measured 13+ cross-agent collisions). To set work aside or test the base,
+  use a scratch commit on your own branch (`git add -A && git commit -m wip`,
+  later `git reset --soft HEAD~1`), `git worktree add --detach
+  <scratchpad>/<unit>/base <base-sha>`, `git show <sha>:<path>`, or copy files to
+  your scratchpad. `git stash list`/`show` are fine. hooks/stash-guard.py
+  denies the rest in Claude Code; Codex runs no hooks, so there this line is
+  the only guard.
 
 RETURN CONTRACT: reply with exactly this JSON, no prose around it:
 {
