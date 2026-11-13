@@ -17,20 +17,26 @@ A repo with no other worktrees, and a non-repo, are left alone.
 
 The target is resolved per segment: the hook's cwd (or inherited GIT_DIR),
 then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` / backquote
-subshell; unknown once an and-or list it may not have run in ends), then
-`env -C` / `sudo -D` (each relative to the last), then the invocation's own
-`-C` / `--git-dir`; VAR=val prefixes and `env -u` / `-i` shape the GIT_* vars
-the probe sees. Quote-, comment- and heredoc-aware, so "git stash" inside an
-echo/grep/commit message or a data heredoc is not a stash. `bash -c` / `sh -c`
-bodies (with their prefix assignments), a heredoc fed to a shell, `eval`
-bodies (in the caller's scope, so their cd/exports carry on; tracked $VARs
-expanded first) and `$(...)` / backquotes (also inside double quotes) are
-scanned too; `env` / shells / `eval` / wrappers (`time -p`, `command -p`,
-`sudo -u X`, `exec -a X`) match by basename like git, their options consumed.
+subshell, pipeline element or backgrounded list; unknown once an and-or list
+it may not have run in ends), then `env -C` / `sudo -D` (each relative to the
+last), then the invocation's own `-C` / `--git-dir`; VAR=val prefixes and
+`env -u` / `-i` shape the GIT_* vars the probe sees, and an export that may
+not have run leaves its var uncertain. Quote-, comment- and heredoc-aware, so
+"git stash" inside an echo/grep/commit message or a data heredoc is not a
+stash (but a `$(...)` in an unquoted heredoc is). `bash -c` / `sh -c` bodies
+(with their prefix assignments and `env -C`), a heredoc fed to a shell (in
+that command's context), `eval` bodies (in the caller's scope, so their
+cd/exports carry on) and `$(...)` / backquotes (also inside double quotes) are
+scanned too; a body is judged both with the caller's $VARs expanded first and
+with the body expanding them itself, since quote removal hides which happens.
+`env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
+`exec -a X`) match by basename like git, their options consumed.
 A mutating stash whose target cannot be resolved (an unknown $VAR, a `$(...)`,
 a `cd` into a missing directory, a failed or timed-out repo or worktree probe,
 shell bodies nested past the scan depth) is denied.
-Known gaps: git run under `timeout` / `nice` / `xargs` is not seen. A crash exits non-zero,
+Known gaps: git run under `timeout` / `nice` / `xargs`, and a heredoc piped
+into a shell (`cat <<EOF | bash`), are not seen; a cd inside a `{ ...; }`
+group used as a pipeline element is not undone. A crash exits non-zero,
 which Claude Code treats as a non-blocking error (fail open), like the other
 Bash hooks here.
 """
@@ -61,7 +67,9 @@ SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 SUBST = "$(...)"                          # opaque stand-in for a $(...)
 OPEN, CLOSE = "\0(", "\0)"                 # subshell scope markers from segments()
-AND, OR, SEP = "\0&", "\0|", "\0;"         # && / || / (; & newline) from segments()
+AND, OR, SEP = "\0&", "\0|", "\0;"         # && / || / (; newline) from segments()
+PIPE, BG = "\0p", "\0b"                    # | or |& / a lone & from segments()
+UNCERTAIN = "\0?"                         # env value: a step that may not have run set it
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 GIT_TARGET = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
@@ -138,16 +146,25 @@ def substitution(s, i):
     return s[i + 2:j], j + 1
 
 
-def heredoc_runs(prefix):
-    """True when the command before a `<<` is a shell reading its script
-    from standard input (no -c), so the heredoc body is executed."""
-    try:
-        toks = shlex.split(prefix, posix=True)
-    except ValueError:
-        toks = prefix.split()
-    toks = strip_prefix(toks, {})[0]
-    return bool(toks) and os.path.basename(toks[0]) in SHELLS and not any(
-        SHELL_C.fullmatch(t) for t in toks[1:])
+def expansions(text):
+    """Bodies of the `$(...)` / backquote substitutions in `text`. The shell
+    runs these in an unquoted heredoc even when its data is not a script."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "`" or text.startswith("$(", i):
+            body, i = substitution(text, i)
+            out.append(body)
+            continue
+        i += 1
+    return out
+
+
+class Seg(str):
+    """A command segment; `docs` lists its heredocs as (body, quoted)."""
+    docs = ()
 
 
 def heredoc_word(word):
@@ -162,9 +179,11 @@ def segments(s):
     """Top-level command segments: quote-aware, comments dropped, split on
     unquoted ; & | ( ) and newlines. `( )`, `$(...)` and backquote bodies are
     bracketed by OPEN / CLOSE so judge() can scope their cd; `&&` / `||` emit
-    AND / OR and `;` / `&` / newline emit SEP, so scan() can tell when a cd
-    might not have run. Heredoc bodies are dropped unless a shell executes them."""
-    segs, buf, pending = [], [], []
+    AND / OR, `|` / `|&` PIPE, a lone `&` BG and `;` / newline SEP, so scan()
+    can tell when a cd might not have run or ran in a subshell. Each segment
+    is a Seg whose `docs` collects its heredoc bodies, so scan() judges them
+    in the context of the command that owns them."""
+    segs, buf, pending, docs = [], [], [], []
     i, n, q = 0, len(s), None
     while i < n:
         c = s[i]
@@ -203,7 +222,7 @@ def segments(s):
             m = HEREDOC.match(s, i)
             if m:
                 pending.append((m.group(1) == "-", heredoc_word(m.group(2)),
-                                heredoc_runs("".join(buf))))
+                                any(ch in m.group(2) for ch in "'\"\\"), docs))
                 buf.append(m.group(0))
                 i = m.end()
                 continue
@@ -218,20 +237,24 @@ def segments(s):
             i += 1
             continue
         if c in ";&|()\n":
-            segs.append("".join(buf))
-            buf = []
+            seg = Seg("".join(buf))
+            seg.docs = docs
+            segs.append(seg)
+            buf, docs = [], []
             if c in "()":
                 segs.append(OPEN if c == "(" else CLOSE)
             elif c in "&|" and s.startswith(c * 2, i):
                 segs.append(AND if c == "&" else OR)
                 i += 1
-            elif c == "|" and s.startswith("|&", i):
-                i += 1                    # |& is a pipe too
-            elif c != "|":
-                segs.append(SEP)
+            elif c == "|":
+                segs.append(PIPE)
+                if s.startswith("|&", i):
+                    i += 1                # |& is a pipe too
+            else:
+                segs.append(BG if c == "&" else SEP)
             i += 1
             if c == "\n" and pending:     # heredoc bodies follow this line
-                for strip_tabs, delim, runs in pending:
+                for strip_tabs, delim, quoted, owner in pending:
                     body = []
                     while i < n:
                         end = s.find("\n", i)
@@ -240,25 +263,31 @@ def segments(s):
                         if (line.lstrip("\t") if strip_tabs else line) == delim:
                             break
                         body.append(line)
-                    if runs:              # `bash <<EOF`: the body is the script
-                        segs += [OPEN, *segments("\n".join(body)), CLOSE]
+                    owner.append(("\n".join(body), quoted))
                 pending = []
             continue
         buf.append(c)
         i += 1
-    segs.append("".join(buf))
+    seg = Seg("".join(buf))
+    seg.docs = docs
+    segs.append(seg)
     return segs
 
 
 def expand(word, env):
     """Expand ~ and $VAR in a path word; raise Unresolved for unknown vars."""
     if word == "~" or word.startswith("~/"):
-        word = env.get("HOME", os.path.expanduser("~")) + word[1:]
+        home = env.get("HOME", os.path.expanduser("~"))
+        if home == UNCERTAIN:
+            raise Unresolved("$HOME may or may not have been changed")
+        word = home + word[1:]
 
     def sub(m):
         name = m.group(1) or m.group(2)
         if name not in env:
             raise Unresolved(f"${name} is not set in this command")
+        if env[name] == UNCERTAIN:
+            raise Unresolved(f"${name} is set by a step that may not have run")
         return env[name]
 
     if "`" in word or "$(" in word:
@@ -404,14 +433,36 @@ def with_scoped(env, scoped):
         except Unresolved:
             if k in GIT_TARGET:
                 raise
-            out.pop(k, None)
+            out[k] = UNCERTAIN
     return out
 
 
 def substitute(body, env):
     """`body` with its tracked $VAR / ${VAR} expansions applied, the way the
-    shell expands an eval / -c body before running it."""
-    return VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), body)
+    caller's shell expands a double-quoted eval / -c body before running it."""
+    def sub(m):
+        v = env.get(m.group(1) or m.group(2), UNCERTAIN)
+        return m.group(0) if v == UNCERTAIN else v
+    return VAR.sub(sub, body)
+
+
+def variants(body, env):
+    """The scripts `body` may be once the shell runs it. Quote removal hides
+    whether the caller expanded its $VARs first (double quotes) or the body
+    expands them itself, after its own assignments (single quotes), so both
+    readings are judged."""
+    pre = substitute(body, env)
+    return [pre] if pre == body else [pre, body]
+
+
+def merge(cwd, env, cwd2, env2):
+    """State after a step that may or may not have taken effect: a cwd the
+    two disagree on is unknown (None), an env var they disagree on UNCERTAIN."""
+    out = dict(env)
+    for k in set(env) | set(env2):
+        if env.get(k) != env2.get(k):
+            out[k] = UNCERTAIN
+    return (cwd if cwd == cwd2 else None), out
 
 
 def may_stash(text):
@@ -428,27 +479,47 @@ def judge(cmd, cwd, env, depth=0):
 def scan(cmd, cwd, env, depth):
     """(deny reason or None, cwd, env) after `cmd`. Tracks cd and plain
     assignments across segments; a subshell's are undone when it closes.
-    A cd in an and-or list may not have run, so once the list ends (or an
-    `||` follows it) a cwd it changed is unknown."""
+    A step in an and-or list may not have run, so once the list ends (or an
+    `||` follows it) a cwd it changed is unknown and an env var it changed
+    UNCERTAIN. Pipeline elements before the last and a backgrounded list run
+    in subshells; the last element does in bash but not zsh, so its changes
+    are uncertain too."""
     scopes = []
-    list_cwd, cond = cwd, False           # cwd where this and-or list began
+    lst = (cwd, dict(env))                # state where this and-or list began
+    elem = lst                            # ... and this pipeline element
+    cond = piped = False
     for seg in segments(cmd) + [SEP]:
         if seg == OPEN:
-            scopes.append((cwd, dict(env), list_cwd, cond))
-            list_cwd, cond = cwd, False
+            scopes.append((cwd, dict(env), lst, elem, cond, piped))
+            lst = elem = (cwd, dict(env))
+            cond = piped = False
             continue
         if seg == CLOSE:
             if scopes:
-                cwd, env, list_cwd, cond = scopes.pop()
+                cwd, env, lst, elem, cond, piped = scopes.pop()
             continue
-        if seg in (AND, OR, SEP):
-            if cwd != list_cwd and (seg == OR or (seg == SEP and cond)):
-                cwd = None
-            if seg == SEP:
-                list_cwd, cond = cwd, False
+        if seg == PIPE:                   # the left side ran in a subshell
+            cwd, env, piped = elem[0], dict(elem[1]), True
+            continue
+        if seg in (AND, OR, SEP, BG):
+            if piped:
+                cwd, env = merge(cwd, env, *elem)
+                piped = False
+            if seg == BG:                 # the whole list ran in the background
+                cwd, env = lst[0], dict(lst[1])
+            elif seg == OR or (seg == SEP and cond):
+                cwd, env = merge(cwd, env, *lst)
+            if seg in (SEP, BG):
+                lst, cond = (cwd, dict(env)), False
             else:
                 cond = True
+            elem = (cwd, dict(env))
             continue
+        for doc, quoted in seg.docs:      # an unquoted heredoc runs its $(...)
+            for body in [] if quoted else expansions(doc):
+                reason = judge(body, cwd, dict(env), depth)
+                if reason:
+                    return reason, cwd, env
         try:
             toks = shlex.split(seg, posix=True)
         except ValueError:
@@ -461,7 +532,7 @@ def scan(cmd, cwd, env, depth):
                 try:
                     env[k] = expand(v, env)
                 except Unresolved:
-                    env.pop(k, None)
+                    env[k] = UNCERTAIN
             continue
         head = toks[0]
         if head == "export":
@@ -471,7 +542,7 @@ def scan(cmd, cwd, env, depth):
                     try:
                         env[k] = expand(v, env)
                     except Unresolved:
-                        env.pop(k, None)
+                        env[k] = UNCERTAIN
             continue
         if head in ("cd", "pushd", "popd"):
             args = [a for a in toks[1:] if a == "-" or not a.startswith("-")]
@@ -492,40 +563,52 @@ def scan(cmd, cwd, env, depth):
             run_cwd = None
         name = os.path.basename(head)
         if name in SHELLS or name == "eval":
+            if name == "eval":
+                raw = " ".join(toks[1:])
+            else:                         # -c, or a cluster like -lc / -ec
+                k = next((k for k, t in enumerate(toks[1:], 1)
+                          if SHELL_C.fullmatch(t)), None)
+                raw = toks[k + 1] if k is not None and k + 1 < len(toks) else None
+            if raw:
+                scripts = variants(raw, env)  # `eval "$CMD"` runs what $CMD holds
+            elif name == "eval":
+                continue
+            else:                         # `bash <<EOF`: the heredoc is the script
+                scripts = [s for doc, quoted in seg.docs
+                           for s in ([doc] if quoted else variants(doc, env))]
+            if not scripts:
+                continue
             if depth >= MAX_DEPTH:
-                if may_stash(substitute(" ".join(toks[1:]), env)):
+                if any(may_stash(s) for s in scripts):
                     return ("[stash-guard] Blocked a shell body that may run "
                             "`git stash`: it is nested too deeply to inspect, "
                             "and an uninspected mutating stash is denied by "
                             "default. " + ALTERNATIVES), cwd, env
                 continue
-            body = None
-            if name == "eval":
-                body = " ".join(toks[1:])
-            else:                         # -c, or a cluster like -lc / -ec
-                k = next((k for k, t in enumerate(toks[1:], 1)
-                          if SHELL_C.fullmatch(t)), None)
-                body = toks[k + 1] if k is not None and k + 1 < len(toks) else None
-            if not body:
-                continue
-            body = substitute(body, env)  # `eval "$CMD"` runs what $CMD holds
             try:
                 body_env = with_scoped(env, scoped)
             except Unresolved as e:
-                if not may_stash(body):
+                if not any(may_stash(s) for s in scripts):
                     continue
                 return ("[stash-guard] Blocked a shell body that may run "
                         f"`git stash`: could not resolve which repo it targets "
                         f"({e}), and an unresolvable mutating stash is denied "
                         "by default. " + ALTERNATIVES), cwd, env
             if name != "eval":            # a child shell: its state is its own
-                reason = judge(body, run_cwd, body_env, depth + 1)
+                for s in scripts:
+                    reason = judge(s, run_cwd, dict(body_env), depth + 1)
+                    if reason:
+                        return reason, cwd, env
+                continue
+            outs = []
+            for s in scripts:
+                reason, c, e = scan(s, cwd, dict(body_env), depth + 1)
                 if reason:
                     return reason, cwd, env
-                continue
-            reason, cwd, after = scan(body, cwd, body_env, depth + 1)
-            if reason:
-                return reason, cwd, env
+                outs.append((c, e))
+            cwd, after = outs[0]
+            for c, e in outs[1:]:         # readings that disagree leave it uncertain
+                cwd, after = merge(cwd, after, c, e)
             for k in scoped:              # `A=b eval ...` sets A only for the eval
                 if k in env:
                     after[k] = env[k]
@@ -588,6 +671,11 @@ def judge_git(args, cwd, env, scoped=None):
                 f"repo it targets ({e}), and an unresolvable mutating "
                 f"stash is denied by default. " + ALTERNATIVES)
     for k in GIT_TARGET:
+        if seen.get(k) == UNCERTAIN:
+            return (f"[stash-guard] Blocked {label}: could not resolve which "
+                    f"repo it targets (${k} is set by a step that may not "
+                    f"have run), and an unresolvable mutating stash is denied "
+                    f"by default. " + ALTERNATIVES)
         if k in seen:
             git_env[k] = seen[k]
     if git_dir is None and "GIT_DIR" in git_env:

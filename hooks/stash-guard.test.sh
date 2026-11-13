@@ -135,6 +135,18 @@ check "bash -c of a tracked variable"        "S='git stash pop'; bash -c \"\$S\"
 check "quote-joined stash word"              "git sta\"\"sh pop"               "$WT" DENY "linked worktree"
 check "partly quoted stash word"             "git sta\"sh\" pop"               "$WT" DENY "linked worktree"
 check "quote-joined stash in bash -c body"   "bash -c 'git sta\"\"sh pop'"     "$WT" DENY "linked worktree"
+check "piped cd runs in a subshell"          "cd $SOLO | cat; git stash clear" "$MAIN" DENY "other worktree"
+check "backgrounded cd runs in a subshell"   "cd $SOLO & git stash clear"      "$MAIN" DENY "other worktree"
+check "last pipeline cd is uncertain"        "true | cd $SOLO; git stash clear" "$MAIN" DENY "could not resolve"
+check "cd before a pipeline keeps its target" "cd $SOLO && true | git stash pop" "$WT" ALLOW
+check "\$(...) in an unquoted data heredoc"  $'cat <<EOF\n$(git stash clear)\nEOF' "$WT" DENY "linked worktree"
+check "\$(...) in a quoted data heredoc"     $'cat <<\'EOF\'\n$(git stash clear)\nEOF' "$WT" ALLOW
+check "shell heredoc uses its env -C"        $'env -C '"$MAIN"$' bash <<\'EOF\'\ngit stash clear\nEOF' "$SOLO" DENY "other worktree"
+check "shell heredoc runs before a later cd" $'bash <<\'EOF\'; cd '"$SOLO"$'\ngit stash pop\nEOF' "$WT" DENY "linked worktree"
+check "conditional export may not have run"  "false && export GIT_DIR=$SOLO/.git; git stash clear" "$MAIN" DENY "may not have run"
+check "export in the same && list applies"   "true && export GIT_DIR=$SOLO/.git && git stash clear" "$MAIN" ALLOW
+check "bash -c body assignment governs its cd" "DEST=$SOLO; bash -c 'DEST=$MAIN; cd \"\$DEST\"; git stash clear'" "$SOLO" DENY "other worktree"
+check "eval body assignment governs its cd"  "DEST=$SOLO; eval 'DEST=$MAIN; cd \"\$DEST\"'; git stash clear" "$SOLO" DENY "could not resolve"
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \
