@@ -17,8 +17,9 @@ A repo with no other worktrees, and a non-repo, are left alone.
 
 The target is resolved per segment: the hook's cwd (or inherited GIT_DIR),
 then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` / backquote
-subshell, pipeline element or backgrounded list; unknown once an and-or list
-or `if` / loop / `case` branch it may not have run in ends; `$PWD` / `$OLDPWD`
+subshell, pipeline element or backgrounded list; unknown once an and-or list,
+`if` / loop / `case` branch or function body it may not have run in ends;
+`pushd -n` leaves it; `$PWD` / `$OLDPWD`
 follow it), then `env -C` / `sudo -D` (each relative to the last), then the
 invocation's own `-C` (all followed through symlinks the way chdir does) and
 `--git-dir` / `--work-tree` (left for git to resolve after every `-C`);
@@ -30,10 +31,12 @@ message or a data heredoc is not a stash (but a `$(...)` in an unquoted
 heredoc is), and `2>/dev/null git stash` is. `bash -c` / `sh -c` bodies
 (with their prefix assignments and `env -C`), a heredoc or here string fed to
 a shell (in that command's context), `eval` bodies (in the caller's scope, so
-their cd/exports carry on), `$(...)` / backquotes (also inside double quotes)
-and git aliases (`-c alias.x=...` or configured; `!` ones as shell bodies)
-are scanned too; a body is judged both with the caller's $VARs expanded first
-and with the body expanding them itself, since quote removal hides which
+their cd/exports carry on), `$(...)` / backquotes (also inside double quotes),
+`env -S` / `--split-string` commands and git aliases (`-c alias.x=...`,
+`--config-env alias.x=VAR` or configured; `!` ones as shell bodies run from
+the worktree's top level) are scanned too; a body is judged both with the
+caller's $VARs expanded first and with the body expanding them itself, since
+quote removal hides which
 happens. `$VAR` command and subcommand words are expanded before matching.
 `env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
 `exec -a X`, `timeout`, `nice`, `stdbuf`, `ionice`, `setsid`, `xargs`) match
@@ -98,6 +101,7 @@ FD_WORD = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 HEREDOC = re.compile(r"<<(-?)[ \t]*((?:'[^']*'|\"[^\"]*\"|\\.|[^\s;&|<>()'\"\\])+)")
 NOT_A_REPO = re.compile(r"not a git repository|cannot change to|must be run in a work tree")
 SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+FUNC_DEF = re.compile(r"\s*(?:function\s+)?[^\s'\"\\$`=;&|<>(){}]+\s*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 SUBST = "$(...)"                          # opaque stand-in for a $(...)
 OPEN, CLOSE = "\0(", "\0)"                 # subshell scope markers from segments()
@@ -449,6 +453,14 @@ def shared_reason(target, git_dir, work_tree, git_env):
     return None
 
 
+def split_string(val):
+    """The words `env -S` / `--split-string` splits its operand into."""
+    try:
+        return shlex.split(val)
+    except ValueError:
+        return val.split()
+
+
 def strip_prefix(toks, env):
     """Drop shell keywords, wrappers and VAR=val assignments before the
     command word. Returns (remaining tokens, scoped assignments, the
@@ -503,19 +515,25 @@ def strip_prefix(toks, env):
                     env_opt("i", None)
                 elif o.startswith("--"):
                     name, eq, val = o.partition("=")
-                    if name in ("--unset", "--chdir"):
+                    if name in ("--unset", "--chdir", "--split-string"):
                         if not eq:
                             val, toks = (toks[0], toks[1:]) if toks else ("", toks)
-                        env_opt("u" if name == "--unset" else "C", val)
+                        if name == "--split-string":
+                            toks = split_string(val) + toks
+                        else:
+                            env_opt("u" if name == "--unset" else "C", val)
                     continue
                 for k in range(1, len(o)):        # a short cluster like -iu X
                     if o[k] == "i":
                         env_opt("i", None)
-                    elif o[k] in "uC":
+                    elif o[k] in "uCS":
                         val = o[k + 1:]
                         if not val:
                             val, toks = (toks[0], toks[1:]) if toks else ("", toks)
-                        env_opt(o[k], val)
+                        if o[k] == "S":           # -S 'git stash': its words lead the argv
+                            toks = split_string(val) + toks
+                        else:
+                            env_opt(o[k], val)
                         break
         elif ASSIGN.match(t):
             k, v = t.split("=", 1)
@@ -611,7 +629,23 @@ def scan(cmd, cwd, env, depth):
     lst = (cwd, dict(env))                # state where this and-or list began
     elem = lst                            # ... and this pipeline element
     cond = piped = False
-    for seg in segments(cmd) + [SEP]:
+    func, fdepth, skip = None, 0, 0       # state at a `f() {` definition, its { } depth
+    segs = segments(cmd) + [SEP]
+    for idx, seg in enumerate(segs):
+        if skip:
+            skip -= 1
+            continue
+        nxt = segs[idx + 1:idx + 4]
+        if type(seg) is Seg and FUNC_DEF.fullmatch(seg) and len(nxt) == 3 and \
+                nxt[0] == OPEN and type(nxt[1]) is Seg and not nxt[1].strip() \
+                and nxt[2] == CLOSE:      # `f()` / `function f ()`: a definition
+            skip = 3                      # (an empty `( )` is not a valid subshell)
+            body = next((s for s in segs[idx + 4:]
+                         if s != SEP and (type(s) is not Seg or s.strip())), None)
+            if func is None and type(body) is Seg and body.split()[:1] == ["{"]:
+                func = (cwd, dict(env), lst, elem, cond, piped, blocks)
+                blocks = []
+            continue
         if seg == OPEN:
             scopes.append((cwd, dict(env), lst, elem, cond, piped, blocks))
             lst = elem = (cwd, dict(env))
@@ -648,8 +682,18 @@ def scan(cmd, cwd, env, depth):
             toks, herestrs = words(seg)
         except ValueError:
             toks, herestrs = seg.split(), []
+        if func is None and toks[:1] == ["function"] and toks[2:3] == ["{"]:
+            func = (cwd, dict(env), lst, elem, cond, piped, blocks)
+            blocks, toks = [], toks[2:]   # `function f {`: the body follows
         while toks and toks[0] in BLOCK_WORDS:
             w, toks = toks[0], toks[1:]
+            if func is not None and w in ("{", "}"):
+                fdepth += 1 if w == "{" else -1
+                if fdepth == 0:           # the body ends: it runs only if f is called
+                    saved_cwd, saved_env, lst, elem, cond, piped, blocks = func
+                    cwd, env = merge(cwd, env, saved_cwd, saved_env)
+                    func = None
+                continue
             if w in OPENERS:              # a branch or loop body may be skipped
                 blocks.append((cwd, dict(env)))
             elif w in ("else", "elif") and blocks:
@@ -700,12 +744,16 @@ def scan(cmd, cwd, env, depth):
                     env.pop(LOCAL + k, None)
             continue
         if head in ("cd", "pushd", "popd"):
+            if head == "pushd" and any(re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", a)
+                                       for a in toks[1:]):
+                continue                  # pushd -n: only the dir stack changes
             args = [a for a in toks[1:] if a == "-" or not a.startswith("-")]
             physical = any(a.startswith("-") and "P" in a for a in toks[1:]
                            if a not in args)
             old = cwd
             try:
-                if head == "popd" or args[:1] == ["-"]:
+                if head == "popd" or args[:1] == ["-"] or \
+                        (head == "pushd" and not args):  # swap / rotate (-N)
                     raise Unresolved("cd -/popd target is not tracked")
                 cwd = (resolve(args[0], cwd, env, physical) if args
                        else env.get("HOME"))
@@ -839,6 +887,8 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
                     configs.append(expand(value, env))
                 except Unresolved as e:
                     config_unresolved = str(e)
+            elif name == "--config-env" and value:
+                configs.append(tuple(value.partition("=")[::2]))  # read once `seen` is known
         except Unresolved as e:
             pending_unresolved = str(e)
     if i >= len(args):
@@ -858,6 +908,19 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
     if not isinstance(seen, Unresolved):
         git_env.update({k: v for k, v in seen.items()
                         if k.startswith("GIT_CONFIG") and v != UNCERTAIN})
+    resolved = []                         # --config-env=key=VAR takes VAR's exported value
+    for c in configs:
+        if isinstance(c, str):
+            resolved.append(c)
+            continue
+        key, var = c
+        val = UNCERTAIN if isinstance(seen, Unresolved) else seen.get(var)
+        if val == UNCERTAIN:
+            config_unresolved = config_unresolved or \
+                f"--config-env reads ${var}, which cannot be resolved"
+        elif val is not None:             # an unset VAR makes git fail outright
+            resolved.append(f"{key}={val}")
+    configs = resolved
     if rest[0] != "stash":
         return judge_alias(rest, target, git_dir, work_tree, configs,
                            config_unresolved, seen, git_env, depth)
@@ -936,7 +999,15 @@ def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
         if quoted:
             prior = child.get("GIT_CONFIG_PARAMETERS")
             child["GIT_CONFIG_PARAMETERS"] = f"{prior} {quoted}" if prior else quoted
-        return judge(f"{value[1:]} {extra}", target, child, depth + 1)
+        run_dir = target                  # git runs it from the worktree's top level
+        if target:
+            top = git(base + ["rev-parse", "--show-toplevel"], env)
+            if top is None or (top.returncode and not NOT_A_REPO.search(top.stderr)):
+                return blocked(label, "its top-level lookup (git rev-parse) "
+                                      "failed or timed out")
+            if not top.returncode and top.stdout.strip():
+                run_dir = top.stdout.strip()
+        return judge(f"{value[1:]} {extra}", run_dir, child, depth + 1)
     try:
         words_ = shlex.split(value)
     except ValueError:

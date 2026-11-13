@@ -199,6 +199,28 @@ check "alias to status"                     "git -c alias.st=status st"       "$
 g -C "$MAIN" config alias.shelf2 'stash pop'
 check "configured alias runs a stash"       "git shelf2"                      "$WT" DENY "linked worktree"
 check "configured alias, other repo"        "git shelf2"                      "$SOLO" ALLOW
+check "--config-env alias runs a stash"     "A='stash clear' git --config-env=alias.s=A s" "$WT" DENY "linked worktree"
+check "--config-env alias, exported var"    "export A='stash pop'; git --config-env alias.s=A s" "$WT" DENY "linked worktree"
+check "--config-env alias, read-only"       "A='stash list' git --config-env=alias.s=A s" "$WT" ALLOW
+check "--config-env alias, unset var"       "git --config-env=alias.s=NOPE_UNSET_VAR s" "$WT" ALLOW
+check "--config-env alias, uncertain var"   "true && export A='stash pop'; git --config-env=alias.s=A s" "$WT" DENY "cannot be resolved"
+mkdir -p "$MAIN/sub" "$SOLO/sub"
+check "shell alias runs from the top level" "git -c 'alias.s=!git -C sub stash clear' s" "$MAIN/sub" DENY "other worktree"
+check "shell alias top level, solo repo"    "git -c 'alias.s=!git -C sub stash clear' s" "$SOLO/sub" ALLOW
+check "function body cd is not run"         "f() { cd $SOLO; }; git stash clear" "$WT" DENY
+check "called function's cd is uncertain"   "f() { cd $WT; }; f; git stash clear" "$SOLO" DENY
+check "function keyword form"               "function f { cd $SOLO; }; git stash clear" "$WT" DENY
+check "function body on its own line"       $'f()\n{ cd '"$SOLO"$'; }\ngit stash clear' "$WT" DENY
+check "stash inside a function body"        "f() { git stash pop; }"          "$WT" DENY "linked worktree"
+check "function without cd, solo repo"      "f() { echo hi; }; git stash clear" "$SOLO" ALLOW
+check "env -S runs its split command"       "env -S 'git stash clear'"        "$WT" DENY "linked worktree"
+check "env -S attached operand"             "env -iS'git stash pop'"          "$WT" DENY "linked worktree"
+check "env --split-string"                  "env --split-string='git stash'"  "$WT" DENY "linked worktree"
+check "env -S read-only stash"              "env -S 'git stash list'"         "$WT" ALLOW
+check "pushd -n keeps the cwd"              "pushd -n $SOLO; git stash clear" "$WT" DENY "linked worktree"
+check "pushd -n away from a worktree"       "pushd -n $WT; git stash clear"   "$SOLO" ALLOW
+check "pushd changes the cwd"               "pushd $WT; git stash clear"      "$SOLO" DENY "linked worktree"
+check "bare pushd target is untracked"      "pushd; git stash clear"          "$SOLO" DENY "unknown"
 
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
