@@ -147,6 +147,59 @@ check "conditional export may not have run"  "false && export GIT_DIR=$SOLO/.git
 check "export in the same && list applies"   "true && export GIT_DIR=$SOLO/.git && git stash clear" "$MAIN" ALLOW
 check "bash -c body assignment governs its cd" "DEST=$SOLO; bash -c 'DEST=$MAIN; cd \"\$DEST\"; git stash clear'" "$SOLO" DENY "other worktree"
 check "eval body assignment governs its cd"  "DEST=$SOLO; eval 'DEST=$MAIN; cd \"\$DEST\"'; git stash clear" "$SOLO" DENY "could not resolve"
+# --- redirections, $PWD, exports, unset, symlinks, here strings, branches,
+#     expanded command words, wrappers and aliases
+check "leading redirection before git"      "2>/dev/null git stash clear"     "$WT" DENY "linked worktree"
+check "redirection between git and stash"   "git 2>/dev/null stash clear"     "$WT" DENY "linked worktree"
+check "spaced leading redirection"          "> /dev/null git stash pop"       "$WT" DENY "linked worktree"
+check "trailing redirection keeps list"     "git stash list 2>/dev/null"      "$WT" ALLOW
+check "quoted > is not a redirection"       "bash -c '>/dev/null git stash pop'" "$WT" DENY "linked worktree"
+check "cd updates \$PWD"                    "cd $MAIN && git -C \"\$PWD\" stash clear" "$SOLO" DENY "other worktree"
+check "cd updates \$OLDPWD"                 "cd $SOLO && git -C \"\$OLDPWD\" stash clear" "$WT" DENY "linked worktree"
+check "unexported assignment skips git"     "GIT_DIR=$SOLO/.git; git stash clear" "$WT" DENY "linked worktree"
+check "unexported assignment skips bash -c" "GIT_DIR=$SOLO/.git; bash -c 'git stash clear'" "$WT" DENY "linked worktree"
+check "assign then export reaches git"      "GIT_DIR=$SOLO/.git; export GIT_DIR; git stash clear" "$WT" ALLOW
+check "export -n un-exports"                "export GIT_DIR=$SOLO/.git; export -n GIT_DIR; git stash clear" "$WT" DENY "linked worktree"
+check "scoped assignment still reaches git" "GIT_DIR=$SOLO/.git git stash clear" "$WT" ALLOW
+check "unset drops a tracked export"        "export GIT_DIR=$SOLO/.git; unset GIT_DIR; git stash clear" "$WT" DENY "linked worktree"
+GIT_DIR="$SOLO/.git" \
+check "unset drops an inherited GIT_DIR"    "unset GIT_DIR; git stash clear"  "$WT" DENY "linked worktree"
+mkdir -p "$WT/sub"; ln -s "$WT/sub" "$PLAIN/link"
+check "git -C follows a symlink before .."  "git -C link/.. stash pop"        "$PLAIN" DENY "linked worktree"
+check "env -C follows a symlink before .."  "env -C link/.. git stash clear"  "$PLAIN" DENY "linked worktree"
+check "cd stays logical across a symlink"   "cd link/.. && git stash pop"     "$PLAIN" ALLOW
+check "cd -P follows the symlink"           "cd -P link/.. && git stash pop"  "$PLAIN" DENY "linked worktree"
+g clone --bare "$MAIN" "$T/bare.git"; g -C "$T/bare.git" worktree add "$T/bare.wt" -b bare-wt
+check "--work-tree reaches the probe"       "git --git-dir=$T/bare.git --work-tree=$T/bare.wt stash clear" "$PLAIN" DENY "other worktree"
+check "relative --git-dir after a later -C" "git --git-dir=.git -C $MAIN stash clear" "$SOLO" DENY "other worktree"
+check "here string fed to bash"             "bash <<< 'git stash clear'"      "$WT" DENY "linked worktree"
+check "here string to cat stays data"       "cat <<< 'git stash clear'"       "$WT" ALLOW
+check "cd in a skipped if branch"           "if false; then cd $SOLO; fi; git stash clear" "$WT" DENY "could not resolve"
+check "cd in then, stash in else"           "if false; then cd $SOLO; else git stash clear; fi" "$WT" DENY "could not resolve"
+check "cd and stash in one branch"          "if true; then cd $SOLO && git stash pop; fi" "$WT" ALLOW
+check "cd in a loop body may not run"       "while false; do cd $SOLO; done; git stash pop" "$WT" DENY "could not resolve"
+check "command word from a variable"        "B=git; \"\$B\" stash pop"        "$WT" DENY "linked worktree"
+check "subcommand from a variable"          "S=stash; git \"\$S\" pop"        "$WT" DENY "linked worktree"
+check "read-only stash sub from a variable" "S=list; git stash \"\$S\""       "$WT" ALLOW
+check "unknown subcommand word, shared"     "git \"\$NOPE_UNSET_VAR\" pop"    "$WT" DENY "could not be resolved"
+check "unknown subcommand word, solo"       "git \"\$NOPE_UNSET_VAR\" pop"    "$SOLO" ALLOW
+check "unknown command word, shared"        "\"\$NOPE_UNSET_VAR\" stash pop"  "$WT" DENY "could not be resolved"
+check "unknown command word, unrelated"     "\"\$NOPE_UNSET_VAR\" notes.md"   "$WT" ALLOW
+check "timeout wrapper"                     "timeout 10 git stash pop"        "$WT" DENY "linked worktree"
+check "timeout with options"                "timeout -k 5 --signal=TERM 10 git stash clear" "$WT" DENY "linked worktree"
+check "timeout of a read-only stash"        "timeout 10 git stash list"       "$WT" ALLOW
+check "nice wrapper"                        "nice -n 5 git stash"             "$WT" DENY "linked worktree"
+check "xargs wrapper"                       "echo pop | xargs git stash"      "$WT" DENY "linked worktree"
+check "-c shell alias runs a stash"         "git -c alias.shelf='!git stash pop' shelf" "$WT" DENY "linked worktree"
+check "-c git alias runs a stash"           "git -c alias.sv='stash pop' sv"  "$WT" DENY "linked worktree"
+check "chained aliases reach a stash"       "git -c alias.a=b -c 'alias.b=stash pop' a" "$WT" DENY "linked worktree"
+check "shell alias calls a -c alias"        "git -c 'alias.b=stash pop' -c 'alias.a=!git b' a" "$WT" DENY "linked worktree"
+check "alias to a read-only stash"          "git -c alias.sl='stash list' sl" "$WT" ALLOW
+check "alias to status"                     "git -c alias.st=status st"       "$WT" ALLOW
+g -C "$MAIN" config alias.shelf2 'stash pop'
+check "configured alias runs a stash"       "git shelf2"                      "$WT" DENY "linked worktree"
+check "configured alias, other repo"        "git shelf2"                      "$SOLO" ALLOW
+
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \

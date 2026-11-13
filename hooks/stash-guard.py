@@ -18,26 +18,34 @@ A repo with no other worktrees, and a non-repo, are left alone.
 The target is resolved per segment: the hook's cwd (or inherited GIT_DIR),
 then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` / backquote
 subshell, pipeline element or backgrounded list; unknown once an and-or list
-it may not have run in ends), then `env -C` / `sudo -D` (each relative to the
-last), then the invocation's own `-C` / `--git-dir`; VAR=val prefixes and
-`env -u` / `-i` shape the GIT_* vars the probe sees, and an export that may
-not have run leaves its var uncertain. Quote-, comment- and heredoc-aware, so
-"git stash" inside an echo/grep/commit message or a data heredoc is not a
-stash (but a `$(...)` in an unquoted heredoc is). `bash -c` / `sh -c` bodies
-(with their prefix assignments and `env -C`), a heredoc fed to a shell (in
-that command's context), `eval` bodies (in the caller's scope, so their
-cd/exports carry on) and `$(...)` / backquotes (also inside double quotes) are
-scanned too; a body is judged both with the caller's $VARs expanded first and
-with the body expanding them itself, since quote removal hides which happens.
+or `if` / loop / `case` branch it may not have run in ends; `$PWD` / `$OLDPWD`
+follow it), then `env -C` / `sudo -D` (each relative to the last), then the
+invocation's own `-C` (all followed through symlinks the way chdir does) and
+`--git-dir` / `--work-tree` (left for git to resolve after every `-C`);
+VAR=val prefixes, `unset` and `env -u` / `-i` shape the GIT_* vars the probe
+sees, a plain assignment reaches git or a child shell only once exported, and
+an export that may not have run leaves its var uncertain. Quote-, comment-,
+redirection- and heredoc-aware, so "git stash" inside an echo/grep/commit
+message or a data heredoc is not a stash (but a `$(...)` in an unquoted
+heredoc is), and `2>/dev/null git stash` is. `bash -c` / `sh -c` bodies
+(with their prefix assignments and `env -C`), a heredoc or here string fed to
+a shell (in that command's context), `eval` bodies (in the caller's scope, so
+their cd/exports carry on), `$(...)` / backquotes (also inside double quotes)
+and git aliases (`-c alias.x=...` or configured; `!` ones as shell bodies)
+are scanned too; a body is judged both with the caller's $VARs expanded first
+and with the body expanding them itself, since quote removal hides which
+happens. `$VAR` command and subcommand words are expanded before matching.
 `env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
-`exec -a X`) match by basename like git, their options consumed.
+`exec -a X`, `timeout`, `nice`, `stdbuf`, `ionice`, `setsid`, `xargs`) match
+by basename like git, their options consumed.
 A mutating stash whose target cannot be resolved (an unknown $VAR, a `$(...)`,
-a `cd` into a missing directory, a failed or timed-out repo or worktree probe,
-shell bodies nested past the scan depth) is denied.
-Known gaps: git run under `timeout` / `nice` / `xargs`, and a heredoc piped
-into a shell (`cat <<EOF | bash`), are not seen; a cd inside a `{ ...; }`
-group used as a pipeline element is not undone. A crash exits non-zero,
-which Claude Code treats as a non-blocking error (fail open), like the other
+a `cd` into a missing directory, a failed or timed-out repo, worktree or alias
+probe, an unresolvable command or subcommand word, shell bodies or aliases
+nested past the scan depth) is denied.
+Known gaps: a heredoc piped into a shell (`cat <<EOF | bash`) is not seen; a
+cd inside a `{ ...; }` group used as a pipeline element is not undone, and a
+loop body is scanned once, in the state its first pass sees. A crash exits
+non-zero, which Claude Code treats as a non-blocking error (fail open), like the other
 Bash hooks here.
 """
 import json
@@ -51,16 +59,42 @@ READ_ONLY = {"list", "show"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 PREFIX_WORDS = {"{", "}", "!", "then", "do", "else", "elif", "if", "while",
                 "until"}
-# Wrappers that run the next word as the command (matched by basename), with
-# the short options that take a value; their other options are flags.
-WRAPPERS = {"time": "", "nohup": "", "command": "", "builtin": "",
-            "exec": "a", "sudo": "ugpCDrtUTR"}
+OPENERS = {"if", "while", "until", "for", "select", "case"}
+CLOSERS = {"fi", "done", "esac"}
+BLOCK_WORDS = OPENERS | CLOSERS | {"then", "do", "else", "elif", "{", "}", "!"}
 SUDO_LONG_WITH_VALUE = {"--user", "--group", "--prompt", "--close-from",
                         "--chdir", "--role", "--type", "--other-user",
                         "--command-timeout", "--host"}
+# Wrappers that run a later word as the command (matched by basename):
+# (short options taking a value, long options taking a value, positional
+# words before the command). Their other options are flags.
+WRAPPERS = {"time": ("", (), 0), "nohup": ("", (), 0),
+            "command": ("", (), 0), "builtin": ("", (), 0),
+            "setsid": ("", (), 0), "exec": ("a", (), 0),
+            "sudo": ("ugpCDrtUTR", SUDO_LONG_WITH_VALUE, 0),
+            "timeout": ("sk", ("--signal", "--kill-after"), 1),
+            "nice": ("n", ("--adjustment",), 0),
+            "stdbuf": ("ioe", ("--input", "--output", "--error"), 0),
+            "ionice": ("cnpt", ("--class", "--classdata", "--pid", "--pgid",
+                                "--uid"), 0),
+            "xargs": ("EIdLnPsa", ("--arg-file", "--delimiter", "--max-lines",
+                                   "--max-args", "--max-procs", "--max-chars",
+                                   "--process-slot-var"), 0)}
 GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
                        "--super-prefix", "--config-env"}
+# Long-standing git builtins: git ignores an alias that shadows one, so these
+# never need an alias lookup.
+GIT_BUILTINS = set("""add am annotate apply archive bisect blame branch bundle
+    cat-file checkout cherry cherry-pick clean clone commit config
+    count-objects describe diff fetch for-each-ref format-patch fsck gc grep
+    hash-object help init log ls-files ls-remote ls-tree merge merge-base mv
+    name-rev notes prune pull push range-diff rebase reflog remote reset
+    restore revert rev-list rev-parse rm shortlog show show-branch show-ref
+    sparse-checkout status switch symbolic-ref tag update-ref var version
+    worktree""".split())
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+REDIR_OP = re.compile(r"&>>?|<<<|<<-|<<|<>|<&|<|>>|>&|>\||>")
+FD_WORD = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 HEREDOC = re.compile(r"<<(-?)[ \t]*((?:'[^']*'|\"[^\"]*\"|\\.|[^\s;&|<>()'\"\\])+)")
 NOT_A_REPO = re.compile(r"not a git repository|cannot change to|must be run in a work tree")
 SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
@@ -70,6 +104,7 @@ OPEN, CLOSE = "\0(", "\0)"                 # subshell scope markers from segment
 AND, OR, SEP = "\0&", "\0|", "\0;"         # && / || / (; newline) from segments()
 PIPE, BG = "\0p", "\0b"                    # | or |& / a lone & from segments()
 UNCERTAIN = "\0?"                         # env value: a step that may not have run set it
+LOCAL = "\0l"                             # env key prefix: that var is set but not exported
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 GIT_TARGET = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
@@ -173,6 +208,63 @@ def heredoc_word(word):
         return "".join(shlex.split(word, posix=True))
     except ValueError:
         return re.sub(r"[\\'\"]", "", word)
+
+
+def words(seg):
+    """(words, here strings) of a segment after quote removal. Redirections
+    and their operands are dropped wherever they sit (`2>/dev/null git stash`
+    still runs git), each `<<<` operand is kept as a here string, and a
+    heredoc operator's delimiter word is dropped (its body is in seg.docs)."""
+    out, here, raw, pending = [], [], [], None
+    i, n, q = 0, len(seg), None
+
+    def flush():
+        nonlocal raw, pending
+        if not raw:
+            return
+        w = "".join(shlex.split("".join(raw), posix=True))
+        raw = []
+        if pending is None:
+            out.append(w)
+        elif pending == "<<<":
+            here.append(w)
+        pending = None
+
+    while i < n:
+        c = seg[i]
+        if q:
+            raw.append(c)
+            if c == "\\" and q == '"' and i + 1 < n:
+                raw.append(seg[i + 1])
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            raw += [c, seg[i + 1]]
+            i += 2
+            continue
+        if c in ("'", '"'):
+            q = c
+            raw.append(c)
+        elif c in " \t\n":
+            flush()
+        elif c in "<>" or seg.startswith("&>", i):
+            if FD_WORD.fullmatch("".join(raw)):
+                raw = []                  # `2>` / `{fd}>`: the fd is not a word
+            flush()
+            pending = REDIR_OP.match(seg, i).group(0)
+            i += len(pending)
+            continue
+        else:
+            raw.append(c)
+        i += 1
+    if q:
+        raise ValueError("No closing quotation")
+    flush()
+    return out, here
 
 
 def segments(s):
@@ -297,14 +389,26 @@ def expand(word, env):
     return VAR.sub(sub, word)
 
 
-def resolve(path, cwd, env):
-    """Absolute, normalised form of a path word relative to `cwd`."""
+def expand_word(word, env):
+    """The words a command or subcommand word becomes once its tracked $VARs
+    expand (split on whitespace, the way an unquoted expansion is; an empty
+    one vanishes). Raises Unresolved when it cannot be expanded."""
+    if "$" not in word and "`" not in word:
+        return [word]
+    return expand(word, env).split()
+
+
+def resolve(path, cwd, env, physical=False):
+    """Absolute form of a path word relative to `cwd`. `cd` is logical (`..`
+    drops the last component, as bash's default `cd -L` does); a chdir(2)
+    (git -C, env -C, sudo -D, cd -P) is `physical`: symlinks are followed
+    before `..`, so `link/..` lands where the link points."""
     path = expand(path, env)
-    if os.path.isabs(path):
-        return os.path.normpath(path)
-    if cwd is None:
-        raise Unresolved("the working directory is unknown at this point")
-    return os.path.normpath(os.path.join(cwd, path))
+    if not os.path.isabs(path):
+        if cwd is None:
+            raise Unresolved("the working directory is unknown at this point")
+        path = os.path.join(cwd, path)
+    return os.path.realpath(path) if physical else os.path.normpath(path)
 
 
 def git(args, git_env):
@@ -317,9 +421,10 @@ def git(args, git_env):
         return None
 
 
-def shared_reason(target, git_dir, git_env):
+def shared_reason(target, git_dir, work_tree, git_env):
     """Why a stash at `target` would touch a shared stack, else None."""
-    base = ["-C", target] + ([f"--git-dir={git_dir}"] if git_dir else [])
+    base = ["-C", target] + ([f"--git-dir={git_dir}"] if git_dir else []) + \
+        ([f"--work-tree={work_tree}"] if work_tree else [])
     r = git(base + ["rev-parse", "--path-format=absolute",
                     "--git-dir", "--git-common-dir", "--show-toplevel"], git_env)
     if r is not None and r.returncode and NOT_A_REPO.search(r.stderr):
@@ -366,14 +471,14 @@ def strip_prefix(toks, env):
             toks = toks[1:]
         elif os.path.basename(t) in WRAPPERS:
             wrapper, toks = os.path.basename(t), toks[1:]
-            takes = WRAPPERS[wrapper]
+            takes, long_takes, positional = WRAPPERS[wrapper]
             while toks and toks[0].startswith("-") and toks[0] != "-":
                 o, toks = toks[0], toks[1:]
                 if o == "--":
                     break
                 if o.startswith("--"):
                     name, eq, val = o.partition("=")
-                    if wrapper == "sudo" and name in SUDO_LONG_WITH_VALUE:
+                    if name in long_takes:
                         if not eq:
                             val, toks = (toks[0], toks[1:]) if toks else ("", toks)
                         if name == "--chdir":
@@ -387,6 +492,7 @@ def strip_prefix(toks, env):
                         if wrapper == "sudo" and o[k] == "D":
                             chdirs.append(val)
                         break
+            toks = toks[positional:]      # `timeout 10 git ...`: the duration
         elif os.path.basename(t) == "env":
             toks = toks[1:]
             while toks and toks[0].startswith("-"):
@@ -437,6 +543,23 @@ def with_scoped(env, scoped):
     return out
 
 
+def exported_env(env, scoped):
+    """The environment a child process (git, a child shell) inherits: what
+    with_scoped() gives, minus the vars that were set but never exported.
+    A command-scoped VAR=val always reaches the child; a var whose export may
+    not have run is UNCERTAIN."""
+    out = with_scoped(env, scoped)
+    for k in [k for k in out if k.startswith(LOCAL)]:
+        name, flag = k[len(LOCAL):], out.pop(k)
+        if name in scoped or name not in out:
+            continue
+        if flag == UNCERTAIN:
+            out[name] = UNCERTAIN
+        else:
+            out.pop(name)
+    return out
+
+
 def substitute(body, env):
     """`body` with its tracked $VAR / ${VAR} expansions applied, the way the
     caller's shell expands a double-quoted eval / -c body before running it."""
@@ -484,19 +607,20 @@ def scan(cmd, cwd, env, depth):
     UNCERTAIN. Pipeline elements before the last and a backgrounded list run
     in subshells; the last element does in bash but not zsh, so its changes
     are uncertain too."""
-    scopes = []
+    scopes, blocks = [], []               # blocks: state where each if/loop/case began
     lst = (cwd, dict(env))                # state where this and-or list began
     elem = lst                            # ... and this pipeline element
     cond = piped = False
     for seg in segments(cmd) + [SEP]:
         if seg == OPEN:
-            scopes.append((cwd, dict(env), lst, elem, cond, piped))
+            scopes.append((cwd, dict(env), lst, elem, cond, piped, blocks))
             lst = elem = (cwd, dict(env))
             cond = piped = False
+            blocks = []
             continue
         if seg == CLOSE:
             if scopes:
-                cwd, env, lst, elem, cond, piped = scopes.pop()
+                cwd, env, lst, elem, cond, piped, blocks = scopes.pop()
             continue
         if seg == PIPE:                   # the left side ran in a subshell
             cwd, env, piped = elem[0], dict(elem[1]), True
@@ -521,46 +645,93 @@ def scan(cmd, cwd, env, depth):
                 if reason:
                     return reason, cwd, env
         try:
-            toks = shlex.split(seg, posix=True)
+            toks, herestrs = words(seg)
         except ValueError:
-            toks = seg.split()
+            toks, herestrs = seg.split(), []
+        while toks and toks[0] in BLOCK_WORDS:
+            w, toks = toks[0], toks[1:]
+            if w in OPENERS:              # a branch or loop body may be skipped
+                blocks.append((cwd, dict(env)))
+            elif w in ("else", "elif") and blocks:
+                cwd, env = merge(cwd, env, *blocks[-1])
+            elif w in CLOSERS and blocks:
+                cwd, env = merge(cwd, env, *blocks.pop())
         toks, scoped, chdirs = strip_prefix(toks, env)
+        opaque = None
+        if toks and ("$" in toks[0] or "`" in toks[0]):
+            try:                          # `"$B" stash pop` runs what $B holds
+                toks = expand_word(toks[0], env) + toks[1:]
+                toks, more, dirs = strip_prefix(toks, env)
+                scoped.update(more)
+                chdirs += dirs
+            except Unresolved as e:
+                opaque = str(e)
         if not toks:
             for k, v in scoped.items():   # bare `A=b` sets shell state
                 if v is None:
                     continue
+                if k not in env:          # a new var stays unexported
+                    env[LOCAL + k] = "1"
                 try:
                     env[k] = expand(v, env)
                 except Unresolved:
                     env[k] = UNCERTAIN
             continue
         head = toks[0]
-        if head == "export":
+        if head in ("export", "unset"):
+            opts = "".join(t[1:] for t in toks[1:] if t.startswith("-"))
             for t in toks[1:]:
-                if ASSIGN.match(t):
-                    k, v = t.split("=", 1)
+                k, eq, v = t.partition("=")
+                if t.startswith("-") or not ASSIGN.match(k + "="):
+                    continue
+                if head == "unset":
+                    if "f" not in opts:
+                        env.pop(k, None)
+                        env.pop(LOCAL + k, None)
+                    continue
+                if eq:
                     try:
                         env[k] = expand(v, env)
                     except Unresolved:
                         env[k] = UNCERTAIN
+                if "n" in opts:           # export -n: set, but no longer exported
+                    env[LOCAL + k] = "1"
+                else:
+                    env.pop(LOCAL + k, None)
             continue
         if head in ("cd", "pushd", "popd"):
             args = [a for a in toks[1:] if a == "-" or not a.startswith("-")]
+            physical = any(a.startswith("-") and "P" in a for a in toks[1:]
+                           if a not in args)
+            old = cwd
             try:
                 if head == "popd" or args[:1] == ["-"]:
                     raise Unresolved("cd -/popd target is not tracked")
-                cwd = resolve(args[0], cwd, env) if args else env.get("HOME")
+                cwd = (resolve(args[0], cwd, env, physical) if args
+                       else env.get("HOME"))
             except Unresolved:
                 cwd = None
             if cwd is not None and not os.path.isdir(cwd):
                 cwd = None                # the cd fails; where the shell stays is untracked
+            if cwd is None:
+                env["PWD"] = env["OLDPWD"] = UNCERTAIN
+            else:                         # bash keeps $PWD / $OLDPWD in step
+                env["PWD"], env["OLDPWD"] = cwd, (UNCERTAIN if old is None
+                                                  else old)
             continue
         run_cwd = cwd
         try:
             for d in chdirs:              # each env -C is relative to the last
-                run_cwd = resolve(d, run_cwd, env)
+                run_cwd = resolve(d, run_cwd, env, physical=True)
         except Unresolved:
             run_cwd = None
+        if opaque:                        # judge it as if the word expands to git
+            if judge_git(toks[1:], run_cwd, env, scoped, depth):
+                return ("[stash-guard] Blocked a command whose name could not "
+                        f"be resolved ({opaque}): run as git, it is a mutating "
+                        "stash on a shared stack, and an unresolvable mutating "
+                        "stash is denied by default. " + ALTERNATIVES), cwd, env
+            continue
         name = os.path.basename(head)
         if name in SHELLS or name == "eval":
             if name == "eval":
@@ -573,9 +744,10 @@ def scan(cmd, cwd, env, depth):
                 scripts = variants(raw, env)  # `eval "$CMD"` runs what $CMD holds
             elif name == "eval":
                 continue
-            else:                         # `bash <<EOF`: the heredoc is the script
+            else:                         # `bash <<EOF` / `bash <<< ...`: stdin is the script
                 scripts = [s for doc, quoted in seg.docs
                            for s in ([doc] if quoted else variants(doc, env))]
+                scripts += [s for h in herestrs for s in variants(h, env)]
             if not scripts:
                 continue
             if depth >= MAX_DEPTH:
@@ -585,8 +757,8 @@ def scan(cmd, cwd, env, depth):
                             "and an uninspected mutating stash is denied by "
                             "default. " + ALTERNATIVES), cwd, env
                 continue
-            try:
-                body_env = with_scoped(env, scoped)
+            try:                          # eval shares this shell; a child gets the exports
+                body_env = (with_scoped if name == "eval" else exported_env)(env, scoped)
             except Unresolved as e:
                 if not any(may_stash(s) for s in scripts):
                     continue
@@ -618,7 +790,7 @@ def scan(cmd, cwd, env, depth):
             continue
         if name != "git":
             continue
-        reason = judge_git(toks[1:], run_cwd, env, scoped)
+        reason = judge_git(toks[1:], run_cwd, env, scoped, depth)
         if reason:
             return reason, cwd, env
     if scopes:                            # an unclosed ( ends with the command
@@ -626,12 +798,22 @@ def scan(cmd, cwd, env, depth):
     return None, cwd, env
 
 
-def judge_git(args, cwd, env, scoped=None):
+def blocked(label, why):
+    """The deny reason for a mutating stash whose target is unresolvable."""
+    return (f"[stash-guard] Blocked {label}: could not resolve which repo it "
+            f"targets ({why}), and an unresolvable mutating stash is denied "
+            f"by default. " + ALTERNATIVES)
+
+
+def judge_git(args, cwd, env, scoped=None, depth=0):
     """Deny reason for one git invocation's argv (after `git`), or None.
     `env` expands the argv (the shell expands words before a command-scoped
-    VAR=val takes effect); `scoped` only reaches git's own environment."""
-    target, git_dir, i = cwd, None, 0
-    pending_unresolved = None
+    VAR=val takes effect); `scoped` only reaches git's own environment.
+    `--git-dir` / `--work-tree` stay as written: git resolves a relative one
+    after every `-C`, and so does the probe, which gets the same options."""
+    scoped = scoped or {}
+    target, git_dir, work_tree, configs, i = cwd, None, None, [], 0
+    pending_unresolved = config_unresolved = None
     while i < len(args) and args[i].startswith("-"):
         opt = args[i]
         name, _, inline = opt.partition("=")
@@ -647,43 +829,120 @@ def judge_git(args, cwd, env, scoped=None):
             i += 1
         try:
             if name == "-C" and value:
-                target = resolve(value, target, env)
+                target = resolve(value, target, env, physical=True)
             elif name == "--git-dir" and value:
-                git_dir = resolve(value, target, env)
+                git_dir = expand(value, env)
+            elif name == "--work-tree" and value:
+                work_tree = expand(value, env)
+            elif name == "-c" and value:
+                try:
+                    configs.append(expand(value, env))
+                except Unresolved as e:
+                    config_unresolved = str(e)
         except Unresolved as e:
             pending_unresolved = str(e)
-    if i >= len(args) or args[i] != "stash":
+    if i >= len(args):
         return None
-    sub = args[i + 1] if i + 1 < len(args) else "push"
-    if sub in READ_ONLY:
-        return None
-    label = f"`git stash{'' if i + 1 >= len(args) else ' ' + sub}`"
-    if pending_unresolved or target is None:
-        why = pending_unresolved or "the working directory is unknown"
-        return (f"[stash-guard] Blocked {label}: could not resolve which repo "
-                f"it targets ({why}), and an unresolvable mutating stash is "
-                f"denied by default. " + ALTERNATIVES)
-    git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    try:
-        seen = with_scoped(env, scoped or {})
+    opaque = None
+    try:                                  # `git "$S" pop` runs what $S holds
+        rest = expand_word(args[i], env) + args[i + 1:]
     except Unresolved as e:
-        return (f"[stash-guard] Blocked {label}: could not resolve which "
-                f"repo it targets ({e}), and an unresolvable mutating "
-                f"stash is denied by default. " + ALTERNATIVES)
+        rest, opaque = ["stash"] + args[i + 1:], str(e)
+    if not rest:
+        return None
+    try:
+        seen = exported_env(env, scoped)
+    except Unresolved as e:
+        seen = e
+    git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    if not isinstance(seen, Unresolved):
+        git_env.update({k: v for k, v in seen.items()
+                        if k.startswith("GIT_CONFIG") and v != UNCERTAIN})
+    if rest[0] != "stash":
+        return judge_alias(rest, target, git_dir, work_tree, configs,
+                           config_unresolved, seen, git_env, depth)
+    sub = rest[1] if len(rest) > 1 else "push"
+    try:
+        sub = (expand_word(sub, env) or ["push"])[0]
+    except Unresolved as e:
+        opaque = opaque or str(e)
+    if sub in READ_ONLY and not opaque:
+        return None
+    label = f"`git stash{'' if len(rest) < 2 else ' ' + rest[1]}`"
+    if opaque:
+        label = f"`git {' '.join(args[i:i + 2])}`"
+    if pending_unresolved or target is None:
+        return blocked(label, pending_unresolved or "the working directory is unknown")
+    if isinstance(seen, Unresolved):
+        return blocked(label, seen)
     for k in GIT_TARGET:
         if seen.get(k) == UNCERTAIN:
-            return (f"[stash-guard] Blocked {label}: could not resolve which "
-                    f"repo it targets (${k} is set by a step that may not "
-                    f"have run), and an unresolvable mutating stash is denied "
-                    f"by default. " + ALTERNATIVES)
+            return blocked(label, f"${k} is set by a step that may not have run")
         if k in seen:
             git_env[k] = seen[k]
     if git_dir is None and "GIT_DIR" in git_env:
         git_dir = git_env.pop("GIT_DIR")
-    reason = shared_reason(target, git_dir, git_env)
+    reason = shared_reason(target, git_dir, work_tree, git_env)
     if not reason:
         return None
+    if opaque:                            # a stash only if the word expands to one
+        reason += (f", and a word of it could not be resolved ({opaque}), "
+                   f"so it may be a mutating stash")
     return f"[stash-guard] Blocked {label}: {reason}. " + ALTERNATIVES
+
+
+def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
+                seen, git_env, depth):
+    """Deny reason when `git <rest>` runs an alias (`-c alias.x=...` on the
+    command line, or configured) that can reach a mutating stash, else None.
+    git ignores an alias that shadows a builtin, so those are not looked up.
+    A `!` alias is a shell body run at the repo's top level."""
+    name = rest[0]
+    if name in GIT_BUILTINS or name.startswith("-"):
+        return None
+    label = f"`git {name}`"
+    if config_unresolved:
+        return blocked(label, f"a `-c` value that may define its alias "
+                              f"cannot be expanded: {config_unresolved}")
+    base = (["-C", target] if target else []) + \
+        ([f"--git-dir={git_dir}"] if git_dir else []) + \
+        ([f"--work-tree={work_tree}"] if work_tree else [])
+    for c in configs:
+        base += ["-c", c]
+    env = git_env if isinstance(seen, Unresolved) else {
+        **git_env, **{k: seen[k] for k in GIT_TARGET
+                      if k in seen and seen[k] != UNCERTAIN}}
+    r = git(base + ["config", "--get", f"alias.{name}"], env)
+    if r is None or r.returncode not in (0, 1):
+        return blocked(label, "its alias lookup (git config) failed or timed out")
+    value = r.stdout.strip() if r.returncode == 0 else ""
+    if not value:
+        return None
+    if depth >= MAX_DEPTH:
+        if may_stash(value):
+            return ("[stash-guard] Blocked " + label + ": its alias chain is "
+                    "nested too deeply to inspect, and an uninspected mutating "
+                    "stash is denied by default. " + ALTERNATIVES)
+        return None
+    # The alias acts in the repo the invocation names, so its own git sees
+    # that repo: carry the options over as the env git sets for an alias.
+    child = {} if isinstance(seen, Unresolved) else dict(seen)
+    for k, v in (("GIT_DIR", git_dir), ("GIT_WORK_TREE", work_tree)):
+        if v:
+            child[k] = v if os.path.isabs(v) or not target else os.path.join(target, v)
+    extra = " ".join(shlex.quote(a) for a in rest[1:])
+    if value.startswith("!"):             # git hands its `-c` options on in the env
+        quoted = " ".join("'" + c.replace("'", "'\\''") + "'" for c in configs)
+        if quoted:
+            prior = child.get("GIT_CONFIG_PARAMETERS")
+            child["GIT_CONFIG_PARAMETERS"] = f"{prior} {quoted}" if prior else quoted
+        return judge(f"{value[1:]} {extra}", target, child, depth + 1)
+    try:
+        words_ = shlex.split(value)
+    except ValueError:
+        words_ = value.split()
+    opts = [w for c in configs for w in ("-c", c)]
+    return judge_git(opts + words_ + rest[1:], target, child, {}, depth + 1)
 
 
 def main():
@@ -698,7 +957,7 @@ def main():
     if not isinstance(cmd, str):
         return 0
     cwd = payload.get("cwd") or os.getcwd()
-    reason = judge(cmd, cwd, dict(os.environ))
+    reason = judge(cmd, cwd, {**os.environ, "PWD": cwd})
     if reason:
         json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                           "permissionDecision": "deny",
