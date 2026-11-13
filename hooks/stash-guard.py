@@ -16,16 +16,20 @@ when its target repo is
 A repo with no other worktrees, and a non-repo, are left alone.
 
 The target is resolved per segment: the hook's cwd (or inherited GIT_DIR),
-then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` subshell),
-then `env -C` (each relative to the last), then the invocation's own `-C` /
-`--git-dir`; VAR=val prefixes and `env -u` / `-i` shape the GIT_* vars the
-probe sees. Quote-, comment- and heredoc-aware, so "git stash" inside an
-echo/grep/commit message is not a stash. `bash -c` / `sh -c` bodies (with
-their prefix assignments), `eval` bodies (in the caller's scope, so their
-cd/exports carry on) and `$(...)` (also inside double quotes) are scanned
-too, and `env` / shells / `eval` match by basename like git. A mutating stash whose target cannot be resolved (an unknown $VAR, a
-`$(...)`, a `cd` into a missing directory, a failed worktree probe, shell
-bodies nested past the scan depth) is denied.
+then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` / backquote
+subshell; unknown once an and-or list it may not have run in ends), then
+`env -C` / `sudo -D` (each relative to the last), then the invocation's own
+`-C` / `--git-dir`; VAR=val prefixes and `env -u` / `-i` shape the GIT_* vars
+the probe sees. Quote-, comment- and heredoc-aware, so "git stash" inside an
+echo/grep/commit message or a data heredoc is not a stash. `bash -c` / `sh -c`
+bodies (with their prefix assignments), a heredoc fed to a shell, `eval`
+bodies (in the caller's scope, so their cd/exports carry on; tracked $VARs
+expanded first) and `$(...)` / backquotes (also inside double quotes) are
+scanned too; `env` / shells / `eval` / wrappers (`time -p`, `command -p`,
+`sudo -u X`, `exec -a X`) match by basename like git, their options consumed.
+A mutating stash whose target cannot be resolved (an unknown $VAR, a `$(...)`,
+a `cd` into a missing directory, a failed or timed-out repo or worktree probe,
+shell bodies nested past the scan depth) is denied.
 Known gaps: git run under `timeout` / `nice` / `xargs` is not seen. A crash exits non-zero,
 which Claude Code treats as a non-blocking error (fail open), like the other
 Bash hooks here.
@@ -40,15 +44,24 @@ import sys
 READ_ONLY = {"list", "show"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 PREFIX_WORDS = {"{", "}", "!", "then", "do", "else", "elif", "if", "while",
-                "until", "time", "nohup", "command", "builtin", "exec", "sudo"}
+                "until"}
+# Wrappers that run the next word as the command (matched by basename), with
+# the short options that take a value; their other options are flags.
+WRAPPERS = {"time": "", "nohup": "", "command": "", "builtin": "",
+            "exec": "a", "sudo": "ugpCDrtUTR"}
+SUDO_LONG_WITH_VALUE = {"--user", "--group", "--prompt", "--close-from",
+                        "--chdir", "--role", "--type", "--other-user",
+                        "--command-timeout", "--host"}
 GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
                        "--super-prefix", "--config-env"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+HEREDOC = re.compile(r"<<(-?)[ \t]*((?:'[^']*'|\"[^\"]*\"|\\.|[^\s;&|<>()'\"\\])+)")
+NOT_A_REPO = re.compile(r"not a git repository|cannot change to|must be run in a work tree")
 SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 SUBST = "$(...)"                          # opaque stand-in for a $(...)
 OPEN, CLOSE = "\0(", "\0)"                 # subshell scope markers from segments()
+AND, OR, SEP = "\0&", "\0|", "\0;"         # && / || / (; & newline) from segments()
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 GIT_TARGET = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
@@ -57,7 +70,8 @@ ALTERNATIVES = (
     "takes whatever is on top (routinely a parallel agent's WIP), and a stash "
     "on a clean tree saves nothing, so the pop after it is always someone "
     "else's entry. Safe alternatives: (1) a scratch commit on your "
-    "own branch: `git add -A && git commit -m wip`, later "
+    "own branch: `git add <only the paths you may change>`, check "
+    "`git diff --cached --stat`, `git commit -m wip`, later "
     "`git reset --soft HEAD~1`; "
     "(2) run the base in its own checkout: `git worktree add --detach "
     "<scratchpad>/<unit>/base <base-sha>`; (3) read a base file: `git show "
@@ -101,20 +115,64 @@ def close_paren(s, i):
     return n
 
 
+def close_backtick(s, i):
+    """Index of the backtick closing the one whose body starts at `i`, or
+    len(s) when it is never closed."""
+    n = len(s)
+    while i < n:
+        if s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == "`":
+            return i
+        i += 1
+    return n
+
+
+def substitution(s, i):
+    """(body, end) of the `$(...)` or backquote substitution at `i`."""
+    if s[i] == "`":
+        j = close_backtick(s, i + 1)
+        return re.sub(r"\\([$`\\])", r"\1", s[i + 1:j]), j + 1
+    j = close_paren(s, i + 2)
+    return s[i + 2:j], j + 1
+
+
+def heredoc_runs(prefix):
+    """True when the command before a `<<` is a shell reading its script
+    from standard input (no -c), so the heredoc body is executed."""
+    try:
+        toks = shlex.split(prefix, posix=True)
+    except ValueError:
+        toks = prefix.split()
+    toks = strip_prefix(toks, {})[0]
+    return bool(toks) and os.path.basename(toks[0]) in SHELLS and not any(
+        SHELL_C.fullmatch(t) for t in toks[1:])
+
+
+def heredoc_word(word):
+    """The delimiter a heredoc word names, after quote removal."""
+    try:
+        return "".join(shlex.split(word, posix=True))
+    except ValueError:
+        return re.sub(r"[\\'\"]", "", word)
+
+
 def segments(s):
-    """Top-level command segments: quote-aware, comments and heredoc bodies
-    dropped, split on unquoted ; & | ( ) ` and newlines. `( )` and `$(...)`
-    bodies are bracketed by OPEN / CLOSE so judge() can scope their cd."""
+    """Top-level command segments: quote-aware, comments dropped, split on
+    unquoted ; & | ( ) and newlines. `( )`, `$(...)` and backquote bodies are
+    bracketed by OPEN / CLOSE so judge() can scope their cd; `&&` / `||` emit
+    AND / OR and `;` / `&` / newline emit SEP, so scan() can tell when a cd
+    might not have run. Heredoc bodies are dropped unless a shell executes them."""
     segs, buf, pending = [], [], []
     i, n, q = 0, len(s), None
     while i < n:
         c = s[i]
         if q:
-            if c == "$" and q == '"' and s.startswith("$(", i):
-                j = close_paren(s, i + 2)
-                segs += [OPEN, *segments(s[i + 2:j]), CLOSE]
+            if q == '"' and (c == "`" or s.startswith("$(", i)):
+                body, i = substitution(s, i)
+                segs += [OPEN, *segments(body), CLOSE]
                 buf.append(SUBST)
-                i = j + 1
                 continue
             buf.append(c)
             if c == "\\" and q == '"' and i + 1 < n:
@@ -144,30 +202,46 @@ def segments(s):
         if c == "<" and s.startswith("<<", i) and not s.startswith("<<<", i):
             m = HEREDOC.match(s, i)
             if m:
-                pending.append((m.group(1) == "-", m.group(2) or m.group(3) or m.group(4)))
+                pending.append((m.group(1) == "-", heredoc_word(m.group(2)),
+                                heredoc_runs("".join(buf))))
                 buf.append(m.group(0))
                 i = m.end()
                 continue
-        if c == "$" and s.startswith("$(", i):
-            j = close_paren(s, i + 2)     # body runs first; outer sees a token
-            segs += [OPEN, *segments(s[i + 2:j]), CLOSE]
+        if c == "`" or s.startswith("$(", i):
+            body, i = substitution(s, i)  # body runs first; outer sees a token
+            segs += [OPEN, *segments(body), CLOSE]
             buf.append(SUBST)
-            i = j + 1
             continue
-        if c in ";&|()`\n":
+        if (c == "&" and (s.startswith("&>", i) or (buf and buf[-1] in "<>"))) \
+                or (c == "|" and buf and buf[-1] == ">"):
+            buf.append(c)                 # a redirection, not a separator
+            i += 1
+            continue
+        if c in ";&|()\n":
             segs.append("".join(buf))
+            buf = []
             if c in "()":
                 segs.append(OPEN if c == "(" else CLOSE)
-            buf = []
+            elif c in "&|" and s.startswith(c * 2, i):
+                segs.append(AND if c == "&" else OR)
+                i += 1
+            elif c == "|" and s.startswith("|&", i):
+                i += 1                    # |& is a pipe too
+            elif c != "|":
+                segs.append(SEP)
             i += 1
-            if c == "\n" and pending:     # skip heredoc bodies
-                for strip_tabs, delim in pending:
+            if c == "\n" and pending:     # heredoc bodies follow this line
+                for strip_tabs, delim, runs in pending:
+                    body = []
                     while i < n:
                         end = s.find("\n", i)
                         line = s[i:] if end < 0 else s[i:end]
                         i = n if end < 0 else end + 1
                         if (line.lstrip("\t") if strip_tabs else line) == delim:
                             break
+                        body.append(line)
+                    if runs:              # `bash <<EOF`: the body is the script
+                        segs += [OPEN, *segments("\n".join(body)), CLOSE]
                 pending = []
             continue
         buf.append(c)
@@ -205,32 +279,35 @@ def resolve(path, cwd, env):
 
 
 def git(args, git_env):
-    """stdout of `git <args>`, or None on any failure."""
+    """The finished `git <args>`, or None when git could not run or timed out."""
     try:
-        r = subprocess.run(["git", *args], capture_output=True, text=True,
-                           timeout=5, env=git_env)
+        return subprocess.run(["git", *args], capture_output=True, text=True,
+                              timeout=5, env={**git_env, "LC_ALL": "C",
+                                              "LANGUAGE": "C"})
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return r.stdout if r.returncode == 0 else None
 
 
 def shared_reason(target, git_dir, git_env):
     """Why a stash at `target` would touch a shared stack, else None."""
     base = ["-C", target] + ([f"--git-dir={git_dir}"] if git_dir else [])
-    out = git(base + ["rev-parse", "--path-format=absolute",
-                      "--git-dir", "--git-common-dir", "--show-toplevel"], git_env)
-    if not out:
+    r = git(base + ["rev-parse", "--path-format=absolute",
+                    "--git-dir", "--git-common-dir", "--show-toplevel"], git_env)
+    if r is not None and r.returncode and NOT_A_REPO.search(r.stderr):
         return None                       # not a repo: the stash fails on its own
-    lines = out.splitlines()
+    lines = r.stdout.splitlines() if r is not None and not r.returncode else []
+    if len(lines) < 2:
+        return (f"could not probe {target} (git rev-parse failed or timed "
+                f"out), and an unresolvable mutating stash is denied by default")
     own, common = lines[0], lines[1]
     top = lines[2] if len(lines) > 2 else target
     if own != common:
         return f"{top} is a linked worktree"
     listing = git(base + ["worktree", "list", "--porcelain"], git_env)
-    if listing is None:
+    if listing is None or listing.returncode:
         return (f"could not list the worktrees of {top} (git worktree list "
                 f"failed), and an unresolvable mutating stash is denied by default")
-    live = [b for b in listing.split("\n\n")
+    live = [b for b in listing.stdout.split("\n\n")
             if b.startswith("worktree ") and "\nprunable" not in b]
     if len(live) > 1:
         return (f"{top} is the main checkout with {len(live) - 1} other "
@@ -258,6 +335,29 @@ def strip_prefix(toks, env):
         t = toks[0]
         if t in PREFIX_WORDS:
             toks = toks[1:]
+        elif os.path.basename(t) in WRAPPERS:
+            wrapper, toks = os.path.basename(t), toks[1:]
+            takes = WRAPPERS[wrapper]
+            while toks and toks[0].startswith("-") and toks[0] != "-":
+                o, toks = toks[0], toks[1:]
+                if o == "--":
+                    break
+                if o.startswith("--"):
+                    name, eq, val = o.partition("=")
+                    if wrapper == "sudo" and name in SUDO_LONG_WITH_VALUE:
+                        if not eq:
+                            val, toks = (toks[0], toks[1:]) if toks else ("", toks)
+                        if name == "--chdir":
+                            chdirs.append(val)
+                    continue
+                for k in range(1, len(o)):        # a short cluster like -Eu X
+                    if o[k] in takes:
+                        val = o[k + 1:]
+                        if not val:
+                            val, toks = (toks[0], toks[1:]) if toks else ("", toks)
+                        if wrapper == "sudo" and o[k] == "D":
+                            chdirs.append(val)
+                        break
         elif os.path.basename(t) == "env":
             toks = toks[1:]
             while toks and toks[0].startswith("-"):
@@ -308,6 +408,17 @@ def with_scoped(env, scoped):
     return out
 
 
+def substitute(body, env):
+    """`body` with its tracked $VAR / ${VAR} expansions applied, the way the
+    shell expands an eval / -c body before running it."""
+    return VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), body)
+
+
+def may_stash(text):
+    """Whether `text` could spell `stash` once quotes are removed."""
+    return "stash" in re.sub(r"[\"'\\$\n]", "", text)
+
+
 def judge(cmd, cwd, env, depth=0):
     """Return a deny reason for the first mutating shared-stack stash in
     `cmd`, or None."""
@@ -316,15 +427,27 @@ def judge(cmd, cwd, env, depth=0):
 
 def scan(cmd, cwd, env, depth):
     """(deny reason or None, cwd, env) after `cmd`. Tracks cd and plain
-    assignments across segments; a subshell's are undone when it closes."""
+    assignments across segments; a subshell's are undone when it closes.
+    A cd in an and-or list may not have run, so once the list ends (or an
+    `||` follows it) a cwd it changed is unknown."""
     scopes = []
-    for seg in segments(cmd):
+    list_cwd, cond = cwd, False           # cwd where this and-or list began
+    for seg in segments(cmd) + [SEP]:
         if seg == OPEN:
-            scopes.append((cwd, dict(env)))
+            scopes.append((cwd, dict(env), list_cwd, cond))
+            list_cwd, cond = cwd, False
             continue
         if seg == CLOSE:
             if scopes:
-                cwd, env = scopes.pop()
+                cwd, env, list_cwd, cond = scopes.pop()
+            continue
+        if seg in (AND, OR, SEP):
+            if cwd != list_cwd and (seg == OR or (seg == SEP and cond)):
+                cwd = None
+            if seg == SEP:
+                list_cwd, cond = cwd, False
+            else:
+                cond = True
             continue
         try:
             toks = shlex.split(seg, posix=True)
@@ -370,7 +493,7 @@ def scan(cmd, cwd, env, depth):
         name = os.path.basename(head)
         if name in SHELLS or name == "eval":
             if depth >= MAX_DEPTH:
-                if "stash" in " ".join(toks[1:]):
+                if may_stash(substitute(" ".join(toks[1:]), env)):
                     return ("[stash-guard] Blocked a shell body that may run "
                             "`git stash`: it is nested too deeply to inspect, "
                             "and an uninspected mutating stash is denied by "
@@ -385,10 +508,11 @@ def scan(cmd, cwd, env, depth):
                 body = toks[k + 1] if k is not None and k + 1 < len(toks) else None
             if not body:
                 continue
+            body = substitute(body, env)  # `eval "$CMD"` runs what $CMD holds
             try:
                 body_env = with_scoped(env, scoped)
             except Unresolved as e:
-                if "stash" not in body:
+                if not may_stash(body):
                     continue
                 return ("[stash-guard] Blocked a shell body that may run "
                         f"`git stash`: could not resolve which repo it targets "
@@ -415,7 +539,7 @@ def scan(cmd, cwd, env, depth):
         if reason:
             return reason, cwd, env
     if scopes:                            # an unclosed ( ends with the command
-        cwd, env = scopes[0]
+        cwd, env = scopes[0][:2]
     return None, cwd, env
 
 
@@ -483,7 +607,7 @@ def main():
     if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
         return 0
     cmd = (payload.get("tool_input") or {}).get("command")
-    if not isinstance(cmd, str) or "stash" not in cmd:
+    if not isinstance(cmd, str):
         return 0
     cwd = payload.get("cwd") or os.getcwd()
     reason = judge(cmd, cwd, dict(os.environ))

@@ -113,10 +113,36 @@ check "eval export carries on"               "eval 'export W=$WT'; git -C \"\$W\
 check "eval in a subshell does not leak"     "(eval 'cd $WT'); git stash pop"     "$SOLO" ALLOW
 check "A=b eval scopes A to the eval only"   "GIT_DIR=$SOLO/.git eval true; git stash pop" "$WT" DENY "linked worktree"
 check "bash -c cd does not leak out"         "bash -c 'cd $SOLO'; git stash pop"  "$WT" DENY "linked worktree"
+check "command -p wrapper option"            "command -p git stash pop"        "$WT" DENY "linked worktree"
+check "time -p wrapper option"               "time -p git stash pop"           "$WT" DENY "linked worktree"
+check "sudo -u USER wrapper option"          "sudo -u nobody git stash pop"    "$WT" DENY "linked worktree"
+check "exec -a NAME wrapper option"          "exec -a x git stash"             "$WT" DENY "linked worktree"
+check "sudo -D retargets git"                "sudo -D $WT git stash pop"       "$SOLO" DENY "linked worktree"
+check "conditional cd may not have run"      "false && cd $SOLO; git stash pop" "$WT" DENY "could not resolve"
+check "cd before || may have failed"         "cd $SOLO || git stash pop"       "$WT" DENY "could not resolve"
+check "cd && stash keeps the cd target"      "cd $SOLO && git stash pop"       "$WT" ALLOW
+check "2>&1 is not a list separator"         "cd $SOLO 2>&1 && git stash pop"  "$WT" ALLOW
+check "backquote cd does not leak out"       "echo \`cd $SOLO\`; git stash pop" "$WT" DENY "linked worktree"
+check "stash inside backquotes"              "echo \`git stash pop\`"          "$WT" DENY
+check "stash in backquotes in double quotes" "echo \"\`git stash pop\`\""      "$WT" DENY
+check "heredoc fed to bash is scanned"       $'bash <<\'EOF\'\ngit stash pop\nEOF' "$WT" DENY "linked worktree"
+check "heredoc fed to sh -s is scanned"      $'sh -s <<EOF\ncd /\ngit -C '"$WT"$' stash\nEOF' "$PLAIN" DENY "linked worktree"
+check "heredoc to bash -c stays data"        $'bash -c cat <<\'EOF\'\ngit stash pop\nEOF' "$WT" ALLOW
+check "heredoc delimiter with a dash"        $'cat <<EOF-1\nx\nEOF-1\ngit stash pop' "$WT" DENY "linked worktree"
+check "heredoc delimiter partly quoted"      $'cat <<"EO"F\nx\nEOF\ngit stash pop' "$WT" DENY "linked worktree"
+check "eval of a tracked variable"           "CMD='git stash pop'; eval \"\$CMD\"" "$WT" DENY "linked worktree"
+check "bash -c of a tracked variable"        "S='git stash pop'; bash -c \"\$S\"" "$WT" DENY "linked worktree"
+check "quote-joined stash word"              "git sta\"\"sh pop"               "$WT" DENY "linked worktree"
+check "partly quoted stash word"             "git sta\"sh\" pop"               "$WT" DENY "linked worktree"
+check "quote-joined stash in bash -c body"   "bash -c 'git sta\"\"sh pop'"     "$WT" DENY "linked worktree"
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \
 check "failed worktree probe fails closed"  "git stash"                       "$MAIN" DENY "could not list"
+
+printf '#!/bin/sh\nfor a; do [ "$a" = rev-parse ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"
+PATH="$T/bin:$PATH" \
+check "failed repo probe fails closed"      "git stash"                       "$SOLO" DENY "could not probe"
 
 # --- the main checkout is guarded too while other worktrees exist
 check "main tree with a linked wt attached" "git stash"                       "$MAIN" DENY "other worktree"

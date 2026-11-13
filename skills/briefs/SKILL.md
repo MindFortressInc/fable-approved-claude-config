@@ -41,8 +41,10 @@ Every worker allowed to modify Git state or a worktree gets this one, verbatim, 
   on top, routinely a parallel sibling's WIP, and a stash on a clean tree
   saves nothing, so the pop after it is ALWAYS someone else's entry
   (we measured 13+ cross-agent collisions). To set work aside or test the base,
-  use a scratch commit on your own branch (`git add -A && git commit -m wip`,
-  later `git reset --soft HEAD~1`), `git worktree add --detach
+  use a scratch commit on your own branch (`git add <only the paths you may
+  change>`, check `git diff --cached --stat`, `git commit -m wip`, later
+  `git reset --soft HEAD~1`; never `git add -A`, which sweeps in files outside
+  your scope), `git worktree add --detach
   <scratchpad>/<unit>/base <base-sha>`, `git show <sha>:<path>`, or copy files to
   your scratchpad. `git stash list`/`show` are fine. hooks/stash-guard.py
   denies the rest in Claude Code; Codex runs no hooks, so there this line is
@@ -91,8 +93,10 @@ CONSTRAINTS:
   on top, routinely a parallel sibling's WIP, and a stash on a clean tree
   saves nothing, so the pop after it is ALWAYS someone else's entry
   (we measured 13+ cross-agent collisions). To set work aside or test the base,
-  use a scratch commit on your own branch (`git add -A && git commit -m wip`,
-  later `git reset --soft HEAD~1`), `git worktree add --detach
+  use a scratch commit on your own branch (`git add <only the paths you may
+  change>`, check `git diff --cached --stat`, `git commit -m wip`, later
+  `git reset --soft HEAD~1`; never `git add -A`, which sweeps in files outside
+  your scope), `git worktree add --detach
   <scratchpad>/<unit>/base <base-sha>`, `git show <sha>:<path>`, or copy files to
   your scratchpad. `git stash list`/`show` are fine. hooks/stash-guard.py
   denies the rest in Claude Code; Codex runs no hooks, so there this line is
